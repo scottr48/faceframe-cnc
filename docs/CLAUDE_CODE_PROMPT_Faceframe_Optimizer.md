@@ -377,3 +377,19 @@ prevent:
   single opening is (W − 4) × (H − 3) = 14 × 33 for WDC2436. This also
   supersedes the §4b host-table row for WDC2436: with a 14×33 opening, a
   rotated W3012 (12×30) still fits as an inner, but B18 (18 wide) does not.
+
+- **2026-08-03 — SD1212 / no-faceframe lines**: the SD1212 line is a sample
+  DOOR (door size in cols 4/5); its order form shows N/A for the faceframe —
+  no faceframe is cut for it. Parsing rule: a row with QTY > 0 and BOTH
+  frame dims missing is a "no faceframe required" line — exclude it
+  automatically (shown informationally, still manually resolvable), and do
+  NOT prompt the user for dimensions. Only rows missing exactly ONE frame
+  dimension (e.g. WDC2436 in the 7-21 file) belong in "needs attention".
+  This supersedes §2's "exclude SD1212 after prompting".
+
+- **2026-08-03 — front-edge margin**: when a sheet has vertical slack, keep
+  parts **1" away from the front edge (Y=0, the sheet origin)** — a soft
+  preference like the edge cushion, configurable (`front_margin`, default
+  1.0). If packing needs the space, parts may sit closer to the front (and
+  the remaining slack goes to the back edge). This refines, not replaces,
+  §4a's 0.5" all-around soft cushion: the front edge target is 1".

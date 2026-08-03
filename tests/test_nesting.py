@@ -428,5 +428,78 @@ class CanonicalFormTests(unittest.TestCase):
         self.assertNotEqual(a.canonical(), b.canonical())
 
 
+class FrontMarginTests(unittest.TestCase):
+    """2026-08-03 amendment: soft front-edge margin (spec 4a refinement).
+
+    ``front_margin`` only nudges where an already-decided shelf stack sits
+    vertically; it must never change which parts fit on a sheet, so the
+    sheet count is pinned to the same 47 as before this feature existed.
+    """
+
+    def test_full_order_front_margin_holds_and_sheet_count_is_unchanged(self):
+        config = NestingConfig()
+        result = nest(ORDER_7_21_26, config)
+
+        self.assertEqual(result.total_sheets, 47, "front_margin changed the sheet count")
+        self.assertEqual(validate_layouts(result, config), [])
+
+        for i, (layout, _run) in enumerate(result.unique_sheets, start=1):
+            top_level = layout.placements
+            self.assertTrue(top_level, f"sheet {i}: empty")
+            min_y = min(p.y for p in top_level)
+            max_top = max(p.y + p.height for p in top_level)
+            # Slack derived independently from the placements themselves,
+            # not from anything the packer recorded.
+            slack = config.sheet_height - (max_top - min_y)
+            if slack >= config.front_margin - EPS:
+                self.assertAlmostEqual(
+                    min_y, config.front_margin, places=6,
+                    msg=f"sheet {i}: expected the full front margin",
+                )
+            else:
+                self.assertAlmostEqual(
+                    min_y, max(0.0, slack), places=6,
+                    msg=f"sheet {i}: expected all slack spent on the front",
+                )
+
+    def test_single_part_with_two_inches_of_slack_gets_the_full_margin(self):
+        result = nest([PartSpec("P", 20.0, 95.0, 1)], NestingConfig())
+        p = result.unique_sheets[0][0].placements[0]
+        self.assertAlmostEqual(p.y, 1.0)
+
+    def test_single_part_with_half_an_inch_of_slack_gets_all_of_it_up_front(self):
+        # 97 - 96.5 = 0.5" of slack, less than the 1" default margin: all of
+        # it goes to the front and the back edge sits flush.
+        result = nest([PartSpec("P", 20.0, 96.5, 1)], NestingConfig())
+        p = result.unique_sheets[0][0].placements[0]
+        self.assertAlmostEqual(p.y, 0.5)
+        self.assertAlmostEqual(p.y + p.height, 97.0)
+
+    def test_single_part_with_no_slack_sits_flush(self):
+        result = nest([PartSpec("P", 20.0, 97.0, 1)], NestingConfig())
+        p = result.unique_sheets[0][0].placements[0]
+        self.assertAlmostEqual(p.y, 0.0)
+
+    def test_front_margin_zero_reproduces_flush_vertical_behaviour(self):
+        cfg = NestingConfig(front_margin=0.0)
+        result = nest([PartSpec("P", 20.0, 97.0, 1)], cfg)
+        self.assertEqual(validate_layouts(result, cfg), [])
+        p = result.unique_sheets[0][0].placements[0]
+        self.assertAlmostEqual(p.y, 0.0)
+
+        # Also true when there IS slack: with the margin off, none of it is
+        # reserved for the front.
+        cfg_slack = NestingConfig(front_margin=0.0)
+        result_slack = nest([PartSpec("Q", 20.0, 50.0, 1)], cfg_slack)
+        q = result_slack.unique_sheets[0][0].placements[0]
+        self.assertAlmostEqual(q.y, 0.0)
+
+    def test_front_margin_rejected_when_invalid(self):
+        with self.assertRaises(NestingError):
+            nest([PartSpec("P", 10.0, 10.0, 1)], NestingConfig(front_margin=-1.0))
+        with self.assertRaises(NestingError):
+            nest([PartSpec("P", 10.0, 10.0, 1)], NestingConfig(front_margin=float("nan")))
+
+
 if __name__ == "__main__":
     unittest.main()

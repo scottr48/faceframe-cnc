@@ -119,15 +119,21 @@ class Parse7_21Tests(unittest.TestCase):
         # Must not also appear among the good lines.
         self.assertIsNone(_line_by_part(self.result.lines, "WDC2436"))
 
-    def test_sd1212_needs_attention_missing_both(self):
-        sd = next(
-            (l for l in self.result.needs_attention if l.part_number == "SD1212"), None
-        )
-        self.assertIsNotNone(sd, "SD1212 should be in needs_attention (missing both dims)")
+    def test_sd1212_is_no_frame_not_needs_attention(self):
+        # 2026-08-03 amendment ("SD1212 / no-faceframe lines"): SD1212 is a
+        # sample door with BOTH frame dims blank on the order form (N/A --
+        # no faceframe is cut for it), so it belongs in ``no_frame``, not
+        # ``needs_attention`` (which is reserved for exactly-one-missing
+        # rows like WDC2436).
+        sd = next((l for l in self.result.no_frame if l.part_number == "SD1212"), None)
+        self.assertIsNotNone(sd, "SD1212 should be in no_frame (missing both dims)")
         self.assertIsNone(sd.frame_width)
         self.assertIsNone(sd.frame_height)
         self.assertEqual(sd.missing, ("width", "height"))
         self.assertIsNone(_line_by_part(self.result.lines, "SD1212"))
+        self.assertIsNone(
+            next((l for l in self.result.needs_attention if l.part_number == "SD1212"), None)
+        )
 
     def test_known_parts_and_frame_type_inference(self):
         expected = {
@@ -164,6 +170,17 @@ class Parse7_7Tests(unittest.TestCase):
             self.assertGreater(line.frame_width, 0)
             self.assertGreater(line.frame_height, 0)
 
+    def test_sd1212_is_no_frame_and_needs_attention_is_empty(self):
+        # 2026-08-03 amendment: in the 7-7 file SD1212 is the only
+        # incomplete row, and it is missing BOTH dims, so it lands in
+        # no_frame -- leaving needs_attention empty for this file.
+        result = parse_order(ORDER_7_7)
+        sd = next((l for l in result.no_frame if l.part_number == "SD1212"), None)
+        self.assertIsNotNone(sd, "SD1212 should be in no_frame (missing both dims)")
+        self.assertEqual(sd.missing, ("width", "height"))
+        self.assertEqual(result.needs_attention, [])
+        self.assertIsNone(_line_by_part(result.lines, "SD1212"))
+
 
 @unittest.skipUnless(_IMPORT_ERROR is None, f"pandas/xlrd unavailable: {_IMPORT_ERROR}")
 class ResolveTests(unittest.TestCase):
@@ -179,9 +196,24 @@ class ResolveTests(unittest.TestCase):
 
     def test_resolve_raises_when_still_missing(self):
         result = parse_order(ORDER_7_21)
-        sd = next(l for l in result.needs_attention if l.part_number == "SD1212")
+        sd = next(l for l in result.no_frame if l.part_number == "SD1212")
         with self.assertRaises(ValueError):
             resolve(sd, width=12)  # height still missing
+
+    def test_resolve_no_frame_sd1212_yields_a_valid_order_line(self):
+        # 2026-08-03 amendment: a no_frame line stays manually resolvable --
+        # a user can still type dims and include the line if the order form
+        # was actually wrong. The qty-0 "Sample Door" row for SD1212 in this
+        # same file shows a 12 x 12 frame, so use that as the plausible
+        # resolution.
+        result = parse_order(ORDER_7_21)
+        sd = next(l for l in result.no_frame if l.part_number == "SD1212")
+        completed = resolve(sd, width=12, height=12)
+        self.assertIsInstance(completed, OrderLine)
+        self.assertEqual(completed.part_number, "SD1212")
+        self.assertEqual(completed.qty, sd.qty)
+        self.assertEqual(completed.frame_width, 12.0)
+        self.assertEqual(completed.frame_height, 12.0)
 
 
 if __name__ == "__main__":

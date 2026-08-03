@@ -179,6 +179,16 @@ class NestingConfig:
     #: packing allows it.  Parts may go all the way to the edge when they
     #: must; edge contact is scored as a last resort, never as an error.
     edge_cushion: float = 0.5
+    #: SOFT preference (2026-08-03 amendment): when a sheet's shelf stack
+    #: leaves vertical slack, start the stack this far off the front edge
+    #: (Y=0, the sheet origin) — i.e. parts sit exactly this far from the
+    #: front edge when there is at least this much slack, all the available
+    #: slack when there is less, and flush (0) when there is none.  Whatever
+    #: slack is left over goes to the back edge instead.  This refines, not
+    #: replaces, ``edge_cushion``: it is the vertical front-edge target
+    #: specifically, applied from leftover slack AFTER shelf selection, so
+    #: it never changes which parts fit on a sheet or the sheet count.
+    front_margin: float = 1.0
     #: Spec 4b: place small frames inside larger frames' routed openings.
     #: Default OFF so plain footprint packing (Milestone 2) is unchanged.
     inside_nesting: bool = False
@@ -491,6 +501,8 @@ def _check_config(config: NestingConfig) -> None:
         problems.append(f"part_gap must be >= 0 and finite, got {config.part_gap!r}")
     if not (math.isfinite(config.edge_cushion) and config.edge_cushion >= 0):
         problems.append(f"edge_cushion must be >= 0 and finite, got {config.edge_cushion!r}")
+    if not (math.isfinite(config.front_margin) and config.front_margin >= 0):
+        problems.append(f"front_margin must be >= 0 and finite, got {config.front_margin!r}")
     if problems:
         raise NestingError("invalid NestingConfig: " + "; ".join(problems))
 
@@ -855,10 +867,11 @@ def _build_sheet(
     if not shelves:
         return layout, counts
 
-    # Soft edge cushion: spend whatever vertical slack is left on a bottom
-    # margin (up to the cushion, balanced against the top margin).
+    # Soft front-edge margin (2026-08-03 amendment): spend up to
+    # front_margin of whatever vertical slack is left on the front (Y=0)
+    # side of the stack; any slack beyond that goes to the back edge.
     slack_v = cfg.sheet_height - used_height
-    y = min(cfg.edge_cushion, max(0.0, slack_v) / 2.0)
+    y = min(cfg.front_margin, max(0.0, slack_v))
 
     for shelf_h, row_width, items in shelves:
         slack_h = cfg.sheet_width - row_width

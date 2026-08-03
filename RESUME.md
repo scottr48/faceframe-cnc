@@ -30,7 +30,7 @@ spec and the reference `.anc` files disagree, the .anc files win.
   Fable may do directly.
 - Check in with Scott after each milestone; only commit when asked.
 
-## State: Milestones 1 and 2 complete and reviewed
+## State: Milestones 1-4 complete and reviewed
 
 - `faceframe_cnc/geometry.py` — frame-type inference + opening geometry.
   WDC is special (2026-08-03 amendment): 2" stiles, WDC2436 is 18x36 →
@@ -46,10 +46,26 @@ spec and the reference `.anc` files disagree, the .anc files win.
   7-21 order: 47 sheets, 16 unique pictures, 85.8% fill (area floor 41).
   `Placement.children` reserved for M3 inners.
 
-## Next: Milestone 3 — frame-inside-frame (spec §4b)
+- `faceframe_cnc/inside.py` + nesting.py M3 extensions — frame-inside-frame
+  (spec 4b): exact max-flow inner/host assignment, WDC2436 dual-role
+  (hosts a rotated W3012 AND nests inside W2742/W2442), portfolio ranked
+  sheets-first (nesting B18 is a net loss — it packs free beside 30" parts).
+  7-21 order: 40 sheets vs 47 baseline, 80 inners, validator recurses into
+  children (containment vs recomputed openings, CCW rotation convention).
+- `faceframe_cnc/gui/` — Milestone 4 PySide6 GUI (PySide6 6.11.1 verified on
+  Py 3.14): headless `session.py` holds ALL logic (order load/resolve/include,
+  optimize, move/rotate/cross-sheet/nest/unnest edits validated on trial
+  copies — invalid edits snap back with the violated rule; spec-4c run
+  splitting and re-grouping). Qt widgets are thin. Launch:
+  `.venv\Scripts\python.exe -m faceframe_cnc.gui` (`--self-test N` for
+  headless smoke). Settings persist to faceframe_settings.json (gitignored).
 
-Host eligibility incl. WDC as wall-style host; clearance rule
-inner + 0.75 ≤ opening per axis with rotation; center inners; prefer
-smallest inner, one per host; verify amended candidate table (WDC2436 row:
-only rotated W3012 fits its 14x33 opening). Baseline to beat: 47 sheets.
-Then M4 GUI, M5 NC post, M6 PDF report.
+## Next: Milestone 5 — NC post (.anc generation)
+
+First reproduce R710101N.anc from its own layout data and diff (structure
+match, coords within 0.001); then R720101N.anc (nested frames — THE key
+case); only then generate for optimized sheets. Tool grammar extracted from
+reference files, never invented. Verifier gates every emitted file (Z limits
+section 8, bounds, gaps, header/footer byte-match). Then M6 PDF report.
+Note: T11 opening through-cuts run tool center 0.1975 inside the opening
+edge (0.1875 radius + 0.010 T12 finish stock) — verified vs R730101N.anc.

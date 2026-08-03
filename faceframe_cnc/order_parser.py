@@ -14,6 +14,20 @@ This module is NOT imported by ``faceframe_cnc/__init__.py`` so that
 ``import faceframe_cnc`` keeps working on a bare stdlib Python without
 pandas/xlrd installed (see Milestone 1a). Importing *this* module without
 those dependencies raises the normal ``ImportError`` at import time.
+
+Amendment (2026-08-03, "SD1212 / no-faceframe lines", see the Amendments
+section of ``docs/CLAUDE_CODE_PROMPT_Faceframe_Optimizer.md`` — it
+supersedes section 2's "exclude SD1212 after prompting"): a row with QTY > 0
+and BOTH frame dimensions missing (e.g. ``SD1212``, a sample door whose
+order form shows N/A for the faceframe — no faceframe is cut for it) is a
+"no faceframe required" line, not a "needs attention" line. Those rows are
+collected in :attr:`ParseResult.no_frame` instead of
+:attr:`ParseResult.needs_attention`, are never prompted for, and are
+auto-excluded (shown informationally, still manually resolvable — a user
+can type dimensions and include the line if the order form was actually
+wrong). ``needs_attention`` now only ever holds rows missing exactly ONE
+frame dimension (e.g. ``WDC2436`` in the 7-21 file, missing only the
+width).
 """
 
 from __future__ import annotations
@@ -131,6 +145,12 @@ class NeedsAttentionLine:
 
     ``missing`` lists which of ``("width", "height")`` are absent so a UI
     can prompt for exactly those; ``reason`` is a ready-to-display message.
+
+    This dataclass is reused for :attr:`ParseResult.no_frame` rows (the
+    2026-08-03 "SD1212 / no-faceframe lines" amendment): a row missing BOTH
+    dimensions has ``missing == ("width", "height")`` and lands in
+    ``no_frame`` instead of ``needs_attention``, but is otherwise the same
+    shape — :func:`resolve` works on either.
     """
 
     row_index: int
@@ -146,22 +166,35 @@ class NeedsAttentionLine:
 
 @dataclass
 class ParseResult:
-    """Outcome of parsing one order spreadsheet."""
+    """Outcome of parsing one order spreadsheet.
+
+    ``needs_attention`` holds rows missing exactly ONE frame dimension
+    (the user is prompted for it). ``no_frame`` holds rows missing BOTH
+    frame dimensions — "no faceframe required" lines (2026-08-03
+    amendment) such as ``SD1212`` — which are shown informationally and
+    never prompted for.
+    """
 
     lines: list[OrderLine] = field(default_factory=list)
     needs_attention: list[NeedsAttentionLine] = field(default_factory=list)
+    no_frame: list[NeedsAttentionLine] = field(default_factory=list)
     skipped_rows: int = 0
 
 
 def parse_order(path: str) -> ParseResult:
     """Parse a legacy ``.xls`` order spreadsheet into a :class:`ParseResult`.
 
-    Rules (spec section 2):
+    Rules (spec section 2, as amended 2026-08-03 — "SD1212 / no-faceframe
+    lines"):
     - Only rows with QTY > 0 are considered at all.
     - The "Quantity Total" summary row is always excluded, never surfaced
-      in ``needs_attention`` even though its QTY is > 0.
-    - Rows with QTY > 0 but a missing/non-numeric FRAME W or H go to
+      in ``needs_attention`` or ``no_frame`` even though its QTY is > 0.
+    - Rows with QTY > 0 missing exactly ONE of FRAME W / FRAME H go to
       ``needs_attention`` instead of being dropped or guessed at.
+    - Rows with QTY > 0 missing BOTH FRAME W and FRAME H go to
+      ``no_frame`` — the order form is saying no faceframe is cut for
+      this line (e.g. ``SD1212``, a sample door) — not ``needs_attention``.
+      These are never prompted for.
     - Every other row (blank rows, section headers, repeated column-header
       rows, rows with QTY <= 0 or non-numeric QTY) is silently skipped and
       counted in ``skipped_rows``.
@@ -174,6 +207,7 @@ def parse_order(path: str) -> ParseResult:
 
     lines: list[OrderLine] = []
     needs_attention: list[NeedsAttentionLine] = []
+    no_frame: list[NeedsAttentionLine] = []
     skipped_rows = 0
 
     for row_index, row in df.iterrows():
@@ -204,19 +238,24 @@ def parse_order(path: str) -> ParseResult:
                 name for name, val in (("width", frame_w), ("height", frame_h)) if val is None
             )
             reason = "missing frame " + " and ".join(missing)
-            needs_attention.append(
-                NeedsAttentionLine(
-                    row_index=int(row_index),
-                    part_number=part,
-                    qty=qty,
-                    frame_width=frame_w,
-                    frame_height=frame_h,
-                    frame_type=frame_type,
-                    drawer_faces=drawer_faces,
-                    missing=missing,
-                    reason=reason,
-                )
+            attention_line = NeedsAttentionLine(
+                row_index=int(row_index),
+                part_number=part,
+                qty=qty,
+                frame_width=frame_w,
+                frame_height=frame_h,
+                frame_type=frame_type,
+                drawer_faces=drawer_faces,
+                missing=missing,
+                reason=reason,
             )
+            if len(missing) == 2:
+                # 2026-08-03 amendment: both dims missing means the order
+                # form is saying no faceframe is cut for this line (e.g.
+                # SD1212, a sample door) -- not a dimension to chase down.
+                no_frame.append(attention_line)
+            else:
+                needs_attention.append(attention_line)
             continue
 
         lines.append(
@@ -231,7 +270,12 @@ def parse_order(path: str) -> ParseResult:
             )
         )
 
-    return ParseResult(lines=lines, needs_attention=needs_attention, skipped_rows=skipped_rows)
+    return ParseResult(
+        lines=lines,
+        needs_attention=needs_attention,
+        no_frame=no_frame,
+        skipped_rows=skipped_rows,
+    )
 
 
 def resolve(
@@ -240,11 +284,16 @@ def resolve(
     width: Optional[float] = None,
     height: Optional[float] = None,
 ) -> OrderLine:
-    """Complete a ``needs_attention`` line with a user-supplied dimension.
+    """Complete a ``needs_attention`` or ``no_frame`` line with a user-supplied dimension.
 
-    Only dimensions the line is actually missing need to be supplied;
-    already-present dimensions are kept as parsed. Raises ``ValueError`` if
-    a required dimension is still missing after this call.
+    Works on a line from either :attr:`ParseResult.needs_attention` or
+    :attr:`ParseResult.no_frame` -- both are :class:`NeedsAttentionLine`,
+    and the 2026-08-03 amendment keeps ``no_frame`` lines "manually
+    resolvable" (a user can still type dims and include the line if the
+    order form was actually wrong). Only dimensions the line is actually
+    missing need to be supplied; already-present dimensions are kept as
+    parsed. Raises ``ValueError`` if a required dimension is still missing
+    after this call.
     """
     resolved_w = line.frame_width if line.frame_width is not None else width
     resolved_h = line.frame_height if line.frame_height is not None else height
