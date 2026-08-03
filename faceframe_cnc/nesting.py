@@ -1,11 +1,24 @@
-"""Sheet-nesting optimizer — footprint packing (spec sections 4a and 4c).
+"""Sheet-nesting optimizer — footprint packing and frame-inside-frame nesting.
 
-Milestone 2 scope: pack whole faceframe footprints (outside W x H) onto
+Covers spec sections 4a (footprint packing), 4b (frame-inside-frame) and 4c
+(sheet uniqueness): pack whole faceframe footprints (outside W x H) onto
 49 x 97 sheets, honouring the 0.375" edge-to-edge part gap, allowing 90
 degree rotation of every part, and grouping identical sheet pictures into
-runs.  Frame-inside-frame placement (spec 4b) is Milestone 3 and is NOT
-implemented here; :class:`Placement` carries an empty ``children`` list so
-that milestone can hang inner frames off a host without a schema change.
+runs.
+
+Frame-inside-frame (spec 4b, the capability the shop's CAM lacks) is opt-in
+via ``NestingConfig.inside_nesting``; with it off, this module behaves
+exactly as it did in Milestone 2.  With it on, a pairing phase
+(:mod:`faceframe_cnc.inside`) runs FIRST and decides which small frames sit
+inside which large frames' routed openings; the packer then packs the hosts
+— whose footprints are unchanged by their passengers — plus everything that
+was not nested.  Each nested frame is one whole footprint the sheet no
+longer has to find room for.
+
+Hosts reach the packer under a synthetic part number (``HOST\\x1fINNER``) so
+that "a W3036 carrying a W3024" and "a bare W3036" are distinct sheet
+contents for run grouping, which is what spec 4c means by a unique sheet
+picture.  The synthetic names never escape :func:`nest`.
 
 Stdlib only.  Fully deterministic: same input always yields a byte-identical
 result (every collection is sorted before it is iterated; no randomness).
@@ -49,6 +62,9 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
+from .geometry import compute_geometry
+from .inside import assign_inners, best_fit
+
 __all__ = [
     "EPS",
     "NestingError",
@@ -58,6 +74,7 @@ __all__ = [
     "SheetLayout",
     "NestingResult",
     "nest",
+    "place_inner",
     "validate_layouts",
 ]
 
@@ -162,10 +179,32 @@ class NestingConfig:
     #: packing allows it.  Parts may go all the way to the edge when they
     #: must; edge contact is scored as a last resort, never as an error.
     edge_cushion: float = 0.5
+    #: Spec 4b: place small frames inside larger frames' routed openings.
+    #: Default OFF so plain footprint packing (Milestone 2) is unchanged.
+    inside_nesting: bool = False
+    #: Spec 4b: allow an inner frame to host a frame of its own (depth 3+).
+    #: Default OFF.  The optimizer never builds depth-2 nests on its own —
+    #: this flag only decides whether :func:`validate_layouts` accepts one,
+    #: so a hand-built GUI layout can go deeper when the user asks for it.
+    inside_recursion: bool = False
+    #: When inside nesting is on, also run a plain footprint pass so the
+    #: summary can quote "sheets saved vs no-inside baseline" (spec 5).
+    #: Costs one extra pack; turn it off if the delta is not wanted.
+    inside_baseline: bool = True
 
     @property
     def sheet_area(self) -> float:
         return self.sheet_width * self.sheet_height
+
+    @property
+    def inner_clearance(self) -> float:
+        """Required clearance per side between an inner and its opening.
+
+        Spec 4b's ``inner + 0.75 <= opening`` is the same 0.375" the parts
+        keep from each other on the sheet, so the two follow one setting and
+        can never drift apart.
+        """
+        return self.part_gap
 
 
 @dataclass(frozen=True)
@@ -196,9 +235,13 @@ class Placement:
     ``rotated`` is true), so ``x + width`` and ``y + height`` are the
     part's real extents without any further reasoning.
 
-    ``children`` is reserved for Milestone 3 (frame-inside-frame): inner
-    frames placed inside this part's routed opening.  Milestone 2 always
-    leaves it empty.
+    ``children`` holds frame-inside-frame passengers (spec 4b): whole
+    frames placed inside this part's routed openings.  A child's ``x`` /
+    ``y`` are SHEET coordinates like everyone else's — not relative to the
+    host — so no caller has to compose transforms, and ``rotated`` is the
+    child's ABSOLUTE orientation on the sheet (a child turned 90° inside a
+    host that is itself turned 90° comes out upright).  Empty unless
+    ``NestingConfig.inside_nesting`` is on.
     """
 
     part_number: str
@@ -272,6 +315,43 @@ class SheetLayout:
         walk(self.placements)
         return total
 
+    def footprint_area(self) -> float:
+        """Area this sheet actually gives up: top-level footprints only.
+
+        A nested frame is cut from a host's interior waste, so it yields
+        product without consuming any more sheet — which is exactly why
+        ``used_area`` (everything, nested included) and this are different
+        numbers once inside nesting is on.
+        """
+        return sum(p.area for p in self.placements)
+
+    def child_count(self) -> int:
+        """Frames nested inside another frame on this sheet, at any depth."""
+        total = 0
+
+        def walk(items: list) -> None:
+            nonlocal total
+            for p in items:
+                total += len(p.children)
+                walk(p.children)
+
+        walk(self.placements)
+        return total
+
+    def nested_area(self) -> float:
+        """Footprint area recovered from the hosts' interior waste."""
+        total = 0.0
+
+        def walk(items: list, depth: int) -> None:
+            nonlocal total
+            for p in items:
+                if depth > 0:
+                    total += p.area
+                walk(p.children, depth + 1)
+
+        walk(self.placements, 0)
+        return total
+
 
 @dataclass
 class NestingResult:
@@ -287,10 +367,24 @@ class NestingResult:
     total_sheets: int
     demand: list[PartSpec]
     config: NestingConfig
+    #: Physical frames placed inside another frame's opening (spec 4b),
+    #: counted per sheet cut, i.e. already multiplied by each run quantity.
+    inside_placements: int = 0
+    #: Sheets the same order needs with inside nesting turned off.  ``None``
+    #: when no baseline pass was run (inside nesting off, or
+    #: ``inside_baseline`` disabled).
+    baseline_sheets: int | None = None
 
     @property
     def unique_sheet_count(self) -> int:
         return len(self.unique_sheets)
+
+    @property
+    def sheets_saved(self) -> int | None:
+        """Sheets saved versus the no-inside-nesting baseline (spec 5)."""
+        if self.baseline_sheets is None:
+            return None
+        return self.baseline_sheets - self.total_sheets
 
     @property
     def total_parts(self) -> int:
@@ -301,21 +395,39 @@ class NestingResult:
         return sum(spec.area * spec.qty for spec in self.demand)
 
     @property
+    def nested_part_area(self) -> float:
+        """Ordered area that came out of hosts' waste, not out of new sheet."""
+        return sum(
+            layout.nested_area() * run for layout, run in self.unique_sheets
+        )
+
+    @property
     def area_lower_bound_sheets(self) -> int:
-        """Absolute floor on sheet count: total part area / sheet area."""
+        """Absolute floor on sheet count: sheet-consuming area / sheet area.
+
+        Frames nested inside a host are cut from interior waste the host
+        already paid for, so they do not consume sheet area and are excluded.
+        With inside nesting off nothing is nested and this is simply the
+        total part area over the sheet area.
+        """
         sheet_area = self.config.sheet_area
         if sheet_area <= 0:
             return 0
-        return math.ceil(self.total_part_area / sheet_area - 1e-9)
+        consuming = self.total_part_area - self.nested_part_area
+        return math.ceil(max(0.0, consuming) / sheet_area - 1e-9)
 
     def fill_fraction(self, layout: SheetLayout) -> float:
+        """How much of the sheet the footprints consume (nested frames are
+        free riders in a host's waste, so they are not counted)."""
         area = self.config.sheet_area
-        return layout.used_area() / area if area > 0 else 0.0
+        return layout.footprint_area() / area if area > 0 else 0.0
 
     @property
     def overall_fill_fraction(self) -> float:
         denom = self.total_sheets * self.config.sheet_area
-        return self.total_part_area / denom if denom > 0 else 0.0
+        if denom <= 0:
+            return 0.0
+        return (self.total_part_area - self.nested_part_area) / denom
 
     def edge_contact_parts(self) -> int:
         """Placements (weighted by run qty) that fail the soft edge cushion."""
@@ -343,13 +455,23 @@ class NestingResult:
             f"unique_sheets={self.unique_sheet_count} "
             f"overall_fill={self.overall_fill_fraction * 100:.1f}%",
         ]
+        if self.config.inside_nesting:
+            saved = self.sheets_saved
+            baseline = (
+                f" baseline={self.baseline_sheets} saved={saved}"
+                if saved is not None
+                else ""
+            )
+            lines.append(f"inside_placements={self.inside_placements}{baseline}")
         for i, (layout, run) in enumerate(self.unique_sheets, start=1):
             contents = ", ".join(
                 f"{n}x{pn}" for pn, n in sorted(layout.part_counts().items())
             )
+            nested = layout.child_count()
+            inside = f" inside={nested}" if nested else ""
             lines.append(
                 f"  sheet {i:>2}: run={run:<3} fill={self.fill_fraction(layout) * 100:5.1f}% "
-                f"parts={len(layout):<2} [{contents}]"
+                f"parts={len(layout):<2}{inside} [{contents}]"
             )
         return "\n".join(lines)
 
@@ -832,29 +954,23 @@ def _run_strategy(ctx: _Context, demand: list[PartSpec], strategy: _Strategy):
     return grouped
 
 
-def nest(parts, config: NestingConfig | None = None) -> NestingResult:
-    """Nest ``parts`` onto sheets and group identical sheet pictures.
+def _pack(
+    demand: list[PartSpec],
+    cfg: NestingConfig,
+    strategies: tuple[_Strategy, ...] = _STRATEGIES,
+) -> NestingResult:
+    """Footprint-pack an already-normalised demand list (spec 4a / 4c).
 
-    ``parts`` is an iterable of :class:`PartSpec`.  Raises
-    :class:`NestingError` for invalid input or for any part that cannot fit
-    on a sheet in either orientation.
-
-    Every strategy in ``_STRATEGIES`` is run (until the deterministic work
+    Every strategy in ``strategies`` is run (until the deterministic work
     budget is spent) and the best result kept, ranked by the spec's
     objectives in order: fewest total sheets, then fewest unique sheet
     pictures, then the fewest parts sitting on a sheet edge.  Fully
     deterministic — the final tie-break is the layouts' canonical form.
     """
-    cfg = config if config is not None else NestingConfig()
-    _check_config(cfg)
-    demand = _normalize_demand(list(parts), cfg)
-    if not demand:
-        return NestingResult([], 0, [], cfg)
-
     ctx = _Context(demand, cfg)
     best_result = None
     best_key = None
-    for strategy in _STRATEGIES:
+    for strategy in strategies:
         if best_result is not None and ctx.dp_ops > _OPS_BUDGET:
             break
         grouped = _run_strategy(ctx, demand, strategy)
@@ -872,9 +988,399 @@ def nest(parts, config: NestingConfig | None = None) -> NestingResult:
     return best_result
 
 
+#: Separator for the synthetic "host carrying an inner" part numbers fed to
+#: the packer.  ASCII unit separator: not whitespace (so ``strip()`` leaves
+#: it alone) and impossible in a real part number off a spreadsheet.
+_SYNTHETIC_SEP = "\x1f"
+
+#: How many "give this inner type up" assignments :func:`nest` packs
+#: alongside the maximum-count one.
+#:
+#: Nesting a frame is not automatically a sheet-count win.  A B18 (18 x 30)
+#: rides for free in the 18" of width left over beside a 30"-wide frame, so
+#: hiding it inside a host's opening recovers nothing — while the host slot
+#: it occupied could have swallowed a frame that does NOT pack for free.  On
+#: the 7-21-26 order the flat-out maximum nests 92 frames and needs 41
+#: sheets; giving up B18 nests 80 and needs 40.  Spec section 4 ranks fewest
+#: sheets above most inside placements, so the packer decides.  The cap keeps
+#: a many-family order bounded; the screening pass below keeps the cost of
+#: the extra candidates down to a fraction of a pack each.
+_INSIDE_PORTFOLIO = 8
+
+#: Candidates are screened with the cheapest single strategy (about a tenth
+#: of the cost of a full pack) and only the leaders get the full portfolio.
+#: On the 7-21-26 order the screen predicts the full pack's sheet count
+#: exactly for every candidate, so this is a pure speed-up; three finalists
+#: leave room for it to be wrong by a sheet without changing the answer.
+_SCREEN_STRATEGIES = _STRATEGIES[:1]
+_INSIDE_FINALISTS = 3
+
+
+def place_inner(
+    host: Placement,
+    host_spec: PartSpec,
+    inner_spec: PartSpec,
+    config: NestingConfig,
+) -> Placement | None:
+    """Centre ``inner_spec`` in one of ``host``'s openings, in sheet coords.
+
+    Returns ``None`` when the inner does not fit any of the host's openings
+    with the required clearance, so a GUI drag can reject the drop.
+
+    The host's own openings come from the geometry engine in frame-local
+    coordinates; this maps them onto the sheet.  Rotation convention (used
+    identically by :func:`validate_layouts`, and the one the NC post must
+    follow): a rotated placement is the frame turned 90° COUNTER-CLOCKWISE,
+    so a frame-local point ``(lx, ly)`` lands at sheet offset
+    ``(ordered_height - ly, lx)`` inside the placed footprint — and
+    ``ordered_height`` is just ``host.width`` once the host is rotated.
+    """
+    fit = best_fit(
+        host_spec.part_number,
+        host_spec.width,
+        host_spec.height,
+        inner_spec.width,
+        inner_spec.height,
+        config.inner_clearance,
+    )
+    if fit is None:
+        return None
+
+    if host.rotated:
+        x = host.x + (host.width - fit.local_y - fit.local_height)
+        y = host.y + fit.local_x
+        width, height = fit.local_height, fit.local_width
+    else:
+        x = host.x + fit.local_x
+        y = host.y + fit.local_y
+        width, height = fit.local_width, fit.local_height
+
+    return Placement(
+        part_number=inner_spec.part_number,
+        x=round(x, 9),
+        y=round(y, 9),
+        width=width,
+        height=height,
+        # The child's flag is absolute: turned inside a turned host is upright.
+        rotated=(fit.inner_rotated != host.rotated),
+    )
+
+
+def _pack_demand_with_inners(demand: list[PartSpec], assignment):
+    """Rewrite demand so each assigned host arrives carrying its passenger.
+
+    Returns ``(pack_demand, decode)``.  A host type that takes an inner
+    becomes a synthetic type ``HOST\\x1fINNER`` with the host's footprint and
+    the assigned count; leftovers of that host, and of every inner not
+    nested, stay under their real part numbers.  ``decode`` maps each
+    synthetic name back to ``(host, inner)``.
+
+    Nesting does not consume extra units: a W3012 sitting inside a WDC2436
+    is one of the thirty W3012s the customer ordered, which is why the
+    inner's own quantity is decremented here rather than added to.
+    """
+    by_name = {s.part_number: s for s in demand}
+    remaining = {s.part_number: s.qty for s in demand}
+    pack: list[PartSpec] = []
+    decode: dict[str, tuple[str, str]] = {}
+
+    for host, inner, count in assignment.pairs:
+        if count <= 0:
+            continue
+        name = f"{host}{_SYNTHETIC_SEP}{inner}"
+        spec = by_name[host]
+        pack.append(PartSpec(name, spec.width, spec.height, count))
+        decode[name] = (host, inner)
+        remaining[host] -= count
+        remaining[inner] -= count
+
+    for pn in sorted(remaining):
+        left = remaining[pn]
+        if left < 0:
+            raise NestingError(
+                f"internal error: inside-nesting assignment used {-left} more "
+                f"{pn} than were ordered"
+            )
+        if left > 0:
+            spec = by_name[pn]
+            pack.append(PartSpec(pn, spec.width, spec.height, left))
+
+    pack.sort(key=lambda s: s.part_number)
+    return pack, decode
+
+
+def _expand_children(
+    packed: NestingResult,
+    decode: dict[str, tuple[str, str]],
+    demand: list[PartSpec],
+    cfg: NestingConfig,
+    baseline_sheets: int | None,
+) -> NestingResult:
+    """Turn synthetic host types back into real hosts with real children.
+
+    Run grouping already happened on the synthetic names, and the mapping
+    ``HOST\\x1fINNER -> (host, inner)`` is injective, so two sheet pictures
+    that grouped together really do carry the same inner in the same place
+    and two that did not really are different pictures (spec 4c).
+    """
+    by_name = {s.part_number: s for s in demand}
+    sheets: list[tuple[SheetLayout, int]] = []
+    inside_placements = 0
+
+    for layout, run in packed.unique_sheets:
+        placements: list[Placement] = []
+        for p in layout.placements:
+            pair = decode.get(p.part_number)
+            if pair is None:
+                placements.append(
+                    Placement(p.part_number, p.x, p.y, p.width, p.height, p.rotated, [])
+                )
+                continue
+            host_name, inner_name = pair
+            host = Placement(host_name, p.x, p.y, p.width, p.height, p.rotated, [])
+            child = place_inner(host, by_name[host_name], by_name[inner_name], cfg)
+            if child is None:
+                raise NestingError(
+                    f"internal error: {inner_name} was assigned to {host_name} but "
+                    f"does not fit its openings with {cfg.inner_clearance} clearance"
+                )
+            host.children.append(child)
+            inside_placements += run
+            placements.append(host)
+        sheets.append((SheetLayout(placements), run))
+
+    return NestingResult(
+        unique_sheets=sheets,
+        total_sheets=packed.total_sheets,
+        demand=demand,
+        config=cfg,
+        inside_placements=inside_placements,
+        baseline_sheets=baseline_sheets,
+    )
+
+
+def nest(parts, config: NestingConfig | None = None) -> NestingResult:
+    """Nest ``parts`` onto sheets and group identical sheet pictures.
+
+    ``parts`` is an iterable of :class:`PartSpec`.  Raises
+    :class:`NestingError` for invalid input or for any part that cannot fit
+    on a sheet in either orientation.
+
+    With ``config.inside_nesting`` off this is plain footprint packing.  With
+    it on, the frame-inside-frame pairing phase runs first, and a small
+    portfolio of assignments is packed so the result can be ranked by spec
+    section 4's objectives in their stated order — fewest total sheets
+    FIRST, then most inside placements (see ``_INSIDE_PORTFOLIO``).  The
+    no-inside baseline is also computed (``config.inside_baseline``) so the
+    summary can quote the delta, which is the app's headline value.
+    """
+    cfg = config if config is not None else NestingConfig()
+    _check_config(cfg)
+    demand = _normalize_demand(list(parts), cfg)
+    if not demand:
+        return NestingResult([], 0, [], cfg)
+
+    if not cfg.inside_nesting:
+        return _pack(demand, cfg)
+
+    baseline_sheets = _pack(demand, cfg).total_sheets if cfg.inside_baseline else None
+
+    unbarred = assign_inners(demand, cfg.inner_clearance)
+    if unbarred.total == 0:
+        result = _pack(demand, cfg)
+        result.baseline_sheets = baseline_sheets
+        return result
+
+    # Candidate assignments: the flat-out maximum, plus one per inner type
+    # that gives that type up.  Ranked by how many frames each type nests, so
+    # a truncated portfolio still covers the types that matter most.
+    ranked = sorted(unbarred.inners_used().items(), key=lambda kv: (-kv[1], kv[0]))
+    bars: list[frozenset] = [frozenset()]
+    bars.extend(frozenset([name]) for name, _n in ranked[:_INSIDE_PORTFOLIO])
+
+    screened = []
+    seen: set[tuple] = set()
+    for bar in bars:
+        assignment = unbarred if not bar else assign_inners(demand, cfg.inner_clearance, bar)
+        if assignment.total == 0:
+            continue
+        pack_demand, decode = _pack_demand_with_inners(demand, assignment)
+        signature = tuple((s.part_number, s.qty) for s in pack_demand)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        estimate = _pack(pack_demand, cfg, _SCREEN_STRATEGIES).total_sheets
+        screened.append(
+            (estimate, -assignment.total, sorted(bar), pack_demand, decode)
+        )
+    screened.sort(key=lambda entry: entry[:3])
+
+    best = None
+    best_key = None
+    for _estimate, _neg_total, _bar, pack_demand, decode in screened[:_INSIDE_FINALISTS]:
+        candidate = _expand_children(
+            _pack(pack_demand, cfg), decode, demand, cfg, baseline_sheets
+        )
+        key = (
+            candidate.total_sheets,               # 1. minimise total sheets
+            -candidate.inside_placements,         # 2. maximise inside placements
+            candidate.unique_sheet_count,         # 3. repeated sheet pictures
+            candidate.edge_contact_parts(),       # 4. keep off the sheet edges
+            "||".join(f"{l.canonical()}#{r}" for l, r in candidate.unique_sheets),
+        )
+        if best_key is None or key < best_key:
+            best_key = key
+            best = candidate
+
+    if best is None:
+        result = _pack(demand, cfg)
+        result.baseline_sheets = baseline_sheets
+        return result
+    return best
+
+
 # --------------------------------------------------------------------------
 # Independent validator
 # --------------------------------------------------------------------------
+
+
+#: Depth at which the validator stops descending and reports a malformed
+#: layout instead.  Real nests are depth 1, or 2 with ``inside_recursion``;
+#: anything past this is a cycle in the placement tree, not a cabinet.
+_MAX_NEST_DEPTH = 8
+
+
+def _flatten(placements: list) -> tuple[list[tuple[Placement, int]], bool]:
+    """Depth-first ``[(placement, parent_index)]`` plus a "too deep" flag.
+
+    Top-level placements get parent index -1.  The depth cap means a
+    self-referential ``children`` list degrades into a reported problem
+    rather than a stack overflow inside the NC verifier.
+    """
+    nodes: list[tuple[Placement, int]] = []
+    too_deep = False
+
+    def walk(items: list, parent_index: int, depth: int) -> None:
+        nonlocal too_deep
+        if depth > _MAX_NEST_DEPTH:
+            too_deep = True
+            return
+        for p in items:
+            index = len(nodes)
+            nodes.append((p, parent_index))
+            walk(p.children, index, depth + 1)
+
+    walk(placements, -1, 0)
+    return nodes, too_deep
+
+
+def _related(nodes: list[tuple[Placement, int]], a_idx: int, b_idx: int) -> bool:
+    """True when one of the two placements is an ancestor of the other."""
+    for lower, upper in ((a_idx, b_idx), (b_idx, a_idx)):
+        cursor = nodes[lower][1]
+        while cursor >= 0:
+            if cursor == upper:
+                return True
+            cursor = nodes[cursor][1]
+    return False
+
+
+def _ordered_dims(p: Placement, ordered: dict[str, PartSpec]) -> tuple[float, float]:
+    """The part's as-ordered ``(width, height)``.
+
+    Prefers the order line, falling back to undoing the placement's own
+    rotation.  Any disagreement between the two is already reported by the
+    "dimensions must never be altered" check, so this never hides one.
+    """
+    spec = ordered.get(p.part_number)
+    if spec is not None:
+        return spec.width, spec.height
+    return (p.height, p.width) if p.rotated else (p.width, p.height)
+
+
+def _sheet_openings(parent: Placement, ordered: dict[str, PartSpec]):
+    """The parent's routed openings as ``(x, y, w, h)`` in SHEET coordinates.
+
+    Recomputed from the geometry engine, never from anything the packer
+    stored.  Returns ``(rects, error)``; ``error`` is a human-readable reason
+    when the part has no usable openings at all.
+
+    Rotation convention (shared with :func:`place_inner`): a rotated
+    placement is the frame turned 90° counter-clockwise, so frame-local
+    ``(lx, ly, w, h)`` becomes ``(ordered_h - ly - h, lx, h, w)`` inside the
+    placed footprint, and ``ordered_h`` equals the placed width.
+    """
+    width, height = _ordered_dims(parent, ordered)
+    geom = compute_geometry(parent.part_number, width, height)
+    if geom.errors:
+        return [], f"geometry is invalid ({geom.errors[0]})"
+    if not geom.openings:
+        return [], "the part has no routed openings"
+
+    rects = []
+    for opening in geom.openings:
+        if parent.rotated:
+            rects.append(
+                (
+                    parent.x + (parent.width - opening.y - opening.height),
+                    parent.y + opening.x,
+                    opening.height,
+                    opening.width,
+                )
+            )
+        else:
+            rects.append(
+                (
+                    parent.x + opening.x,
+                    parent.y + opening.y,
+                    opening.width,
+                    opening.height,
+                )
+            )
+    return rects, None
+
+
+def _check_containment(
+    sheet: int,
+    child: Placement,
+    parent: Placement,
+    ordered: dict[str, PartSpec],
+    config: NestingConfig,
+) -> list[str]:
+    """Child footprint + clearance must lie wholly inside ONE parent opening."""
+    clearance = config.inner_clearance
+    rects, error = _sheet_openings(parent, ordered)
+    if error is not None:
+        return [
+            f"sheet {sheet}: {child.part_number} is nested inside "
+            f"{parent.part_number} but {error}"
+        ]
+
+    need_x0 = child.x - clearance
+    need_y0 = child.y - clearance
+    need_x1 = child.x + child.width + clearance
+    need_y1 = child.y + child.height + clearance
+
+    best_shortfall = None
+    for ox, oy, ow, oh in rects:
+        shortfall = max(
+            ox - need_x0,
+            oy - need_y0,
+            need_x1 - (ox + ow),
+            need_y1 - (oy + oh),
+        )
+        if shortfall <= EPS:
+            return []
+        if best_shortfall is None or shortfall < best_shortfall:
+            best_shortfall = shortfall
+
+    return [
+        f"sheet {sheet}: {child.part_number} @({child.x:.4f},{child.y:.4f}) "
+        f"{child.width:.4f}x{child.height:.4f} does not fit inside any single "
+        f"opening of {parent.part_number} @({parent.x:.4f},{parent.y:.4f}) with "
+        f"{clearance} clearance — closest opening is short by "
+        f"{best_shortfall:.4f}"
+    ]
 
 
 def validate_layouts(result: NestingResult, config: NestingConfig) -> list[str]:
@@ -885,14 +1391,30 @@ def validate_layouts(result: NestingResult, config: NestingConfig) -> list[str]:
     flag or cached value the packer left behind, because this routine becomes
     part of the NC safety verifier.
 
-    Checks: parts fully on the sheet, minimum edge-to-edge part gap, placed
-    dimensions matching the ordered dimensions (allowing only a rotation
-    swap), run quantities summing to the physical sheet count, and every
-    ordered part placed exactly the ordered number of times.
+    Checks, applied to nested (frame-inside-frame) placements as well as
+    top-level ones: parts fully on the sheet, minimum edge-to-edge part gap,
+    placed dimensions matching the ordered dimensions (allowing only a
+    rotation swap), run quantities summing to the physical sheet count, and
+    every ordered part placed exactly the ordered number of times.
+
+    Frame-inside-frame adds (spec 4b):
+
+    *   every child's footprint plus ``part_gap`` on all four sides must lie
+        wholly within ONE opening of its parent.  The openings are recomputed
+        from :func:`~faceframe_cnc.geometry.compute_geometry` using the
+        parent's part number and ORDERED dimensions and then transformed by
+        the parent's own placement — nothing the packer recorded about the
+        child is trusted.  This one check is what rejects a child on a part
+        that has no openings, a child straddling a cross bar or rail, and a
+        child that overhangs its opening;
+    *   children of children only when ``config.inside_recursion`` is on;
+    *   the ordinary part-gap rule between any two placements that are not
+        ancestor and descendant of each other — so siblings sharing an
+        opening are checked, while a child is not reported for "overlapping"
+        the host it is by definition inside.
 
     The soft edge cushion is a preference, not a rule, so a part sitting on
-    the sheet edge is never reported here.  Child (frame-inside-frame)
-    placements are Milestone 3 and are not inspected.
+    the sheet edge is never reported here.
     """
     problems: list[str] = []
 
@@ -918,14 +1440,36 @@ def validate_layouts(result: NestingResult, config: NestingConfig) -> list[str]:
             f"run quantities sum to {run_total} but total_sheets is {result.total_sheets}"
         )
 
+    # --- demand, needed below for the parents' ORDERED dimensions -------
+    ordered: dict[str, PartSpec] = {}
+    for spec in result.demand:
+        if spec.part_number in ordered:
+            problems.append(f"demand lists {spec.part_number} more than once")
+            continue
+        ordered[spec.part_number] = spec
+
     # --- per-sheet geometry -------------------------------------------
+    placed: dict[str, int] = {}
     for i, (layout, run) in enumerate(result.unique_sheets, start=1):
-        placements = list(layout.placements)
-        if not placements:
+        if not layout.placements:
             problems.append(f"sheet {i}: empty sheet layout")
-        for p in placements:
+        nodes, cycle = _flatten(layout.placements)
+        if cycle:
+            problems.append(
+                f"sheet {i}: nesting is deeper than {_MAX_NEST_DEPTH} levels — "
+                f"a placement is probably its own descendant"
+            )
+
+        multiplier = run if isinstance(run, int) and not isinstance(run, bool) and run > 0 else 0
+        for p, parent_index in nodes:
+            placed[p.part_number] = placed.get(p.part_number, 0) + multiplier
+
+        # -- each placement on its own ---------------------------------
+        sane = [True] * len(nodes)
+        for index, (p, _parent_index) in enumerate(nodes):
             if not (math.isfinite(p.x) and math.isfinite(p.y)):
                 problems.append(f"sheet {i}: {p.part_number} has non-finite position")
+                sane[index] = False
                 continue
             if not (math.isfinite(p.width) and p.width > 0) or not (
                 math.isfinite(p.height) and p.height > 0
@@ -934,6 +1478,7 @@ def validate_layouts(result: NestingResult, config: NestingConfig) -> list[str]:
                     f"sheet {i}: {p.part_number} has non-positive placed size "
                     f"{p.width}x{p.height}"
                 )
+                sane[index] = False
                 continue
             if p.x < -EPS or p.y < -EPS or p.x + p.width > sw + EPS or p.y + p.height > sh + EPS:
                 problems.append(
@@ -942,10 +1487,34 @@ def validate_layouts(result: NestingResult, config: NestingConfig) -> list[str]:
                     f"on a {sw}x{sh} sheet"
                 )
 
-        for a_idx in range(len(placements)):
-            a = placements[a_idx]
-            for b_idx in range(a_idx + 1, len(placements)):
-                b = placements[b_idx]
+            spec = ordered.get(p.part_number)
+            if spec is not None:
+                same = (
+                    abs(p.width - spec.width) <= EPS and abs(p.height - spec.height) <= EPS
+                )
+                swapped = (
+                    abs(p.width - spec.height) <= EPS and abs(p.height - spec.width) <= EPS
+                )
+                if not ((swapped and p.rotated) or (same and not p.rotated)):
+                    problems.append(
+                        f"sheet {i}: {p.part_number} placed as {p.width}x{p.height} "
+                        f"(rotated={p.rotated}) but was ordered {spec.width}x{spec.height} — "
+                        f"part dimensions must never be altered"
+                    )
+
+        # -- pairwise gap, skipping ancestor/descendant pairs -----------
+        for a_idx in range(len(nodes)):
+            if not sane[a_idx]:
+                continue
+            a = nodes[a_idx][0]
+            for b_idx in range(a_idx + 1, len(nodes)):
+                if not sane[b_idx]:
+                    continue
+                if _related(nodes, a_idx, b_idx):
+                    # A child sits inside its host's footprint by design; the
+                    # containment check below is what polices that pair.
+                    continue
+                b = nodes[b_idx][0]
                 overlap_x = min(a.x + a.width + half, b.x + b.width + half) - max(
                     a.x - half, b.x - half
                 )
@@ -966,35 +1535,23 @@ def validate_layouts(result: NestingResult, config: NestingConfig) -> list[str]:
                         f"@({b.x:.4f},{b.y:.4f}) — {detail}"
                     )
 
-    # --- demand accounting --------------------------------------------
-    ordered: dict[str, PartSpec] = {}
-    for spec in result.demand:
-        if spec.part_number in ordered:
-            problems.append(f"demand lists {spec.part_number} more than once")
-            continue
-        ordered[spec.part_number] = spec
-
-    placed: dict[str, int] = {}
-    for i, (layout, run) in enumerate(result.unique_sheets, start=1):
-        multiplier = run if isinstance(run, int) and not isinstance(run, bool) and run > 0 else 0
-        for p in layout.placements:
-            placed[p.part_number] = placed.get(p.part_number, 0) + multiplier
-            spec = ordered.get(p.part_number)
-            if spec is None:
+        # -- frame-inside-frame containment (spec 4b) -------------------
+        for index, (child, parent_index) in enumerate(nodes):
+            if parent_index < 0:
                 continue
-            same = (
-                abs(p.width - spec.width) <= EPS and abs(p.height - spec.height) <= EPS
-            )
-            swapped = (
-                abs(p.width - spec.height) <= EPS and abs(p.height - spec.width) <= EPS
-            )
-            ok = (swapped and p.rotated) or (same and not p.rotated)
-            if not ok:
+            parent, grandparent_index = nodes[parent_index]
+            if grandparent_index >= 0 and not config.inside_recursion:
                 problems.append(
-                    f"sheet {i}: {p.part_number} placed as {p.width}x{p.height} "
-                    f"(rotated={p.rotated}) but was ordered {spec.width}x{spec.height} — "
-                    f"part dimensions must never be altered"
+                    f"sheet {i}: {child.part_number} is nested inside "
+                    f"{parent.part_number}, which is itself nested inside "
+                    f"{nodes[grandparent_index][0].part_number} — recursive "
+                    f"frame-inside-frame is disabled (inside_recursion=False)"
                 )
+            if not sane[index] or not sane[parent_index]:
+                continue
+            problems.extend(
+                _check_containment(i, child, parent, ordered, config)
+            )
 
     for pn in sorted(set(ordered) | set(placed)):
         want = ordered[pn].qty if pn in ordered else 0
