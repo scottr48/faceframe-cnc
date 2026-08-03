@@ -387,6 +387,36 @@ prevent:
   dimension (e.g. WDC2436 in the 7-21 file) belong in "needs attention".
   This supersedes §2's "exclude SD1212 after prompting".
 
+- **2026-08-03 — T13 groove purpose and WDC routing**: the T13 grooves
+  (0.5625" from stile edges, 0.9375" from rails, 0.20 deep) seat the face
+  frame onto the cabinet box. **WDC frames do NOT get the standard T13
+  stile grooves** — their stiles instead get a **45° slot cut down the
+  middle of each 2" stile with the T17 45-degree bit** (diagonal-corner
+  cabinets meet the frame at 45°). WDC rails DO get the standard T13 rail
+  routing. Measured by the owner on a real WDC2436: the 45° slot is
+  **7/16" (0.4375) deep** and its centerline sits **15/16" (0.9375) from
+  the stile's INSIDE edge** (stock is 0.75 thick, so slot bottom ≈ Z0.3125
+  in machine coords, cut from the face-down back like the T13 grooves).
+  T17 REFERENCE NOW AVAILABLE: `reference/nc_files/RFK0101N.anc` (owner-
+  supplied 2026-08-03) contains a production T17 section — tool comment
+  "(ROUTE TOOL #17: T17 45 VTIP 158-562SC.026-1W-A)", DIAMETER 0.96,
+  S16000, straight plunge F150, cut F400, multi-pass technique stepping
+  down a 45° line (equal ΔY/ΔZ per pass, shallowest first), 0.125 overrun
+  past the part ends. The WDC slot is designed with that grammar at the
+  owner's measurements (7/16 deep, 15/16 from the stile's inside edge,
+  full stile length). Until the slot's tilt direction is confirmed by the
+  owner, NC generation still refuses WDC sheets.
+
+- **2026-08-03 — NC perimeter cutting order (onion skin)**: part perimeters
+  are cut in TWO depth passes. Pass 1 takes EVERY part's perimeter down to
+  an onion skin (a thin skin still holding the part to the sheet). Only
+  after all pass-1 cuts are complete does pass 2 cut parts all the way
+  through — and pass 2 starts with the frames NESTED inside other frames,
+  cutting every inner free before its host / the outer frames. Reason:
+  parts move less when everything stays anchored as long as possible.
+  This ordering governs GENERATED sheets; the replication diff tests
+  against R710101N/R720101N still match those files' own sequence exactly.
+
 - **2026-08-03 — front-edge margin**: when a sheet has vertical slack, keep
   parts **1" away from the front edge (Y=0, the sheet origin)** — a soft
   preference like the edge cushion, configurable (`front_margin`, default
