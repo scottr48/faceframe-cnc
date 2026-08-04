@@ -195,6 +195,35 @@ class MainWindowSmokeTests(unittest.TestCase):
         self.assertEqual(panel.table.rowCount(), 3)
         self.assertTrue(panel.no_frame_label.isHidden())
 
+    def test_a_wdc_order_shows_the_fact_sheet_and_a_plain_one_does_not(self):
+        # 2026-08-03 owner request: the panel must SHOW what the machine
+        # does to a WDC frame -- the 2" stiles, the derived width, the T17
+        # slot -- in a visible area, not a tooltip.  (isHidden(), not
+        # isVisible(): the window is never shown in these tests.)
+        panel = self.window.order_panel
+        self.assertTrue(panel.wdc_box.isHidden(), "no WDC on the base fixture")
+        self.session.set_rows(
+            [
+                OrderRow(
+                    key="w",
+                    part_number="WDC2436",
+                    qty=2,
+                    frame_width=18.0,
+                    frame_height=36.0,
+                    note="width 18 derived from part number",
+                )
+            ]
+        )
+        panel.reload()
+        self.assertFalse(panel.wdc_box.isHidden())
+        text = panel.wdc_label.text()
+        self.assertIn("18 x 36", text)
+        self.assertIn('2" wide', text)
+        self.assertIn("T17", text)
+        self.assertIn('0.875"', text)
+        # The derivation note rides along as the row's tooltip.
+        self.assertIn("derived from part number", panel.table.item(0, 1).toolTip())
+
     # -- canvas gestures --------------------------------------------------
 
     def test_clicking_a_host_selects_the_host_and_its_passenger_selects_itself(self):

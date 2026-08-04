@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .session import RowStatus, Session, SessionError, suggest_dimensions
+from .session import RowStatus, Session, SessionError, suggest_dimensions, wdc_detail
 
 _HEADERS = ("Cut", "Part #", "Qty", "Frame W x H", "Type")
 
@@ -87,6 +87,25 @@ class OrderPanel(QWidget):
         self.no_frame_label.setStyleSheet("color: #6b7280;")
         self.no_frame_label.setVisible(False)
 
+        # -- WDC fact sheet (2026-08-03 owner request) -----------------
+        # "How do I know that it has the 2 inch stiles and the special T17
+        # routing?"  A visible, read-only area — deliberately NOT a tooltip
+        # the user has to hunt for — showing what the machine does to every
+        # WDC frame on the order.  The text comes from the session
+        # (wdc_detail), which derives every number from the geometry
+        # engine, so this label can never disagree with the cut.
+        self.wdc_box = QGroupBox("WDC frames — what the machine does")
+        self.wdc_label = QLabel("")
+        self.wdc_label.setWordWrap(True)
+        self.wdc_label.setStyleSheet("color: #6b7280;")
+        self.wdc_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        wdc_layout = QVBoxLayout()
+        wdc_layout.addWidget(self.wdc_label)
+        self.wdc_box.setLayout(wdc_layout)
+        self.wdc_box.setVisible(False)
+
         # -- needs attention ------------------------------------------
         self.attention_box = QGroupBox("Needs attention")
         self.attention_list = QListWidget()
@@ -117,6 +136,7 @@ class OrderPanel(QWidget):
         layout.addWidget(self.table, 1)
         layout.addLayout(buttons)
         layout.addWidget(self.no_frame_label)
+        layout.addWidget(self.wdc_box)
         layout.addWidget(self.attention_box)
 
         self.reload()
@@ -169,6 +189,11 @@ class OrderPanel(QWidget):
                     elif row.status is RowStatus.INVALID:
                         item.setForeground(QBrush(QColor("#b91c1c")))
                         item.setToolTip(row.geometry_error or "")
+                    elif row.note:
+                        # 2026-08-03 amendment: a dimension the parser
+                        # derived (a WDC width from the part number) says
+                        # where it came from.
+                        item.setToolTip(row.note)
                     self.table.setItem(index, column, item)
 
             attention = session.needs_attention_rows()
@@ -194,6 +219,22 @@ class OrderPanel(QWidget):
             else:
                 self.no_frame_label.setText("")
             self.no_frame_label.setVisible(bool(no_frame))
+
+            # One fact sheet per distinct WDC part on the order, in a
+            # visible area (not a tooltip): the owner asked to SEE the 2"
+            # stiles, the derived width and the T17 slot before trusting a
+            # WDC line.
+            details: list[str] = []
+            seen: set[str] = set()
+            for row in rows:
+                if row.part_number in seen:
+                    continue
+                detail = wdc_detail(row.part_number, row.frame_width, row.frame_height)
+                if detail:
+                    seen.add(row.part_number)
+                    details.append(detail)
+            self.wdc_label.setText("\n\n".join(details))
+            self.wdc_box.setVisible(bool(details))
 
             frames = session.total_frames
             self.count_label.setText(

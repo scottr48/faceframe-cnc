@@ -16,8 +16,10 @@ try:
     import xlrd  # noqa: F401
 
     from faceframe_cnc.order_parser import (
+        DrawerFaces,
         NeedsAttentionLine,
         OrderLine,
+        derive_wdc_dimensions,
         parse_order,
         resolve,
         safe_float,
@@ -108,16 +110,33 @@ class Parse7_21Tests(unittest.TestCase):
             self.assertGreater(line.frame_width, 0)
             self.assertGreater(line.frame_height, 0)
 
-    def test_wdc2436_needs_attention_missing_width(self):
-        wdc = next(
-            (l for l in self.result.needs_attention if l.part_number == "WDC2436"), None
-        )
-        self.assertIsNotNone(wdc, "WDC2436 should be in needs_attention (missing width)")
-        self.assertIsNone(wdc.frame_width)
+    def test_wdc2436_missing_width_is_auto_resolved_from_the_part_number(self):
+        # 2026-08-03 amendment ("WDC single-missing-dim auto-resolution"):
+        # the 7-21 file's WDC2436 row has a blank width and height 36, and
+        # 36 is exactly what the part number encodes -- so the parser fills
+        # in 24 - 6 = 18 itself instead of prompting the owner on every
+        # single load, and says where the number came from.
+        wdc = _line_by_part(self.result.lines, "WDC2436")
+        self.assertIsNotNone(wdc, "WDC2436 should now parse as a READY line")
+        self.assertEqual(wdc.frame_width, 18.0)
         self.assertEqual(wdc.frame_height, 36.0)
-        self.assertEqual(wdc.missing, ("width",))
-        # Must not also appear among the good lines.
-        self.assertIsNone(_line_by_part(self.result.lines, "WDC2436"))
+        self.assertEqual(wdc.frame_type, FrameType.WDC)
+        self.assertIn("width 18 derived from part number", wdc.note)
+        self.assertIn("24x36", wdc.note)
+        # And it must no longer appear in needs_attention.
+        self.assertIsNone(
+            next((l for l in self.result.needs_attention if l.part_number == "WDC2436"), None)
+        )
+
+    def test_the_7_21_order_now_has_nothing_needing_attention(self):
+        # WDC2436 was the only single-missing-dim row in this file, and it
+        # auto-resolves; SD1212 is a no_frame row.  Nothing prompts.
+        self.assertEqual(self.result.needs_attention, [])
+
+    def test_fully_specified_lines_carry_no_note(self):
+        for line in self.result.lines:
+            if line.part_number != "WDC2436":
+                self.assertEqual(line.note, "", line.part_number)
 
     def test_sd1212_is_no_frame_not_needs_attention(self):
         # 2026-08-03 amendment ("SD1212 / no-faceframe lines"): SD1212 is a
@@ -183,16 +202,89 @@ class Parse7_7Tests(unittest.TestCase):
 
 
 @unittest.skipUnless(_IMPORT_ERROR is None, f"pandas/xlrd unavailable: {_IMPORT_ERROR}")
+class DeriveWdcTests(unittest.TestCase):
+    """The 2026-08-03 WDC auto-resolution rule, one case at a time.
+
+    The parser only ever derives when the dimension it HAS agrees with the
+    part number -- a contradiction, or a row missing both dims, is never
+    guessed over (spec section 2's "do NOT silently guess" stands).
+    """
+
+    def test_missing_width_with_matching_height_derives_18(self):
+        derived = derive_wdc_dimensions("WDC2436", None, 36.0)
+        self.assertIsNotNone(derived)
+        width, height, note = derived
+        self.assertEqual((width, height), (18.0, 36.0))
+        self.assertIn("width 18 derived from part number", note)
+        self.assertIn("WDC cabinet 24x36", note)
+        self.assertIn("6in narrower", note)
+
+    def test_missing_height_with_matching_width_derives_36(self):
+        # The mirror rule: the present width must equal encoded width - 6.
+        derived = derive_wdc_dimensions("WDC2436", 18.0, None)
+        self.assertIsNotNone(derived)
+        width, height, note = derived
+        self.assertEqual((width, height), (18.0, 36.0))
+        self.assertIn("height 36 derived from part number", note)
+
+    def test_a_contradicting_height_is_never_guessed_over(self):
+        self.assertIsNone(derive_wdc_dimensions("WDC2436", None, 35.0))
+
+    def test_a_contradicting_width_is_never_guessed_over(self):
+        # 24 is the CABINET width; a user or form saying the frame is 24
+        # wide contradicts the name (frame = 18) and must be looked at.
+        self.assertIsNone(derive_wdc_dimensions("WDC2436", 24.0, None))
+
+    def test_both_missing_stays_a_no_frame_row(self):
+        # The SD1212 amendment owns this case: nothing to derive from.
+        self.assertIsNone(derive_wdc_dimensions("WDC2436", None, None))
+
+    def test_both_present_derives_nothing(self):
+        self.assertIsNone(derive_wdc_dimensions("WDC2436", 18.0, 36.0))
+
+    def test_non_wdc_and_unparseable_names_derive_nothing(self):
+        self.assertIsNone(derive_wdc_dimensions("W3036", None, 36.0))
+        self.assertIsNone(derive_wdc_dimensions("WDC24365", None, 36.0))
+        self.assertIsNone(derive_wdc_dimensions("WDCX436", None, 36.0))
+
+    def test_an_impossible_encoded_width_derives_nothing(self):
+        # WDC0436 would encode a 4" cabinet -> a -2" frame; needs a human.
+        self.assertIsNone(derive_wdc_dimensions("WDC0436", None, 36.0))
+
+    def test_the_gui_explains_with_the_same_reduction_the_parser_derives_with(self):
+        # The order panel's WDC fact sheet quotes "6 inches narrower" from
+        # its own constant (the session must import without pandas, so it
+        # cannot use the parser's); this is the pin that stops the two
+        # numbers drifting apart.
+        from faceframe_cnc.gui.session import WDC_CABINET_WIDTH_REDUCTION
+        from faceframe_cnc.order_parser import _WDC_FRAME_WIDTH_REDUCTION
+
+        self.assertEqual(WDC_CABINET_WIDTH_REDUCTION, _WDC_FRAME_WIDTH_REDUCTION)
+
+
+@unittest.skipUnless(_IMPORT_ERROR is None, f"pandas/xlrd unavailable: {_IMPORT_ERROR}")
 class ResolveTests(unittest.TestCase):
-    def test_resolve_wdc2436_with_supplied_width(self):
-        result = parse_order(ORDER_7_21)
-        wdc = next(l for l in result.needs_attention if l.part_number == "WDC2436")
-        completed = resolve(wdc, width=24)
+    def test_resolve_a_wdc_line_that_contradicts_its_part_number(self):
+        # A WDC row the auto-resolution refuses (height 35 contradicts the
+        # encoded 36) still reaches the user through needs_attention and is
+        # resolved by hand exactly as before.  Synthetic, because the real
+        # 7-21 row now auto-resolves and never gets here.
+        wdc = NeedsAttentionLine(
+            row_index=12,
+            part_number="WDC2436",
+            qty=30,
+            frame_width=None,
+            frame_height=35.0,
+            frame_type=FrameType.WDC,
+            drawer_faces=DrawerFaces(),
+            missing=("width",),
+            reason="missing frame width",
+        )
+        completed = resolve(wdc, width=18)
         self.assertIsInstance(completed, OrderLine)
         self.assertEqual(completed.frame_type, FrameType.WDC)
-        self.assertEqual(completed.frame_width, 24.0)
-        self.assertEqual(completed.frame_height, wdc.frame_height)
-        self.assertEqual(completed.frame_height, 36.0)
+        self.assertEqual(completed.frame_width, 18.0)
+        self.assertEqual(completed.frame_height, 35.0)
 
     def test_resolve_raises_when_still_missing(self):
         result = parse_order(ORDER_7_21)

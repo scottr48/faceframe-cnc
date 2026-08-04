@@ -74,6 +74,7 @@ from .inside import assign_inners, best_fit, end_clearance_for
 
 __all__ = [
     "EPS",
+    "MIN_PART_GAP",
     "NestingError",
     "NestingConfig",
     "PartSpec",
@@ -177,6 +178,27 @@ class NestingError(ValueError):
     does not fit on a sheet in either orientation)."""
 
 
+#: The least edge-to-edge part gap the NC post can actually cut (inches).
+#:
+#: This is a MACHINE fact, not a packing preference.  The post's T11
+#: perimeter lead-in ramp stands off the profile line, which itself sits a
+#: tool radius outside the part edge, so the 0.375-diameter tool sweeps
+#: 0.425 past the edge of the part it is cutting out (measured from the
+#: post table; ``tests/test_nesting.py`` recomputes the reach from
+#: ``faceframe_cnc.post.model`` and pins it below this constant).  Any
+#: neighbouring part closer than that sweep gets cut into, and the NC
+#: verifier refuses the sheet.  0.455 is the gap measured off the shop's
+#: own machine files (R710101N.anc) and owner-approved on 2026-08-03.
+#:
+#: This module deliberately does NOT enforce the floor —
+#: ``NestingConfig.part_gap`` stays a free setting so replication and
+#: what-if runs are possible — but every path that feeds USER settings into
+#: the optimizer (the GUI session) must clamp or refuse below it, because a
+#: tighter gap silently packs sheets the post must then refuse at Generate
+#: time.
+MIN_PART_GAP = 0.455
+
+
 # --------------------------------------------------------------------------
 # Data model
 # --------------------------------------------------------------------------
@@ -190,16 +212,17 @@ class NestingConfig:
     sheet_height: float = 97.0
     #: Minimum edge-to-edge distance between any two parts on a sheet.
     #:
-    #: 0.455, not the spec's 0.375 (owner decision 2026-08-03).  Two
-    #: independent measurements say so: ``R710101N.anc`` — a program the shop
-    #: has run — spaces its own parts exactly 0.455 apart, and the post needs
-    #: it, because a perimeter lead-in stands 0.05 off a profile that is
-    #: already 0.1875 outside the part edge, so the 0.1875-radius tool sweeps
-    #: 0.425 past the edge.  At 0.375 the neighbouring part is inside that
-    #: sweep and the NC verifier refuses the sheet.  On the 7-21-26 order the
-    #: wider gap costs nothing: 47 sheets footprint-only and 40 with inside
-    #: nesting, the same as at 0.375.
-    part_gap: float = 0.455
+    #: Defaults to :data:`MIN_PART_GAP` (0.455), not the spec's 0.375
+    #: (owner decision 2026-08-03).  Two independent measurements say so:
+    #: ``R710101N.anc`` — a program the shop has run — spaces its own parts
+    #: exactly 0.455 apart, and the post needs it, because a perimeter
+    #: lead-in stands 0.05 off a profile that is already 0.1875 outside the
+    #: part edge, so the 0.1875-radius tool sweeps 0.425 past the edge.  At
+    #: 0.375 the neighbouring part is inside that sweep and the NC verifier
+    #: refuses the sheet.  On the 7-21-26 order the wider gap costs nothing:
+    #: 47 sheets footprint-only and 40 with inside nesting, the same as at
+    #: 0.375.
+    part_gap: float = MIN_PART_GAP
     #: Minimum clearance per side between a frame nested inside another
     #: frame's opening and that opening (spec 4b).
     #:

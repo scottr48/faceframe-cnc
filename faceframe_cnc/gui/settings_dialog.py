@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..nesting import MIN_PART_GAP
 from .session import AppSettings
 
 
@@ -42,7 +43,17 @@ class SettingsDialog(QDialog):
 
         self.sheet_width = _spin(settings.sheet_width, 1.0, 240.0, 1.0)
         self.sheet_height = _spin(settings.sheet_height, 1.0, 480.0, 1.0)
-        self.part_gap = _spin(settings.part_gap, 0.0, 12.0, 0.0625)
+        # The spin box's minimum IS the machine floor (2026-08-03): the NC
+        # perimeter lead-in sweeps 0.425 past the part edge, so a tighter
+        # gap packs sheets the verifier must refuse at Generate time.  The
+        # session's validate() enforces the same floor for anything that
+        # never went through this dialog.
+        self.part_gap = _spin(settings.part_gap, MIN_PART_GAP, 12.0, 0.0625)
+        self.part_gap.setToolTip(
+            f"Hard minimum {MIN_PART_GAP:g} in: the NC perimeter lead-in "
+            f"sweeps 0.425 in past the part edge, so parts spaced closer "
+            f"would be cut into and the sheet refused."
+        )
         self.edge_cushion = _spin(settings.edge_cushion, 0.0, 12.0, 0.125)
         self.front_margin = _spin(settings.front_margin, 0.0, 12.0, 0.125)
         self.inside_nesting = QCheckBox("Nest small frames inside larger frames' openings")

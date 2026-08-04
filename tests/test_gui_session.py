@@ -14,6 +14,7 @@ import unittest
 
 from faceframe_cnc.geometry import FrameType
 from faceframe_cnc.nesting import (
+    MIN_PART_GAP,
     NestingConfig,
     NestingResult,
     PartSpec,
@@ -32,6 +33,7 @@ from faceframe_cnc.gui.session import (
     save_settings,
     sheet_openings,
     suggest_dimensions,
+    wdc_detail,
 )
 
 try:  # the .xls parser is the only thing in the app that needs pandas
@@ -118,7 +120,7 @@ class SettingsTests(unittest.TestCase):
             original = AppSettings(
                 sheet_width=48.0,
                 sheet_height=96.0,
-                part_gap=0.25,
+                part_gap=0.5,  # above the 0.455 floor, so it round-trips
                 edge_cushion=0.0,
                 inside_nesting=False,
                 inside_recursion=True,
@@ -152,6 +154,70 @@ class SettingsTests(unittest.TestCase):
         self.assertTrue(AppSettings(part_gap=-1).validate())
         self.assertTrue(AppSettings(front_margin=-1).validate())
 
+    def test_validate_refuses_a_part_gap_below_the_machine_floor(self):
+        # 2026-08-03: 0.455 is a hard floor -- the perimeter lead-in sweeps
+        # 0.425 past the part edge, so anything tighter packs sheets the NC
+        # verifier must refuse at Generate time.
+        problems = AppSettings(part_gap=0.375).validate()
+        self.assertTrue(problems)
+        self.assertIn("0.455", "; ".join(problems))
+        self.assertIn("lead-in", "; ".join(problems))
+        # The floor itself is fine, as is anything above it.
+        self.assertEqual(AppSettings(part_gap=MIN_PART_GAP).validate(), [])
+        self.assertEqual(AppSettings(part_gap=0.5).validate(), [])
+
+    # -- the stale-settings migration (2026-08-03) -----------------------
+
+    def test_a_stale_part_gap_is_raised_to_the_floor_with_a_note(self):
+        # The owner's repro: faceframe_settings.json persisted 0.375 from
+        # before the 0.455 amendment, the optimizer packed at 0.375, and 8
+        # of 17 sheets came back "[foreign-cut] ..." at Generate time.  The
+        # load is where it gets fixed -- visibly, not silently.
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "settings.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"part_gap": 0.375}, handle)
+            settings = load_settings(path)
+            self.assertEqual(settings.part_gap, MIN_PART_GAP)
+            self.assertEqual(len(settings.migration_notes), 1)
+            note = settings.migration_notes[0]
+            self.assertIn("0.375", note)
+            self.assertIn("0.455", note)
+            self.assertIn("lead-in", note)
+
+    def test_a_compliant_part_gap_loads_untouched_with_no_note(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "settings.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"part_gap": 0.5}, handle)
+            settings = load_settings(path)
+            self.assertEqual(settings.part_gap, 0.5)
+            self.assertEqual(settings.migration_notes, [])
+
+    def test_the_migration_note_is_never_persisted(self):
+        # The note describes one load; writing it back would make the NEXT
+        # load report a migration that never happened.
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "settings.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"part_gap": 0.2}, handle)
+            migrated = load_settings(path)
+            self.assertTrue(migrated.migration_notes)
+            self.assertNotIn("migration_notes", migrated.to_dict())
+            self.assertTrue(save_settings(migrated, path))
+            self.assertEqual(load_settings(path).migration_notes, [])
+
+    def test_optimize_refuses_a_part_gap_forced_below_the_floor(self):
+        # Belt and braces: a programmatic write that dodges both the dialog
+        # and the load-time migration still cannot reach the optimizer.
+        session = Session(AppSettings())
+        session.set_rows([row("W3036", 30.0, 36.0, 1)])
+        session.settings.part_gap = 0.375
+        with self.assertRaises(SessionError) as caught:
+            session.optimize()
+        self.assertIn("0.455", str(caught.exception))
+        self.assertIn("lead-in", str(caught.exception))
+
     def test_front_margin_defaults_and_round_trips(self):
         # 2026-08-03 amendment: front_margin defaults to 1.0 and flows
         # through to the optimizer config.
@@ -173,6 +239,59 @@ class SettingsTests(unittest.TestCase):
             {"sheet_width": 49.0, "sheet_height": 97.0, "part_gap": 0.375}
         )
         self.assertEqual(settings.front_margin, 1.0)
+
+
+# --------------------------------------------------------------------------
+# The WDC fact sheet (2026-08-03 owner request)
+# --------------------------------------------------------------------------
+
+
+class WdcDetailTests(unittest.TestCase):
+    """The owner asked how he can trust a derived 18" width: this text is
+    the answer, so it must actually contain the answers."""
+
+    def test_the_fact_sheet_covers_everything_the_owner_asked_about(self):
+        detail = wdc_detail("WDC2436", 18.0, 36.0)
+        self.assertIn("18 x 36", detail)  # the derived frame size
+        self.assertIn("24 x 36", detail)  # ...and the cabinet it came from
+        self.assertIn('2" wide', detail)  # the special stiles
+        self.assertIn('1.5"', detail)  # vs the standard member
+        self.assertIn("14 x 33", detail)  # the opening those stiles produce
+        self.assertIn("T17", detail)  # the special routing
+        self.assertIn('0.4375"', detail)  # slot depth
+        self.assertIn('1.3386"', detail)  # centreline off the inside edge
+        self.assertIn("34 mm", detail)
+        self.assertIn("NO standard T13", detail)
+        self.assertIn('0.875"', detail)  # the end reach the packer reserves
+
+    def test_missing_dimensions_fall_back_to_the_part_number(self):
+        # An unresolved WDC row still gets a truthful fact sheet: the size
+        # comes from the name and is attributed to it.
+        detail = wdc_detail("WDC2436")
+        self.assertIn("18 x 36", detail)
+        self.assertIn("diagonal-corner", detail)
+        self.assertIn("T17", detail)
+
+    def test_non_wdc_parts_have_no_detail(self):
+        self.assertEqual(wdc_detail("W3036", 30.0, 36.0), "")
+        self.assertEqual(wdc_detail("B18", 18.0, 30.0), "")
+        self.assertEqual(wdc_detail("3DB24", 24.0, 30.0), "")
+
+    def test_every_number_is_derived_not_typed(self):
+        # The trust bar: the text is built FROM the geometry constants, so
+        # check it against them rather than against literals where we can.
+        from faceframe_cnc.geometry import (
+            WDC_SLOT_DEPTH,
+            WDC_SLOT_END_REACH,
+            WDC_SLOT_INSET_FROM_INSIDE_EDGE,
+            WDC_STILE_INSET,
+        )
+
+        detail = wdc_detail("WDC2436", 18.0, 36.0)
+        self.assertIn(f'{WDC_STILE_INSET:g}" wide', detail)
+        self.assertIn(f'{WDC_SLOT_DEPTH:g}" deep', detail)
+        self.assertIn(f'{WDC_SLOT_INSET_FROM_INSIDE_EDGE:g}"', detail)
+        self.assertIn(f'{WDC_SLOT_END_REACH:g}" past each stile end', detail)
 
 
 # --------------------------------------------------------------------------
@@ -1081,22 +1200,25 @@ class RealOrderTests(unittest.TestCase):
     def test_the_acceptance_order_parses_into_rows_and_attention_lines(self):
         session = self.load()
         self.assertEqual(len(session.rows), 14)
-        # 2026-08-03 amendment: WDC2436 (missing exactly one dim) is
-        # needs_attention; SD1212 (missing both) is no_frame, not
-        # needs_attention, and is never prompted for.
-        attention = {r.part_number: r.missing for r in session.needs_attention_rows()}
-        self.assertEqual(attention, {"WDC2436": ("width",)})
+        # 2026-08-03 amendments: WDC2436 (missing exactly one dim, and the
+        # dim it has matches its part number) is AUTO-RESOLVED to 18 x 36 --
+        # nothing needs attention in this file any more; SD1212 (missing
+        # both) is no_frame and is never prompted for.
+        self.assertEqual(session.needs_attention_rows(), [])
+        wdc = next(r for r in session.rows if r.part_number == "WDC2436")
+        self.assertIs(wdc.status, RowStatus.READY)
+        self.assertTrue(wdc.included)
+        self.assertEqual((wdc.frame_width, wdc.frame_height), (18.0, 36.0))
+        self.assertIn("width 18 derived from part number", wdc.note)
         no_frame = {r.part_number: r.missing for r in session.no_frame_rows()}
         self.assertEqual(no_frame, {"SD1212": ("width", "height")})
-        self.assertTrue(all(not r.included for r in session.needs_attention_rows()))
         self.assertTrue(all(not r.included for r in session.no_frame_rows()))
-        self.assertEqual(session.total_frames, 215)  # 245 less the 30 WDC2436
+        self.assertEqual(session.total_frames, 245)  # the 30 WDC2436 included
 
-    def test_resolve_exclude_optimize(self):
+    def test_load_optimize_with_no_manual_resolution(self):
         session = self.load()
-        wdc = [r for r in session.needs_attention_rows() if r.part_number == "WDC2436"][0]
-        session.resolve_row(wdc.key, width=18.0)  # 2026-08-03 amendment
-        # SD1212 has no frame dimensions at all, so it stays out of the cut.
+        # SD1212 has no frame dimensions at all, so it stays out of the cut;
+        # everything else -- WDC2436 included -- is ready as loaded.
         self.assertEqual(session.total_frames, 245)
 
         result = session.optimize()
@@ -1113,8 +1235,6 @@ class RealOrderTests(unittest.TestCase):
 
     def test_re_optimizing_is_deterministic(self):
         session = self.load()
-        wdc = [r for r in session.needs_attention_rows() if r.part_number == "WDC2436"][0]
-        session.resolve_row(wdc.key, width=18.0)
         first = canonical(session) if session.result else None
         self.assertIsNone(first)
         session.optimize()
@@ -1124,8 +1244,6 @@ class RealOrderTests(unittest.TestCase):
 
     def test_excluding_a_line_reduces_the_sheet_count(self):
         session = self.load()
-        wdc = [r for r in session.needs_attention_rows() if r.part_number == "WDC2436"][0]
-        session.resolve_row(wdc.key, width=18.0)
         full = session.optimize().total_sheets
         for candidate in session.rows:
             if candidate.part_number == "3DB30":
@@ -1137,8 +1255,6 @@ class RealOrderTests(unittest.TestCase):
 
     def test_an_edit_on_the_real_layout_keeps_the_totals_straight(self):
         session = self.load()
-        wdc = [r for r in session.needs_attention_rows() if r.part_number == "WDC2436"][0]
-        session.resolve_row(wdc.key, width=18.0)
         result = session.optimize()
         sheets_before = result.total_sheets
 

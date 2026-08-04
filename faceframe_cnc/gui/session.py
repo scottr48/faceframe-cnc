@@ -45,10 +45,20 @@ from enum import Enum
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
-from ..geometry import FrameType, compute_geometry, infer_frame_type
+from ..geometry import (
+    MEMBER,
+    FrameType,
+    WDC_SLOT_DEPTH,
+    WDC_SLOT_END_REACH,
+    WDC_SLOT_INSET_FROM_INSIDE_EDGE,
+    WDC_STILE_INSET,
+    compute_geometry,
+    infer_frame_type,
+)
 from ..inside import candidate_fits
 from ..nesting import (
     EPS,
+    MIN_PART_GAP,
     NestingConfig,
     NestingError,
     NestingResult,
@@ -75,6 +85,7 @@ __all__ = [
     "save_settings",
     "sheet_openings",
     "suggest_dimensions",
+    "wdc_detail",
 ]
 
 #: Part path: indices from the sheet's top-level placement list down through
@@ -110,8 +121,13 @@ class AppSettings:
     #: 0.455 (owner decision 2026-08-03), matching
     #: ``NestingConfig.part_gap``: it is the spacing the shop's own
     #: R710101N.anc uses and the least the NC post can cut without the
-    #: perimeter lead-in sweeping into the neighbouring part.  A saved
-    #: settings file still wins — whatever the user persisted is honoured.
+    #: perimeter lead-in sweeping into the neighbouring part.  That makes
+    #: :data:`~faceframe_cnc.nesting.MIN_PART_GAP` a HARD FLOOR here: a
+    #: persisted settings file from before the 0.455 decision is migrated up
+    #: on load (:meth:`from_dict`, with a note in :attr:`migration_notes`),
+    #: :meth:`validate` refuses anything below it, and so does the settings
+    #: dialog — otherwise the optimizer happily packs sheets the NC verifier
+    #: must then refuse at Generate time, which is how the owner found out.
     #: The frame-inside-frame clearance is deliberately NOT this setting and
     #: is not exposed here: it stays at the 0.375 proven by R720101N (see
     #: ``NestingConfig.inner_clearance``).
@@ -133,6 +149,13 @@ class AppSettings:
     #: operator to the machine with an air cut.
     last_output_dir: Optional[str] = None
     job_prefix: str = ""
+    #: Human-readable record of anything :meth:`from_dict` had to change to
+    #: make a persisted settings file safe to run (today: a part gap below
+    #: the NC post's floor raised to it).  NEVER persisted (``to_dict``
+    #: omits it) and excluded from equality — it describes the load, not the
+    #: settings — but the GUI must show it somewhere honest, because a
+    #: silently-altered setting is the same sin as a silently-refused sheet.
+    migration_notes: list = field(default_factory=list, compare=False)
 
     def to_config(self) -> NestingConfig:
         """The optimizer config this app runs with.
@@ -191,13 +214,30 @@ class AppSettings:
             value = data.get(key, getattr(defaults, key))
             return bool(value) if isinstance(value, (bool, int)) else bool(getattr(defaults, key))
 
+        # The part gap has a hard floor (2026-08-03): a stale file persisted
+        # before the 0.455 decision would pack sheets the NC verifier must
+        # refuse at Generate time, so it is raised here — with a note the
+        # GUI shows, because a silent correction is not a correction the
+        # user can trust.  A gap the file never had (missing key, junk
+        # value) falls back to the compliant default with no note.
+        migration_notes: list = []
+        part_gap = number("part_gap", 0.0)
+        if part_gap < MIN_PART_GAP:
+            migration_notes.append(
+                f"part gap {part_gap:g} from saved settings raised to "
+                f"{MIN_PART_GAP:g} - the perimeter lead-in sweeps 0.425 past "
+                f"the part edge, closer parts would be cut into"
+            )
+            part_gap = MIN_PART_GAP
+
         path = data.get("last_order_path")
         out_dir = data.get("last_output_dir")
         prefix = data.get("job_prefix")
         return cls(
             sheet_width=number("sheet_width", 1e-6),
             sheet_height=number("sheet_height", 1e-6),
-            part_gap=number("part_gap", 0.0),
+            part_gap=part_gap,
+            migration_notes=migration_notes,
             edge_cushion=number("edge_cushion", 0.0),
             front_margin=number("front_margin", 0.0),
             inside_nesting=flag("inside_nesting"),
@@ -216,6 +256,18 @@ class AppSettings:
             problems.append("sheet height must be a positive number")
         if not (math.isfinite(self.part_gap) and self.part_gap >= 0):
             problems.append("part gap must be zero or more")
+        elif self.part_gap < MIN_PART_GAP - 1e-12:
+            # Hard machine floor (2026-08-03): the T11 perimeter lead-in
+            # sweeps 0.425 past the part edge, so a closer neighbour gets
+            # cut into and the NC verifier refuses the sheet.  Refusing here
+            # is the backstop for any path that dodges the settings dialog
+            # and the load-time migration.
+            problems.append(
+                f"part gap must be at least {MIN_PART_GAP:g} in - the NC "
+                f"perimeter lead-in sweeps 0.425 in past the part edge, so "
+                f"parts spaced closer would be cut into; raise the part gap "
+                f"to {MIN_PART_GAP:g} or more"
+            )
         if not (math.isfinite(self.edge_cushion) and self.edge_cushion >= 0):
             problems.append("edge cushion must be zero or more")
         if not (math.isfinite(self.front_margin) and self.front_margin >= 0):
@@ -294,6 +346,94 @@ def suggest_dimensions(part_number: str) -> tuple[Optional[float], Optional[floa
     return width, height
 
 
+#: The WDC name encodes the diagonal-corner CABINET width; the frame is this
+#: much narrower (2026-08-03 amendment: WDC2436 = cabinet 24 x 36, frame
+#: 18 x 36 — the 2" stiles' geometry against the corner cabinet).  Kept
+#: equal to ``order_parser._WDC_FRAME_WIDTH_REDUCTION``, which does the
+#: actual deriving; a test pins the two together.  It cannot simply be
+#: imported from there because the parser needs pandas and this module must
+#: run without it.
+WDC_CABINET_WIDTH_REDUCTION = 6.0
+
+
+def wdc_detail(
+    part_number: str,
+    frame_width: Optional[float] = None,
+    frame_height: Optional[float] = None,
+) -> str:
+    """Human-readable fact sheet for a WDC row, ``""`` for anything else.
+
+    Owner request (2026-08-03): "for WDC I'm nervous to put in 18 inches
+    for the width.  How do I know that it has the 2 inch stiles and the
+    special T17 routing?"  This is the answer — what the machine will
+    actually do to a WDC frame, in words, next to the order line.
+
+    Every number is DERIVED: stile and rail widths and the opening from
+    :mod:`faceframe_cnc.geometry` (``WDC_STILE_INSET``, ``MEMBER``,
+    ``compute_geometry``), the slot facts from the same module's
+    ``WDC_SLOT_*`` constants, and the frame-vs-cabinet size from the part
+    number.  Nothing here restates a value from anywhere else, so the
+    display can never drift from what the optimizer and the post cut.
+
+    ``frame_width`` / ``frame_height`` are the row's dimensions when known;
+    either may be ``None`` (an unresolved row), in which case the value the
+    part number encodes fills in, clearly attributed to the name.
+    """
+    if infer_frame_type(part_number) is not FrameType.WDC:
+        return ""
+    normalized = part_number.strip().upper()
+
+    width, height = frame_width, frame_height
+    match = _DIGITS.search(normalized)
+    lines: list[str] = []
+    if match is not None:
+        cabinet_w, cabinet_h = float(match.group(1)), float(match.group(2))
+        encoded_w = cabinet_w - WDC_CABINET_WIDTH_REDUCTION
+        if width is None and encoded_w > 0:
+            width = encoded_w
+        if height is None:
+            height = cabinet_h
+        size = (
+            f"frame {width:g} x {height:g}"
+            if width is not None and height is not None
+            else "frame size not yet known"
+        )
+        lines.append(
+            f"{normalized}: {size} — the name encodes the diagonal-corner "
+            f"CABINET ({cabinet_w:g} x {cabinet_h:g}); the frame is "
+            f'{WDC_CABINET_WIDTH_REDUCTION:g}" narrower'
+        )
+    elif width is not None and height is not None:
+        lines.append(f"{normalized}: frame {width:g} x {height:g}")
+    else:
+        lines.append(f"{normalized}: frame size not yet known")
+
+    stiles = (
+        f'stiles {WDC_STILE_INSET:g}" wide (not the standard {MEMBER:g}"), '
+        f'rails {MEMBER:g}"'
+    )
+    if width is not None and height is not None:
+        geometry = compute_geometry(normalized, width, height)
+        if not geometry.errors and geometry.openings:
+            opening = geometry.openings[0]
+            stiles += f" — single opening {opening.width:g} x {opening.height:g}"
+    lines.append(stiles)
+
+    lines.append(
+        f"T17 45-degree V-slot down BOTH stiles: "
+        f'{WDC_SLOT_DEPTH:g}" deep, centreline '
+        f'{WDC_SLOT_INSET_FROM_INSIDE_EDGE:g}" '
+        f"({WDC_SLOT_INSET_FROM_INSIDE_EDGE * 25.4:.0f} mm) from the stile's "
+        f"inside edge, two passes; WDC frames get NO standard T13 stile "
+        f"grooves"
+    )
+    lines.append(
+        f'the slot cuts {WDC_SLOT_END_REACH:g}" past each stile end, so the '
+        f"optimizer reserves that much clearance around WDC stile ends"
+    )
+    return "\n".join(lines)
+
+
 @dataclass
 class OrderRow:
     """One line of the order as the GUI shows it.
@@ -313,6 +453,11 @@ class OrderRow:
     missing: tuple[str, ...] = ()
     #: Free-text explanation shown beside a needs-attention row.
     reason: str = ""
+    #: Provenance remark on a READY row (2026-08-03 amendment): the parser
+    #: sets it when it derived a dimension the spreadsheet left blank (a
+    #: WDC frame width from the part number), so the GUI can show where the
+    #: number came from instead of presenting it as typed-in data.
+    note: str = ""
     #: Source spreadsheet row, for tracing back to the order.
     row_index: int = -1
     #: Set once the user has typed the missing dimension.
@@ -664,6 +809,10 @@ class Session:
                     frame_width=line.frame_width,
                     frame_height=line.frame_height,
                     included=True,
+                    # 2026-08-03 amendment: a WDC dimension the parser
+                    # derived from the part number arrives annotated, and
+                    # the annotation must survive to the order panel.
+                    note=getattr(line, "note", "") or "",
                     row_index=line.row_index,
                 )
             )

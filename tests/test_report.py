@@ -522,6 +522,136 @@ def _inside(inner, outer, tolerance: float = 0.05) -> bool:
 
 
 # --------------------------------------------------------------------------
+# The T17 WDC slot centrelines on paper (2026-08-03 owner request)
+# --------------------------------------------------------------------------
+
+#: A line stroked with the WDC slot pen: its dash pattern is unique on the
+#: page (cushion is [3.00 2.50], front margin [1.00 2.00]), so it is the
+#: signature by which slot centrelines are pulled back out of the stream.
+_SLOT_LINE = re.compile(
+    rb"\[4\.00 2\.00\] 0 d (-?\d+\.\d+) (-?\d+\.\d+) m (-?\d+\.\d+) (-?\d+\.\d+) l S"
+)
+
+
+def _slot_lines(parsed: Pdf, index: int) -> list[tuple[float, float, float, float]]:
+    """``(x0, y0, x1, y1)`` of every slot centreline drawn on a page."""
+    return [
+        tuple(float(value) for value in match)
+        for match in _SLOT_LINE.findall(parsed.streams[index])
+    ]
+
+
+def wdc_sheet():
+    """One upright and one rotated WDC2436, far enough from everything.
+
+    Both stile-end reaches (0.875 beyond the height axis before rotation)
+    clear the sheet edges and each other, so the NC job accepts the sheet
+    and the report page under test is a WRITTEN one, not a refusal.
+    """
+    config = NestingConfig(part_gap=0.455)
+    layout = SheetLayout(
+        [
+            Placement("WDC2436", 5.0, 3.0, 18.0, 36.0),
+            Placement("WDC2436", 5.0, 60.0, 36.0, 18.0, rotated=True),
+        ]
+    )
+    demand = [PartSpec("WDC2436", 18.0, 36.0, 2)]
+    result = NestingResult(
+        unique_sheets=[(layout, 1)], total_sheets=1, demand=demand, config=config
+    )
+    return result, config
+
+
+class WdcSlotDrawingTest(unittest.TestCase):
+    """The owner must be able to SEE the T17 routing on the paperwork.
+
+    Every expected coordinate below is recomputed from the geometry
+    engine's constants — the same numbers the optimizer reserves room with
+    — never from the drawing code's own value, so the test still means
+    something if someone edits the drawing.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from faceframe_cnc.geometry import (
+            WDC_SLOT_INSET_FROM_INSIDE_EDGE,
+            WDC_STILE_INSET,
+        )
+
+        cls.result, cls.config = wdc_sheet()
+        cls.job = job_for(cls.result, prefix="88")
+        assert cls.job.outcomes[0].ok, cls.job.outcomes[0].describe()
+        cls.pdf = report_for(cls.result, cls.job)
+        cls.page = 1  # 0 is the cover
+        cls.inset = WDC_STILE_INSET - WDC_SLOT_INSET_FROM_INSIDE_EDGE
+
+    def test_the_drawn_centreline_is_the_posts_centreline(self):
+        # The drawing derives its offset from geometry.py; the post derives
+        # its cut from its own measured table.  This is the pin that stops
+        # the paper and the machine drifting apart.
+        from faceframe_cnc.post.model import default_config
+
+        self.assertAlmostEqual(
+            cutsheet.WDC_SLOT_CENTRELINE_FROM_OUTER_EDGE,
+            default_config().wdc_slot.inset_from_outside_edge,
+        )
+        self.assertAlmostEqual(cutsheet.WDC_SLOT_CENTRELINE_FROM_OUTER_EDGE, self.inset)
+
+    def test_each_wdc_gets_exactly_two_slot_centrelines(self):
+        lines = _slot_lines(self.pdf, self.page)
+        self.assertEqual(len(lines), 4, "two WDC parts, two stiles each")
+
+    def test_the_upright_wdc_slots_are_vertical_full_length_at_the_stiles(self):
+        scale, ox, oy = cutsheet.sheet_transform(self.config)
+        part = self.result.unique_sheets[0][0].placements[0]
+        lines = _slot_lines(self.pdf, self.page)
+        for local_x in (self.inset, part.width - self.inset):
+            want = (
+                ox + (part.x + local_x) * scale,
+                oy + part.y * scale,
+                ox + (part.x + local_x) * scale,
+                oy + (part.y + part.height) * scale,
+            )
+            with self.subTest(local_x=local_x):
+                self.assertTrue(
+                    any(_close(line, want) for line in lines),
+                    f"no vertical slot centreline at {want}; got {lines}",
+                )
+
+    def test_the_rotated_wdc_slots_turn_with_the_part(self):
+        # 90 degrees CCW puts the stile axis along sheet X, so the two
+        # centrelines become horizontal, offset from the placement's bottom
+        # and top edges by the same stile inset.
+        scale, ox, oy = cutsheet.sheet_transform(self.config)
+        part = self.result.unique_sheets[0][0].placements[1]
+        lines = _slot_lines(self.pdf, self.page)
+        for local_y in (self.inset, part.height - self.inset):
+            want = (
+                ox + part.x * scale,
+                oy + (part.y + local_y) * scale,
+                ox + (part.x + part.width) * scale,
+                oy + (part.y + local_y) * scale,
+            )
+            with self.subTest(local_y=local_y):
+                self.assertTrue(
+                    any(_close(line, want) for line in lines),
+                    f"no horizontal slot centreline at {want}; got {lines}",
+                )
+
+    def test_the_cut_list_says_what_the_lines_mean(self):
+        text = self.pdf.text(self.page)
+        self.assertIn("T17 45 deg V-slots both stiles", text)
+        self.assertIn('2" stiles', text)
+        self.assertIn("no T13 stile grooves", text)
+
+    def test_non_wdc_parts_get_no_slot_lines_and_no_note(self):
+        result, _config = known_sheet()
+        parsed = report_for(result, job_for(result, prefix="7201"))
+        self.assertEqual(_slot_lines(parsed, 1), [])
+        self.assertNotIn("T17", parsed.text(1))
+
+
+# --------------------------------------------------------------------------
 # (d) + (e) refusals and dry runs
 # --------------------------------------------------------------------------
 

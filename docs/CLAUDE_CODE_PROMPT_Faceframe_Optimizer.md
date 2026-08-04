@@ -454,3 +454,28 @@ prevent:
   1.0). If packing needs the space, parts may sit closer to the front (and
   the remaining slack goes to the back edge). This refines, not replaces,
   §4a's 0.5" all-around soft cushion: the front edge target is 1".
+
+- **2026-08-03 — WDC single-missing-dim auto-resolution, and the part-gap
+  floor**: two fixes to stop recurring prompts and late refusals.
+  (1) A WDC row missing exactly ONE frame dimension is auto-resolved from
+  the part number when the dimension it DOES have matches what the name
+  encodes: the frame width is the encoded cabinet width **minus 6"**
+  (WDC2436 = cabinet 24×36 → frame 18×36), the height carries over. The
+  row parses as a READY line with a note recording the derivation ("width
+  18 derived from part number ...") — **no prompt**. A present dimension
+  that CONTRADICTS the name (e.g. height 35 on a WDC2436) is never guessed
+  over and stays in "needs attention"; a WDC row missing BOTH dims stays a
+  no-faceframe line per the SD1212 amendment. The GUI additionally shows a
+  visible WDC fact sheet (2" stiles, derived width, T17 slot geometry, the
+  0.875" end reach — all derived from the geometry engine) in the order
+  panel, and the PDF cut sheets print the two T17 slot centrelines on
+  every WDC placement plus a "2\" stiles - T17 45 deg V-slots" cut-list
+  note, so the owner can SEE what the machine will do instead of trusting
+  a typed-in 18.
+  (2) The part gap has a **hard floor of 0.455"** (`MIN_PART_GAP`): the
+  perimeter lead-in sweeps 0.425 past the part edge, so a tighter gap
+  packs sheets the NC verifier must refuse at Generate time. A stale
+  settings file persisting a smaller gap (e.g. the spec's original 0.375)
+  is migrated up to 0.455 on load with a visible note; the settings dialog
+  will not accept less; and the session refuses to optimize below the
+  floor outright rather than let the failure surface at Generate.

@@ -36,7 +36,11 @@ spec and the reference `.anc` files disagree, the .anc files win.
   WDC is special (2026-08-03 amendment): 2" stiles, WDC2436 is 18x36 →
   opening 14x33. Openings validated against real machine file.
 - `faceframe_cnc/order_parser.py` — .xls parser (pandas+xlrd), needs-attention
-  flow (7-21 order: WDC2436 missing width → resolve with 18; SD1212 excluded).
+  flow. 2026-08-03 amendment: a WDC row missing exactly one dim is
+  auto-resolved from the part number (frame W = encoded cabinet W − 6, so
+  WDC2436 → 18×36) with a provenance note — no prompt; a contradicting dim
+  still needs attention, and SD1212 (both dims N/A) stays auto-excluded.
+  The 7-21 order now loads with an EMPTY needs-attention list.
 - `faceframe_cnc/anc_reader.py` — decodes T11 cut rectangles from .anc files;
   cross-check proves engine matches R730101N.anc exactly (tool center inset
   0.1975 = 0.1875 radius + 0.010 finish stock for T12).
@@ -81,7 +85,11 @@ spec and the reference `.anc` files disagree, the .anc files win.
     planner and the verifier's swept-cone check, independently.
   - Spacing (owner-approved 2026-08-03): part gap **0.455** (0.375 cannot be
     verified — the perimeter lead-in sweeps 0.425 past the part edge);
-    inner-frame clearance stays **0.375** as its own setting.
+    inner-frame clearance stays **0.375** as its own setting.  0.455 is now
+    a HARD FLOOR (`nesting.MIN_PART_GAP`): stale settings files are migrated
+    up on load with a visible note, the settings dialog will not go lower,
+    and `Session.optimize` refuses a smaller gap instead of packing sheets
+    the verifier must refuse at Generate.
   - Acceptance: the 7-21-26 order at the defaults nests to 41 sheets / 17
     unique pictures and **all 17 generate and verify clean, zero refusals**,
     in production and in dry-run form.

@@ -57,7 +57,14 @@ import os
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
-from ..geometry import compute_geometry, infer_frame_type
+from ..geometry import (
+    FrameType,
+    WDC_SLOT_INSET_FROM_INSIDE_EDGE,
+    WDC_STILE_INSET,
+    compute_geometry,
+    infer_frame_type,
+    wdc_slot_axis_is_height,
+)
 from ..gui.session import sheet_openings
 from ..post.job import APP_BANNER_NAME, DRY_RUN_BANNER, now_created
 from . import pdf
@@ -138,6 +145,28 @@ TILE_EDGE = pdf.gray(0.78)
 #: Dash patterns matching the canvas's guides.
 CUSHION_DASH = (3.0, 2.5)
 FRONT_MARGIN_DASH = (1.0, 2.0)
+
+# -- The T17 WDC stile slot on paper (2026-08-03 owner request) ------------
+#
+# The owner wants to SEE where the special routing runs before trusting a
+# WDC line, so every WDC placement is drawn with its two slot centrelines.
+# Everything is DERIVED from the geometry engine — the same constants the
+# optimizer reserves room with and the post cross-checks — so the paper can
+# never show a slot the machine does not cut.
+
+#: Its own colour and its own dash: the slot is a CUT, not a guide, so it
+#: must not read as the cushion (grey 3/2.5) or the front margin (tan 1/2).
+WDC_SLOT_EDGE = pdf.hex_color("#b3541e")
+WDC_SLOT_DASH = (4.0, 2.0)
+
+#: Frame-local distance from a stile's OUTER edge to its slot centreline:
+#: the amendment gives the centreline 34 mm off the stile's INSIDE
+#: (opening-side) edge, and the stile is 2" wide, so the line sits at
+#: 0.6614 from the outside.  The post derives the same number as
+#: ``WdcSlotSpec.inset_from_outside_edge``; a test pins the two.
+WDC_SLOT_CENTRELINE_FROM_OUTER_EDGE = (
+    WDC_STILE_INSET - WDC_SLOT_INSET_FROM_INSIDE_EDGE
+)
 
 
 # --------------------------------------------------------------------------
@@ -793,10 +822,56 @@ def _draw_part(page, placement, transform, ordered, depth: int) -> None:
             line_width=0.4,
         )
 
+    if infer_frame_type(placement.part_number) is FrameType.WDC:
+        _draw_wdc_slots(page, placement, transform)
+
     for child in placement.children:
         _draw_part(page, child, transform, ordered, depth + 1)
 
     _draw_label(page, x, y, width, height, placement.part_number, nested, is_host)
+
+
+def _draw_wdc_slots(page, placement, transform) -> None:
+    """Dash the two T17 slot centrelines across a WDC placement.
+
+    Each 2" stile carries one straight V slot, centreline
+    :data:`WDC_SLOT_CENTRELINE_FROM_OUTER_EDGE` in from that stile's outer
+    edge, running the full length of the part along the stile axis.  The
+    stiles run along the frame's HEIGHT axis, so
+    :func:`~faceframe_cnc.geometry.wdc_slot_axis_is_height` decides whether
+    the lines are vertical (upright placement) or horizontal (rotated) —
+    the same call the optimizer uses to orient the slot's end clearance,
+    so the drawing and the reserved room can never disagree.
+    """
+    scale, origin_x, origin_y = transform
+    inset = WDC_SLOT_CENTRELINE_FROM_OUTER_EDGE
+    if wdc_slot_axis_is_height(placement.rotated):
+        # Upright: stiles are the left and right members, slots run in Y.
+        for local_x in (inset, placement.width - inset):
+            x = origin_x + (placement.x + local_x) * scale
+            page.line(
+                x,
+                origin_y + placement.y * scale,
+                x,
+                origin_y + (placement.y + placement.height) * scale,
+                stroke=WDC_SLOT_EDGE,
+                line_width=0.8,
+                dash=WDC_SLOT_DASH,
+            )
+        return
+    # Rotated 90 degrees CCW: the stile axis lies along sheet X, and the
+    # frame-local stile offsets land on the placement's Y extents.
+    for local_y in (inset, placement.height - inset):
+        y = origin_y + (placement.y + local_y) * scale
+        page.line(
+            origin_x + placement.x * scale,
+            y,
+            origin_x + (placement.x + placement.width) * scale,
+            y,
+            stroke=WDC_SLOT_EDGE,
+            line_width=0.8,
+            dash=WDC_SLOT_DASH,
+        )
 
 
 def _draw_label(page, x, y, width, height, text, nested: bool, is_host: bool) -> None:
@@ -844,7 +919,12 @@ def _draw_cut_list(page, report, ordered) -> None:
 
     rows = cut_list(report.layout, ordered)
     for position, row in enumerate(rows):
-        needed = 21.0 + (10.0 if row.hosts else 0.0)
+        is_wdc = row.frame_type == FrameType.WDC.value
+        needed = (
+            21.0
+            + (10.0 if row.hosts else 0.0)
+            + (8.5 if is_wdc else 0.0)
+        )
         if y - needed < y0:
             page.text(
                 x0,
@@ -866,6 +946,12 @@ def _draw_cut_list(page, report, ordered) -> None:
         detail = f"{row.frame_type} - openings {row.openings}"
         for line in pdf.wrap_text(detail, REGULAR, 7.5, width, max_lines=2):
             page.text(x0, y, line, size=7.5, color=MUTED)
+            y -= 8.5
+        if is_wdc:
+            # 2026-08-03 owner request: the paperwork says out loud what is
+            # special about a WDC frame, in the slot centrelines' colour so
+            # the note and the dashed lines on the drawing read as one fact.
+            page.text(x0, y, _wdc_cutlist_note(), size=7.5, color=WDC_SLOT_EDGE)
             y -= 8.5
         if row.hosts:
             page.text(x0, y, row.nested_text, size=7.5, color=CHILD_EDGE)
@@ -906,6 +992,18 @@ def _footers(document, stamp, app_name) -> None:
 def _dim(value: float) -> str:
     """A dimension in inches, trimmed: ``21``, ``9.875``, ``0.455``."""
     return f"{float(value):g}"
+
+
+def _wdc_cutlist_note() -> str:
+    """The cut list's one-liner on what makes a WDC frame special.
+
+    Built from the geometry engine's constant so the stile width printed
+    here is the one the openings were computed with.
+    """
+    return (
+        f'{WDC_STILE_INSET:g}" stiles - T17 45 deg V-slots both stiles - '
+        f"no T13 stile grooves"
+    )
 
 
 def _contents_text(layout) -> str:

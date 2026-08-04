@@ -25,7 +25,21 @@ from faceframe_cnc.gui.session import (
     load_settings,
     save_settings,
 )
+from faceframe_cnc.nesting import NestingConfig, nest
 from tests.test_nesting import ORDER_7_21_26
+
+try:  # the .xls parser is the only thing in the app that needs pandas
+    import pandas  # noqa: F401
+
+    HAVE_PANDAS = True
+except ImportError:  # pragma: no cover - depends on the environment
+    HAVE_PANDAS = False
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ORDER_XLS = os.path.join(
+    HERE, os.pardir, "reference", "orders", "7-21-26_Cab_Tec_Order_with_specs.xls"
+)
+HAVE_ORDER = os.path.exists(ORDER_XLS)
 
 CREATED = "01 JAN 27 - 08:00"
 
@@ -131,21 +145,16 @@ class SessionGenerateTests(unittest.TestCase):
         short of the perimeter lead-in's sweep, so on a real order some
         sheets cut into their neighbours.  It needs the real order — a
         two-frame sheet has nowhere for the lead-in to reach.
+
+        ``Session.optimize`` refuses a 0.375 gap outright now (the
+        2026-08-03 floor), so the layout is packed with the library and
+        installed via ``set_result`` — the verifier stays the last line of
+        defence for layouts that never went through the session's guard.
         """
-        session = Session(AppSettings(part_gap=0.375, inside_nesting=True))
-        session.set_rows(
-            [
-                OrderRow(
-                    key=spec.part_number,
-                    part_number=spec.part_number,
-                    qty=spec.qty,
-                    frame_width=spec.width,
-                    frame_height=spec.height,
-                )
-                for spec in ORDER_7_21_26
-            ]
+        session = Session(AppSettings())
+        session.set_result(
+            nest(ORDER_7_21_26, NestingConfig(part_gap=0.375, inside_nesting=True))
         )
-        session.optimize()
         with tempfile.TemporaryDirectory() as folder:
             job = session.generate_nc(folder, prefix="7201", created=CREATED)
             self.assertTrue(job.refused, "0.375 cannot be cut")
@@ -153,6 +162,20 @@ class SessionGenerateTests(unittest.TestCase):
             for outcome in job.refused:
                 self.assertEqual(outcome.refusal_kind, "verifier")
                 self.assertNotIn(outcome.filename, os.listdir(folder))
+
+    def test_optimize_itself_now_refuses_the_gap_that_caused_those_refusals(self):
+        """Bug fix 2026-08-03: a stale 0.375 used to sail through optimize
+        and surface as 8 of 17 sheets refused at Generate.  The session now
+        stops it at optimize time, with the reason and the fix in the
+        message."""
+        session = Session(AppSettings(inside_nesting=True))
+        session.settings.part_gap = 0.375
+        session.set_rows(
+            [OrderRow(key="a", part_number="W3036", qty=2, frame_width=30.0, frame_height=36.0)]
+        )
+        with self.assertRaises(SessionError) as caught:
+            session.optimize()
+        self.assertIn("0.455", str(caught.exception))
 
     def test_the_output_folder_and_prefix_are_remembered(self):
         session = session_with_layout()
@@ -245,14 +268,65 @@ class SessionGenerateTests(unittest.TestCase):
                 self.assertIn(outcome.filename, cover)
 
     def test_a_too_tight_gap_is_reported_not_written(self):
-        """The default 0.375 gap is 0.05 short of what the perimeter lead-in
-        sweeps; the verifier catches it and the file is not written."""
-        session = session_with_layout(part_gap=0.375)
+        """The spec's 0.375 gap is 0.05 short of what the perimeter lead-in
+        sweeps; the verifier catches it and the file is not written.  The
+        layout is installed directly (``Session.optimize`` refuses 0.375
+        since the 2026-08-03 floor), using the fixture built to guarantee
+        the collision."""
+        from tests.test_nc_job import crowded_sheet
+
+        result, _config = crowded_sheet()
+        session = Session(AppSettings())
+        session.set_result(result)
         with tempfile.TemporaryDirectory() as folder:
             job = session.generate_nc(folder, prefix="7201", created=CREATED)
+            self.assertTrue(job.refused, "two parts 0.375 apart must be refused")
             for outcome in job.refused:
                 self.assertEqual(outcome.refusal_kind, "verifier")
                 self.assertNotIn(outcome.filename, os.listdir(folder))
+
+    # -- the 2026-08-03 stale-settings repro, end to end -----------------
+
+    @unittest.skipUnless(HAVE_PANDAS, "pandas/xlrd are needed to read .xls orders")
+    @unittest.skipUnless(HAVE_ORDER, "the sample order spreadsheet is not present")
+    def test_a_stale_settings_file_no_longer_produces_refused_sheets(self):
+        """The owner's exact repro, replayed through every layer of the fix.
+
+        faceframe_settings.json persisted part_gap 0.375 from before the
+        0.455 amendment; loading it, loading the 7-21 order (with NOTHING
+        resolved by hand — the WDC row resolves itself now), optimizing and
+        generating used to end in 8 of 17 sheets refused with
+        "[foreign-cut] ...".  Now the load migrates the gap up to 0.455 with
+        a note, and every sheet writes.
+        """
+        import json
+
+        with tempfile.TemporaryDirectory() as folder:
+            settings_path = os.path.join(folder, "settings.json")
+            with open(settings_path, "w", encoding="utf-8") as handle:
+                json.dump({"part_gap": 0.375, "inside_nesting": True}, handle)
+
+            settings = load_settings(settings_path)
+            self.assertEqual(settings.part_gap, 0.455)
+            self.assertTrue(settings.migration_notes, "the fix must not be silent")
+
+            session = Session(settings)
+            session.load_order(ORDER_XLS)
+            self.assertEqual(
+                session.needs_attention_rows(),
+                [],
+                "nothing may need manual resolution on this order any more",
+            )
+            session.optimize()
+
+            out_dir = os.path.join(folder, "nc")
+            job = session.generate_nc(
+                out_dir, prefix="7201", pdf_report=False, created=CREATED
+            )
+            self.assertEqual(job.refused, [], job.summary())
+            self.assertEqual(len(job.written), session.unique_sheet_count)
+            written = sorted(os.listdir(out_dir))
+            self.assertEqual(written, sorted(o.filename for o in job.written))
 
 
 # --------------------------------------------------------------------------

@@ -122,7 +122,14 @@ class MainWindow(QMainWindow):
         self.summary_dock = summary_dock
 
         self._build_toolbar()
-        self.statusBar().showMessage("Open an order spreadsheet to begin")
+        # A stale settings file the session had to correct on load (e.g. a
+        # part gap below the NC post's floor) is announced here, on startup,
+        # instead of silently running with a value the user never chose.
+        notes = list(getattr(self.session.settings, "migration_notes", ()) or ())
+        if notes:
+            self.statusBar().showMessage("Settings updated: " + "; ".join(notes))
+        else:
+            self.statusBar().showMessage("Open an order spreadsheet to begin")
         self.refresh()
 
     # -- construction ----------------------------------------------------

@@ -505,5 +505,47 @@ class FrontMarginTests(unittest.TestCase):
             nest([PartSpec("P", 10.0, 10.0, 1)], NestingConfig(front_margin=float("nan")))
 
 
+class MinPartGapCrossCheckTests(unittest.TestCase):
+    """MIN_PART_GAP encodes a machine fact; this pins it to the machine.
+
+    The constant exists because the T11 perimeter lead-in sweeps past the
+    part edge, so any packing gap inside that sweep produces sheets the NC
+    verifier must refuse.  ``nesting`` must not import the post package
+    (core modules stay stdlib-and-geometry only), so THIS TEST is the
+    layering-safe cross-check: it recomputes the worst-case sweep from the
+    post's own measured table and fails the moment the table grows a
+    lead-in that MIN_PART_GAP no longer clears.
+    """
+
+    def test_min_part_gap_clears_the_perimeter_lead_in_sweep(self):
+        from faceframe_cnc.nesting import MIN_PART_GAP
+        from faceframe_cnc.post.model import SECTION_PERIMETER, default_config
+
+        config = default_config()
+        tool = config.tools[SECTION_PERIMETER]
+        # Per pass: the ramp line stands ``lateral_lead`` outside a profile
+        # that is itself ``offset`` outside the part edge, and the tool
+        # cuts a further radius beyond its centre.  The worst pass governs.
+        reach = (
+            max(p.offset + p.lateral_lead for p in config.perimeter_passes)
+            + tool.radius
+        )
+        # Pass 1 (spring stock 0.1895 + lead 0.05 + radius 0.1875) = 0.427;
+        # the through pass is the 0.425 the docs quote.
+        self.assertAlmostEqual(reach, 0.427)
+        self.assertLess(
+            reach,
+            MIN_PART_GAP,
+            "the post's perimeter lead-in now sweeps past MIN_PART_GAP: "
+            "parts packed at the minimum gap would be cut into",
+        )
+
+    def test_the_default_part_gap_is_the_floor(self):
+        from faceframe_cnc.nesting import MIN_PART_GAP
+
+        self.assertEqual(MIN_PART_GAP, 0.455)
+        self.assertEqual(NestingConfig().part_gap, MIN_PART_GAP)
+
+
 if __name__ == "__main__":
     unittest.main()
