@@ -49,6 +49,14 @@ spec and the reference `.anc` files disagree, the .anc files win.
   gap** (measured; see below), soft 0.5" edge cushion, deterministic;
   independent `validate_layouts`. 7-21 order: 49 sheets footprint-only
   (area floor 41). `Placement.children` carries M3 inners.
+  2026-08-04 review fix: the packer now enforces the WDC hard edge rule
+  itself (`_edge_inset` — reserved rectangle stays `part_gap` off the
+  slot-axis sheet edges, front/back charged constructively in
+  `_select_shelves`, side rows corrected by one retry), so it can no longer
+  emit a layout `validate_layouts` refuses; impossible WDC sizes are
+  refused up front by `_normalize_demand` with the T17 reach in the
+  message. Non-WDC sheets are laid out bit-identically to before; the
+  footprint-only baseline is now 18 unique pictures (was 19).
 
 - `faceframe_cnc/inside.py` + nesting.py M3 extensions — frame-inside-frame
   (spec 4b): exact max-flow inner/host assignment, WDC2436 dual-role
@@ -60,7 +68,12 @@ spec and the reference `.anc` files disagree, the .anc files win.
   Py 3.14): headless `session.py` holds ALL logic (order load/resolve/include,
   optimize, move/rotate/cross-sheet/nest/unnest edits validated on trial
   copies — invalid edits snap back with the violated rule; spec-4c run
-  splitting and re-grouping; row editing — `Session.edit_row`/`revert_row`
+  splitting and re-grouping; 2026-08-04 review fix: `set_included`/
+  `set_all_included`/`resolve_row` now invalidate the layout exactly like
+  `edit_row` (a layout built from the pre-change cut list must never reach
+  Generate), and `MainWindow._on_order_changed` calls `refresh()` so button
+  states can never go stale (the "Optimize grayed out and stayed gray"
+  owner report); row editing — `Session.edit_row`/`revert_row`
   change a line's qty/dimensions with the same trial-then-commit discipline,
   double-click a row or "Edit..." opens `EditRowDialog` with an explicit
   "Save changes" step and a live before/after summary, and any successful
@@ -78,6 +91,28 @@ spec and the reference `.anc` files disagree, the .anc files win.
   R730101N round-trip **byte for byte**. Generated sheets use T13 → T17
   (WDC only) → T11 openings → T12 → T11 perimeters, with the onion-skin
   pass order. GUI "Generate NC" is wired up.
+  - **2026-08-04 review hardening** (external gpt-5.6-sol review, all
+    findings verified before fixing):
+    - `verifier.expected_work` — build_job hands verify() a manifest of
+      every cut the sheet OWES (derived from the layout + geometry.py +
+      model.py, deliberately NOT from from_layout/generator — an AST test
+      forbids the imports), with depth-aware recovery: missing through
+      passes, missing openings, missing T13/T17 features and extra cuts
+      are now `missing-cut`/`extra-cut` refusals. Dry runs are judged
+      against their own lifted manifest. 7-21 order: 1008 owed cuts per
+      form, all matched.
+    - Feed/speed check (`feed`/`spindle-speed` violations): every F word
+      judged modally against the tool's entry/cut feeds, every S word and
+      every M13 against the tool's RPM, all from the PostConfig in hand.
+      T11 legitimately runs two cut feeds (545 openings / 498.2 perimeter).
+    - `write_job` — atomic writes (`.partial` + os.replace; a failed write
+      can't truncate the file already there) and stale-file quarantine:
+      files matching this job's exact name pattern that this run did not
+      write (shorter re-run leftovers, refused sheets' old files, orphaned
+      partials) are MOVED to `superseded/<stamp>/`, never deleted, listed
+      on `JobResult.superseded`; a failed move is a loud
+      `quarantine_problems` entry and the GUI headline says the folder is
+      not safe for the machine yet.
   - T11 opening through-cuts run tool center 0.1975 inside the opening edge
     (0.1875 radius + 0.010 T12 finish stock) — verified vs R730101N.anc.
   - **T17 WDC stile slot** (2026-08-03 amendment, grammar from RFK0101N):
@@ -111,7 +146,33 @@ spec and the reference `.anc` files disagree, the .anc files win.
   `tests/test_report.py` parses the PDF back and asserts structure,
   determinism and drawn coordinates.
 
-## Where the last session left off (2026-08-03/04)
+## 2026-08-04 session: external review + six fixes (this commit)
+
+Scott asked for a "Codex Sol" high-effort review (OpenAI Codex CLI,
+gpt-5.6-sol, read-only sandbox) of the whole tree, plus a fix for an
+owner-reported bug ("edited some lines then the Optimize button grayed
+out"). The review returned five findings, every one verified against the
+code (two reproduced with scripts) before fixing; the sixth fix is the
+feed-word follow-up, owner-approved the same day. All six are in this
+commit, each written by a subagent and reviewed:
+
+1. include/resolve didn't invalidate the layout → stale NC reachable from
+   Generate (gui/session.py) — CRITICAL.
+2. bare open(path,"w") over production filenames → atomic writes + stale
+   quarantine (post/job.py) — CRITICAL.
+3. verifier blind to MISSING cuts → expected-work manifest
+   (post/verifier.py, job.py) — MAJOR.
+4. button states recomputed only in refresh(), which order changes never
+   called → the grayed-Optimize trap (gui/main_window.py) — MAJOR.
+5. WDC stile ends packable 0.42" from the sheet edge vs the 0.875 hard
+   rule → packer enforces the edge rule (nesting.py) — MAJOR.
+6. F/S words unchecked → per-tool feed/speed verification
+   (post/verifier.py) — the RESUME follow-up, now closed.
+
+Tests 515 → 602, all green; 7-21 order still 41 sheets / 17 unique, zero
+refusals, production and dry-run; reference round-trips still byte-exact.
+
+## Where the previous session left off (2026-08-03/04)
 
 Session log, in order — commits `91757dd` (Milestone 5 complete),
 `ec2da9a` (Milestone 6 PDF report), `b7212d6` (part-gap floor + WDC
@@ -155,8 +216,8 @@ auto-resolution), then row editing (committed at wrap-up; see git log):
 
 ### Known follow-ups (recorded, non-blocking)
 
-- The verifier checks no `F` (feed) words for any tool — a wrong feed would
-  pass today. Worth its own small change + tests.
+- ~~The verifier checks no `F` (feed) words~~ — CLOSED 2026-08-04 (fix 6
+  above; `feed`/`spindle-speed` violation kinds, 24 tamper tests).
 - `verifier._owner_of` attributes a move to the smallest containing grown
   box, which can self-skip a lead-in intrusion; the v-slot check has its
   own correct ownership rule. Fix someday, with a failing test first.
@@ -169,6 +230,8 @@ auto-resolution), then row editing (committed at wrap-up; see git log):
 
 ## Next
 
-No milestone is open — the spec is fully delivered. Candidates, Scott's
-call: the verifier feed-word check (top of the follow-ups), a printed-page
-check of the PDF report, or whatever the shop floor turns up next.
+No milestone is open — the spec is fully delivered and the 2026-08-04
+review findings are all fixed. Candidates, Scott's call: the
+`verifier._owner_of` attribution quirk (needs a failing test first), a
+printed-page check of the PDF report, or whatever the shop floor turns up
+next.

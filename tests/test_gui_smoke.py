@@ -176,6 +176,26 @@ class MainWindowSmokeTests(unittest.TestCase):
         self.assertFalse(self.session.row("b").included)
         self.assertEqual([s.part_number for s in self.session.demand()], ["W3036"])
 
+    def test_cutting_none_then_none_disables_optimize_and_recutting_reenables_it(self):
+        # 2026-08-04 owner report: "Cut none" then re-checking rows never
+        # re-enabled Optimize, because none of the include/edit/resolve
+        # paths ever called refresh() -- only MainWindow.refresh() itself
+        # recomputes optimize_action's enabled state, and _on_order_changed
+        # (wired to the panel's includeChanged/lineResolved signals) used to
+        # do nothing but write a status message.
+        panel = self.window.order_panel
+        self.assertTrue(self.window.optimize_action.isEnabled())
+
+        panel.none_button.click()
+        self.assertEqual(self.session.included_rows(), [])
+        self.assertFalse(self.window.optimize_action.isEnabled())
+
+        # Re-including goes through the same signal path (includeChanged),
+        # never through a reload of the order itself.
+        panel.all_button.click()
+        self.assertTrue(self.session.included_rows())
+        self.assertTrue(self.window.optimize_action.isEnabled())
+
     def test_a_no_frame_row_has_no_usable_checkbox(self):
         # SD1212 (2026-08-03 amendment: NO_FRAME, not needs-attention) still
         # cannot be ticked on until resolved.

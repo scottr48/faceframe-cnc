@@ -258,6 +258,26 @@ class MainWindow(QMainWindow):
                 f"\n\n{len(refused)} sheet{'' if len(refused) == 1 else 's'} refused - "
                 f"nothing was written for those."
             )
+        # 2026-08-04 review: stale programs from an earlier run of this
+        # prefix are quarantined, never deleted, and never silently -- the
+        # moves go in the headline (the details list each file), and a move
+        # that FAILED means the folder still holds a program that is not
+        # part of this job, which the operator must hear about louder than
+        # a details pane.
+        superseded = getattr(job, "superseded", [])
+        if superseded:
+            head += (
+                f"\n\n{len(superseded)} stale file{'' if len(superseded) == 1 else 's'} "
+                f"from an earlier run moved to {job.quarantine_dir} "
+                f"(nothing deleted - see details)."
+            )
+        if getattr(job, "quarantine_problems", []):
+            head += (
+                "\n\nSTALE FILES COULD NOT BE MOVED OUT OF THE OUTPUT FOLDER - "
+                "do not take this folder to the machine until that is sorted "
+                "(see details)."
+            )
+            box.setIcon(QMessageBox.Icon.Warning)
         # Milestone 6: the report is paperwork, so its failure is reported
         # beside the job rather than as part of it (the programs went out).
         report_path = getattr(job, "report_path", None)
@@ -276,6 +296,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"{written} NC program(s) written"
             + (f", {len(refused)} sheet(s) refused" if refused else "")
+            + (f", {len(superseded)} stale file(s) quarantined" if superseded else "")
             + (" + PDF report" if report_path else "")
             + (" [dry run]" if job.dry_run else "")
         )
@@ -313,6 +334,11 @@ class MainWindow(QMainWindow):
     # -- signals ---------------------------------------------------------
 
     def _on_order_changed(self) -> None:
+        # Button enabled states (Optimize, Generate) are only recomputed in
+        # refresh() -- a status-bar message alone left them stale (2026-08-04
+        # owner report: "Cut none" then re-checking rows never re-enabled
+        # Optimize because nothing on this path ever called refresh()).
+        self.refresh()
         self.statusBar().showMessage(
             f"{self.session.total_frames} frames selected - press Optimize (Ctrl+R)"
         )

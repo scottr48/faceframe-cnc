@@ -10,6 +10,7 @@ import math
 import time
 import unittest
 
+from faceframe_cnc.geometry import WDC_SLOT_END_REACH, wdc_slot_axis_is_height
 from faceframe_cnc.nesting import (
     EPS,
     NestingConfig,
@@ -19,6 +20,7 @@ from faceframe_cnc.nesting import (
     Placement,
     SheetLayout,
     nest,
+    slot_end_clearance,
     validate_layouts,
 )
 
@@ -54,6 +56,36 @@ def gap_between(a: Placement, b: Placement) -> float:
     if dx >= 0 and dy >= 0:
         return math.hypot(dx, dy)
     return max(dx, dy)
+
+
+def stile_end_clearances(result: NestingResult, config: NestingConfig):
+    """Every WDC placement's real distance to the two SLOT-AXIS sheet edges.
+
+    Returns ``(run, placement, before, after)`` per WDC on each unique sheet
+    picture, the two distances in inches and ``run`` the number of physical
+    sheets that picture is stamped onto — so the runs sum to the frames the
+    machine will actually cut.  Measured off the emitted coordinates the way
+    the machine will read them: nothing the packer reserved is consulted,
+    which is the whole point when the reserved rectangle is the suspect.
+    Nested children are walked too — a WDC is small enough to ride inside a
+    W2742 opening, so it reaches the sheet edge as a passenger as well.
+    """
+    out = []
+
+    def walk(run, placements):
+        for p in placements:
+            walk(run, p.children)
+            if slot_end_clearance(p.part_number, config) <= config.part_gap:
+                continue
+            if wdc_slot_axis_is_height(p.rotated):
+                low, high, limit = p.y, p.y + p.height, config.sheet_height
+            else:
+                low, high, limit = p.x, p.x + p.width, config.sheet_width
+            out.append((run, p, low, limit - high))
+
+    for layout, run in result.unique_sheets:
+        walk(run, layout.placements)
+    return out
 
 
 class FullOrderTests(unittest.TestCase):
@@ -503,6 +535,291 @@ class FrontMarginTests(unittest.TestCase):
             nest([PartSpec("P", 10.0, 10.0, 1)], NestingConfig(front_margin=-1.0))
         with self.assertRaises(NestingError):
             nest([PartSpec("P", 10.0, 10.0, 1)], NestingConfig(front_margin=float("nan")))
+
+
+class WdcSheetEdgeTests(unittest.TestCase):
+    """2026-08-04 review: the packer must satisfy its own hard edge rule.
+
+    Since the 2026-08-03 amendment ``validate_layouts`` has enforced — hard,
+    the only hard rule it applies to a sheet edge — that a WDC's stile END
+    sits at least ``WDC_SLOT_END_REACH`` (0.875") from the sheet edge along
+    the axis its T17 slot runs: the 45-degree cone breaks the surface that far
+    past the part, so any less and the cut runs off the sheet.
+
+    The packer only ever reserved ``slot_end_clearance - part_gap`` (0.420)
+    past each stile end.  Between two parts the ordinary ``part_gap`` tops
+    that up to exactly 0.875, which is correct and deliberately frugal.  At a
+    sheet edge there is no neighbour and so nothing to top it up — only the
+    SOFT ``edge_cushion``, which is compressible to zero by design.  So the
+    optimizer could hand the owner a finished layout its own validator
+    refused: an optimized job that could never reach Generate.
+
+    Everything below is measured from the emitted coordinates.
+    """
+
+    def setUp(self):
+        self.config = NestingConfig()
+
+    def assert_clear_of_the_edges(self, result, config, frames=None):
+        """No WDC stile end within the slot's reach of a slot-axis edge.
+
+        ``frames``, when given, is how many WDC frames the machine must end up
+        cutting — runs included, so a layout that quietly dropped one cannot
+        pass by having every frame it did place sitting legally.
+        """
+        self.assertEqual(validate_layouts(result, config), [])
+        measured = stile_end_clearances(result, config)
+        if frames is not None:
+            self.assertEqual(
+                sum(run for run, *_rest in measured), frames, "wrong WDC frame count"
+            )
+        for _run, placement, before, after in measured:
+            where = f"{placement.part_number} @({placement.x:.4f},{placement.y:.4f})"
+            self.assertGreaterEqual(
+                before, WDC_SLOT_END_REACH - EPS,
+                f"{where}: only {before:.4f} to the near slot-axis edge",
+            )
+            self.assertGreaterEqual(
+                after, WDC_SLOT_END_REACH - EPS,
+                f"{where}: only {after:.4f} to the far slot-axis edge",
+            )
+        return measured
+
+    # -- the root cause, pinned so it cannot drift back -------------------
+
+    def test_the_reserved_rectangle_alone_cannot_satisfy_the_edge_rule(self):
+        from faceframe_cnc.nesting import _edge_inset, _pack_pad
+
+        cfg = self.config
+        clearance = slot_end_clearance("WDC2436", cfg)
+        self.assertAlmostEqual(clearance, WDC_SLOT_END_REACH)
+
+        pad = _pack_pad("WDC2436", cfg)
+        inset = _edge_inset("WDC2436", cfg)
+        # The reserved rectangle stands 0.420 outside the stile end...
+        self.assertAlmostEqual(pad, clearance - cfg.part_gap)
+        # ...which falls a whole part_gap short of what the validator wants.
+        # Between two parts the gap pays that difference; a sheet edge pays
+        # nothing, so the rectangle itself has to stand off by the remainder.
+        self.assertAlmostEqual(inset, cfg.part_gap)
+        self.assertAlmostEqual(pad + inset, clearance)
+        self.assertLess(pad, clearance)
+
+        # None of it touches an ordinary frame.
+        self.assertEqual(_pack_pad("B30", cfg), 0.0)
+        self.assertEqual(_edge_inset("B30", cfg), 0.0)
+
+    # -- the reported repro ------------------------------------------------
+
+    def test_the_reported_heights_nest_with_no_violations(self):
+        # Reported 2026-08-04: each of these produced an "optimized" sheet the
+        # validator then rejected on both frames.  The first three rotate (the
+        # slot axis lands along the 49" width), so the bug showed up in x.
+        for height in (48.1, 48.0, 47.9):
+            with self.subTest(height=height):
+                result = nest([PartSpec("WDC2452", 18.0, height, 2)], self.config)
+                self.assert_clear_of_the_edges(result, self.config, frames=2)
+
+    def test_the_reported_heights_that_cannot_fit_are_refused_not_packed(self):
+        # The other three from the same report are not packing failures at
+        # all: 95.8 + 2 x 0.875 = 97.55 on a 97" sheet, and turning the frame
+        # is no help (95.8 > 49).  No legal placement exists, so nest() has to
+        # say so — quietly emitting a layout the validator refuses is the one
+        # answer that is never acceptable.
+        for height in (95.8, 96.0, 96.16):
+            with self.subTest(height=height):
+                with self.assertRaises(NestingError) as raised:
+                    nest([PartSpec("WDC2452", 18.0, height, 2)], self.config)
+                message = str(raised.exception)
+                self.assertIn("WDC2452", message)
+                self.assertIn("does not fit", message)
+                self.assertIn("T17 stile slot", message)
+
+    def test_the_boundary_between_a_makeable_and_an_impossible_wdc(self):
+        # 97 - 2 x 0.875 = 95.25 exactly: the tallest WDC this sheet can hold.
+        cfg = self.config
+        limit = cfg.sheet_height - 2.0 * WDC_SLOT_END_REACH
+        self.assertAlmostEqual(limit, 95.25)
+
+        result = nest([PartSpec("WDC2436", 18.0, limit, 1)], cfg)
+        placement = result.unique_sheets[0][0].placements[0]
+        self.assertFalse(placement.rotated)
+        self.assertAlmostEqual(placement.y, WDC_SLOT_END_REACH, places=6)
+        self.assert_clear_of_the_edges(result, cfg, frames=1)
+
+        with self.assertRaises(NestingError):
+            nest([PartSpec("WDC2436", 18.0, limit + 0.01, 1)], cfg)
+
+        # An ordinary frame of the same size is unaffected: it has no slot, so
+        # it may still ride the sheet edge (the cushion is only a preference).
+        plain = nest([PartSpec("B30", 18.0, 97.0, 1)], cfg)
+        self.assertEqual(validate_layouts(plain, cfg), [])
+
+    # -- the frugality the fix must not spend -----------------------------
+
+    def test_a_wdc_beside_a_plain_frame_still_shares_exactly_the_slot_reach(self):
+        # The anti-regression for the fix.  Between two parts the reserved
+        # 0.420 plus part_gap already adds up to 0.875 and not a thou more,
+        # and that must stay true: inflating it would cost real sheets on the
+        # owner's order (41 today, pinned in test_inside).  30" wide apiece,
+        # so the two cannot sit side by side across 49" — they stack, and at
+        # 48" tall the WDC cannot be turned either (48 + 1.75 > 49), so its
+        # stile end is guaranteed to be what faces the B30.
+        cfg = self.config
+        result = nest(
+            [PartSpec("WDC3048", 30.0, 48.0, 1), PartSpec("B30", 30.0, 30.0, 1)], cfg
+        )
+        self.assertEqual(result.total_sheets, 1)
+        placements = result.unique_sheets[0][0].placements
+        self.assertEqual(len(placements), 2)
+        self.assert_clear_of_the_edges(result, cfg, frames=1)
+
+        wdc = next(p for p in placements if p.part_number == "WDC3048")
+        plain = next(p for p in placements if p.part_number == "B30")
+        self.assertFalse(wdc.rotated)
+        gap = gap_between(wdc, plain)
+        self.assertAlmostEqual(
+            gap, WDC_SLOT_END_REACH, places=6,
+            msg="the stile end must clear its neighbour by the reach and no more",
+        )
+
+    def test_the_edge_rule_costs_the_real_order_nothing(self):
+        # The 7-21-26 order's WDC2436 frames are 18x36 and sit nowhere near a
+        # slot-axis edge, so the correction must not touch the answer the shop
+        # already accepted: 49 sheets footprint-only, 41 with inside nesting
+        # (both pinned elsewhere), and a clean validator either way.
+        footprint = nest(ORDER_7_21_26, self.config)
+        self.assertEqual(footprint.total_sheets, 49)
+        self.assert_clear_of_the_edges(footprint, self.config)
+
+        inside_cfg = NestingConfig(inside_nesting=True)
+        inside = nest(ORDER_7_21_26, inside_cfg)
+        self.assertEqual(inside.total_sheets, 41)
+        measured = self.assert_clear_of_the_edges(inside, inside_cfg)
+        self.assertTrue(measured, "this order has WDC frames on it")
+
+    # -- the ways the rule could have been dodged --------------------------
+
+    def test_an_orientation_whose_slot_would_overhang_is_never_chosen(self):
+        # Turned 90 degrees this frame needs 48 + 2 x 0.875 = 49.75 across a
+        # 49" sheet, so the turn is illegal however well it fills a shelf —
+        # and packing it turned is exactly what the reported bug did.
+        cfg = self.config
+        result = nest([PartSpec("WDC2452", 18.0, 48.0, 4)], cfg)
+        self.assert_clear_of_the_edges(result, cfg, frames=4)
+        for layout, _run in result.unique_sheets:
+            for p in layout.placements:
+                self.assertFalse(p.rotated, "turning it hangs the slot off the sheet")
+
+    def test_turning_the_soft_settings_off_does_not_soften_the_hard_rule(self):
+        # The shape of the original mistake: the edge cushion and the front
+        # margin are preferences the packer gives up whenever it needs the
+        # room, so neither could ever stand in for the slot's reach.  With
+        # both at zero the hard rule has to hold on its own.
+        for cfg in (
+            NestingConfig(edge_cushion=0.0),
+            NestingConfig(front_margin=0.0),
+            NestingConfig(edge_cushion=0.0, front_margin=0.0),
+        ):
+            for height in (36.0, 47.9, 48.0, 90.0):
+                with self.subTest(cushion=cfg.edge_cushion, margin=cfg.front_margin,
+                                  height=height):
+                    result = nest([PartSpec("WDC2436", 18.0, height, 3)], cfg)
+                    self.assert_clear_of_the_edges(result, cfg, frames=3)
+
+    def test_a_bigger_gap_moves_the_edge_rule_with_it(self):
+        # ``part_gap`` and the slot reach are independent settings, and the
+        # inset is derived from both.  At a 1.5" gap the gap alone already
+        # exceeds the reach, so a WDC becomes an ordinary part and may ride
+        # the edge like any other.
+        cfg = NestingConfig(part_gap=1.5)
+        result = nest([PartSpec("WDC2436", 18.0, 36.0, 4)], cfg)
+        self.assertEqual(validate_layouts(result, cfg), [])
+        self.assertEqual(stile_end_clearances(result, cfg), [])
+
+        # Just under the reach it is still directional, and still enforced.
+        cfg = NestingConfig(part_gap=0.8)
+        result = nest([PartSpec("WDC2436", 18.0, 36.0, 4)], cfg)
+        self.assert_clear_of_the_edges(result, cfg, frames=4)
+
+    def test_a_sweep_of_wdc_sizes_never_violates_the_edge_rule(self):
+        # One hand-picked size proves nothing here: the violation only
+        # appeared when a reserved rectangle happened to land against an edge,
+        # which depends on the size, the quantity and which orientation won.
+        cfg = self.config
+        widths = (6.0, 12.5, 18.0, 24.3, 30.0, 36.7, 43.1, 48.0)
+        # Straddles the 95.25 ceiling deliberately: the last two heights have
+        # no legal placement at all and must come back as errors, not layouts.
+        heights = (
+            6.0, 12.5, 18.0, 23.15, 30.0, 36.0, 42.5, 47.3, 48.0, 52.0,
+            60.5, 72.0, 84.5, 95.0, 95.25, 95.3, 96.0,
+        )
+        checked = 0
+        refused = 0
+        for width in widths:
+            for height in heights:
+                for qty in (1, 3):
+                    try:
+                        result = nest([PartSpec("WDC2400", width, height, qty)], cfg)
+                    except NestingError:
+                        refused += 1
+                        continue
+                    with self.subTest(width=width, height=height, qty=qty):
+                        self.assert_clear_of_the_edges(result, cfg, frames=qty)
+                    checked += 1
+        self.assertGreater(checked, 150, "the sweep must actually cover ground")
+        self.assertGreater(refused, 0, "sizes past the slot's reach must be refused")
+
+    def test_a_wdc_mixed_with_ordinary_frames_stays_clear_of_the_edges(self):
+        # A WDC alone gets a sheet to itself and plenty of slack; the hard
+        # cases are the ones where partners have already spent the width.
+        cfg = self.config
+        mixes = (
+            [PartSpec("WDC2436", 18.0, 36.0, 7), PartSpec("LS36", 36.0, 30.0, 5)],
+            [PartSpec("WDC2448", 18.0, 47.5, 6), PartSpec("B30", 30.0, 30.0, 9)],
+            [PartSpec("WDC3648", 30.0, 47.5, 4), PartSpec("W3012", 30.0, 12.0, 12)],
+            [PartSpec("WDC2436", 46.0, 46.0, 5), PartSpec("3DB24", 24.0, 30.0, 8)],
+        )
+        for mix in mixes:
+            with self.subTest(mix=[s.part_number for s in mix]):
+                result = nest(mix, cfg)
+                self.assert_clear_of_the_edges(result, cfg)
+
+    def test_the_row_correction_does_not_strand_a_full_width_neighbour(self):
+        # Two of these turned WDCs make a 48.435" row: legal on its own, but
+        # its end stile is then 0.42 from the side edge, so the row has to be
+        # rebuilt.  The rebuild charges the turned WDC for its insets rather
+        # than shrinking the sheet, precisely so the 48.5" frame sharing the
+        # job stays placeable — it would not fit a sheet narrowed to 48.09".
+        cfg = self.config
+        result = nest(
+            [PartSpec("WDC0624", 6.0, 23.15, 3), PartSpec("WIDE", 48.5, 20.0, 2)], cfg
+        )
+        self.assert_clear_of_the_edges(result, cfg, frames=3)
+        placed = {}
+        for layout, run in result.unique_sheets:
+            for p in layout.placements:
+                placed[p.part_number] = placed.get(p.part_number, 0) + run
+        self.assertEqual(placed, {"WDC0624": 3, "WIDE": 2})
+
+    def test_the_correction_keeps_the_packer_deterministic(self):
+        # The fix re-runs shelf selection against a shrunk sheet, so it must
+        # not leak state between runs or depend on demand order.
+        cfg = self.config
+        parts = [
+            PartSpec("WDC2452", 18.0, 47.9, 5),
+            PartSpec("B30", 30.0, 30.0, 4),
+            PartSpec("W3012", 30.0, 12.0, 6),
+        ]
+        first = nest(parts, cfg)
+        again = nest(parts, cfg)
+        reversed_order = nest(list(reversed(parts)), cfg)
+        snapshot = [(l.canonical(), r) for l, r in first.unique_sheets]
+        self.assertEqual(snapshot, [(l.canonical(), r) for l, r in again.unique_sheets])
+        self.assertEqual(
+            snapshot, [(l.canonical(), r) for l, r in reversed_order.unique_sheets]
+        )
+        self.assert_clear_of_the_edges(first, cfg, frames=5)
 
 
 class MinPartGapCrossCheckTests(unittest.TestCase):

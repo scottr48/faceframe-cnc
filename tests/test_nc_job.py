@@ -23,7 +23,17 @@ the whole point, so what is checked instead is
   (h) nothing is ever written for a sheet the verifier rejects;
   (i) the milestone's acceptance run: the whole order, at the shipping
       defaults, written to disk with zero refusals, in production and in
-      dry-run form.
+      dry-run form;
+  (j) 2026-08-04 review -- HOW the files reach the disk: a program is
+      published atomically (a failed write cannot truncate the file that is
+      already there), and a folder regenerated for the same prefix ends up
+      holding this job and nothing else, with every stale file quarantined
+      rather than deleted and every move reported;
+  (k) 2026-08-04 review -- that every sheet contains every cut its layout
+      calls for, production and rehearsal, checked against a manifest built
+      from the layout rather than from the plan the emitter used.  The
+      mutation tests behind that check (delete a pass, delete an opening,
+      delete a slot) live in ``tests/test_verifier_manifest.py``.
 
 Stdlib only.  Run with: python -m unittest discover tests
 """
@@ -58,6 +68,12 @@ from faceframe_cnc.post import (
     verify,
     write_job,
 )
+from faceframe_cnc.post.job import (
+    PARTIAL_SUFFIX,
+    SUPERSEDED_DIR_NAME,
+    job_file_pattern,
+    now_stamp,
+)
 from faceframe_cnc.post.from_layout import (
     WDC_SLOT_END_REACH,
     WdcNotSupportedError,
@@ -68,6 +84,7 @@ from faceframe_cnc.post.from_layout import (
     wdc_slot_lines,
 )
 from faceframe_cnc.post.reconstruct import reconstruct, reconstruct_text
+from faceframe_cnc.post.verifier import expected_work
 from tests.test_nesting import ORDER_7_21_26
 
 CREATED = "01 JAN 27 - 08:00"
@@ -1070,6 +1087,514 @@ class WriteGateTest(unittest.TestCase):
                 )
 
 
+# --------------------------------------------------------------------------
+# (j) 2026-08-04 review: how the files reach the disk
+# --------------------------------------------------------------------------
+
+
+#: Frame sizes for the throwaway one-frame-per-sheet fixtures below.  Real
+#: enough for the geometry engine and the verifier; small enough that a
+#: quarantine test is not a nesting test.
+_FIXTURE_SIZES = {
+    "W2036": (20.0, 36.0),
+    "W2436": (24.0, 36.0),
+    "W3036": (30.0, 36.0),
+}
+
+
+def one_frame_per_sheet(*part_numbers: str) -> tuple[NestingResult, NestingConfig]:
+    """A job of ``len(part_numbers)`` unique sheets, one frame on each.
+
+    The point is the FILE COUNT: these tests are about what is in the output
+    folder after a job that is longer or shorter than the one before it, so
+    the sheets themselves are deliberately trivial and all generate clean.
+    """
+    config = NestingConfig(part_gap=0.455)
+    sheets = []
+    demand = []
+    for name in part_numbers:
+        width, height = _FIXTURE_SIZES[name]
+        sheets.append((SheetLayout([Placement(name, 1.0, 1.0, width, height)]), 1))
+        demand.append(PartSpec(name, width, height, 1))
+    result = NestingResult(
+        unique_sheets=sheets,
+        total_sheets=len(sheets),
+        demand=demand,
+        config=config,
+    )
+    return result, config
+
+
+class _DiesHalfWay:
+    """A file handle that writes half the program and then reports a full disk.
+
+    Stands in for the shop PC losing the disk (or the power) part way through
+    a write — the failure the old ``open(path, "w")`` turned into a truncated
+    production file.
+    """
+
+    def __init__(self, handle):
+        self._handle = handle
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self._handle.close()
+        return False
+
+    def write(self, text):
+        self._handle.write(text[: len(text) // 2])
+        raise OSError(28, "no space left on device")
+
+    def flush(self):
+        self._handle.flush()
+
+    def fileno(self):
+        return self._handle.fileno()
+
+
+class StaleFileQuarantineTest(unittest.TestCase):
+    """The output folder must hold THIS job and nothing that looks like it.
+
+    Three shop-floor stories, all of them ending with the operator cutting a
+    program nobody generated for this order:
+
+    (a) the order shrinks and yesterday's higher-numbered files stay put;
+    (b) a sheet is refused this run and yesterday's file of that name stays,
+        so the ONE sheet the post refused to stand behind is the one still
+        cuttable;
+    (c) a write dies half way (see :class:`AtomicWriteTest`).
+
+    The rule is one line — a file matching this job's names that this run did
+    not write is not part of this job — and the answer is quarantine, never
+    delete: it is somebody's previous job and may be its only copy.
+    """
+
+    STAMP = "20260804-151204"
+
+    def write(self, result, folder, **overrides):
+        options = JobOptions(
+            output_dir=folder,
+            prefix=overrides.pop("prefix", "7201"),
+            created=CREATED,
+            quarantine_stamp=overrides.pop("quarantine_stamp", self.STAMP),
+            **overrides,
+        )
+        return write_job(result, options)
+
+    def read(self, *parts) -> str:
+        with open(os.path.join(*parts), "r", newline="") as handle:
+            return handle.read()
+
+    def test_a_first_run_into_a_clean_folder_quarantines_nothing(self):
+        result, _config = one_frame_per_sheet("W2036", "W2436")
+        with tempfile.TemporaryDirectory() as folder:
+            job = self.write(result, folder)
+            self.assertEqual(job.superseded, [])
+            self.assertEqual(job.quarantine_problems, [])
+            self.assertTrue(job.quarantine_ok)
+            self.assertIsNone(job.quarantine_dir, "no empty folder is left behind")
+            self.assertEqual(
+                sorted(os.listdir(folder)), ["R720101N.anc", "R720102N.anc"]
+            )
+
+    def test_regenerating_a_shorter_job_quarantines_the_leftover_sheets(self):
+        """Failure mode (a): three sheets yesterday, one today."""
+        long_run, _config = one_frame_per_sheet("W2036", "W2436", "W3036")
+        short_run, _config = one_frame_per_sheet("W2036")
+        with tempfile.TemporaryDirectory() as folder:
+            first = self.write(long_run, folder)
+            self.assertEqual(len(first.written), 3)
+            stale_text = {
+                name: self.read(folder, name)
+                for name in ("R720102N.anc", "R720103N.anc")
+            }
+
+            second = self.write(short_run, folder, quarantine_stamp="20260804-160000")
+            self.assertEqual([o.filename for o in second.written], ["R720101N.anc"])
+            self.assertEqual(sorted(os.listdir(folder)), ["R720101N.anc", "superseded"])
+            self.assertEqual(second.quarantine_problems, [])
+            self.assertEqual(
+                second.quarantine_dir,
+                os.path.join(second.output_dir, SUPERSEDED_DIR_NAME, "20260804-160000"),
+            )
+            self.assertEqual(
+                [item.filename for item in second.superseded],
+                ["R720102N.anc", "R720103N.anc"],
+            )
+            for item in second.superseded:
+                with self.subTest(file=item.filename):
+                    self.assertIn("no sheet", item.reason)
+                    self.assertFalse(os.path.exists(item.old_path), "it moved")
+                    self.assertEqual(
+                        self.read(item.new_path),
+                        stale_text[item.filename],
+                        "quarantine copies the bytes, it does not rewrite them",
+                    )
+            # ... and the job says so, in words the UI can show verbatim.
+            self.assertEqual(len(second.superseded_lines()), 2)
+            self.assertIn("R720103N.anc", second.summary())
+            self.assertIn("nothing deleted", second.summary())
+
+    def test_a_refused_sheets_stale_file_is_quarantined_not_left_looking_current(self):
+        """Failure mode (b), and the one that matters most.
+
+        Yesterday's R9901N.anc was fine; today's sheet 1 puts two parts 0.375
+        apart and the verifier refuses it.  ``written`` stays False and the
+        production name must end up EMPTY — a refusal that leaves a cuttable
+        file of that name is worse than no refusal at all.
+        """
+        good, _config = one_frame_per_sheet("W2036")
+        crowded, _config = crowded_sheet()
+        with tempfile.TemporaryDirectory() as folder:
+            self.write(good, folder, prefix="99")
+            before = self.read(folder, "R9901N.anc")
+
+            second = self.write(
+                crowded, folder, prefix="99", quarantine_stamp="20260804-170000"
+            )
+            outcome = second.outcomes[0]
+            self.assertEqual(outcome.filename, "R9901N.anc")
+            self.assertEqual(outcome.refusal_kind, "verifier")
+            self.assertFalse(outcome.written)
+            self.assertIsNone(outcome.path)
+            self.assertFalse(os.path.exists(os.path.join(folder, "R9901N.anc")))
+            self.assertEqual(sorted(os.listdir(folder)), [SUPERSEDED_DIR_NAME])
+
+            self.assertEqual([i.filename for i in second.superseded], ["R9901N.anc"])
+            self.assertIn("refused", second.superseded[0].reason)
+            self.assertEqual(outcome.superseded_path, second.superseded[0].new_path)
+            self.assertEqual(self.read(outcome.superseded_path), before)
+            self.assertIn(outcome.superseded_path, outcome.describe())
+
+    def test_files_that_are_not_this_jobs_are_never_touched(self):
+        """The sweep matches the job's exact naming pattern, not ``R*.anc``.
+
+        Everything below is somebody else's business: another prefix's
+        programs, prefixes whose digit count differs by one either way, this
+        job's own PDF paperwork, a hand backup, a shop note, and index 00,
+        which no job can write because the first sheet index is 1.
+        """
+        result, _config = one_frame_per_sheet("W2036")
+        others = {
+            "R720201N.anc": "another prefix's job",
+            "R72010N.anc": "prefix 720 sheet 10 - one digit short",
+            "R7201001N.anc": "prefix 72010 sheet 01 - one digit long",
+            "R7201_report.pdf": "this job's own paperwork",
+            "R720102N.bak": "somebody's hand backup",
+            "R720100N.anc": "index 00, which no job can have written",
+            "notes.txt": "the shop's own note",
+        }
+        with tempfile.TemporaryDirectory() as folder:
+            for name, text in others.items():
+                with open(os.path.join(folder, name), "w", newline="") as handle:
+                    handle.write(text)
+
+            job = self.write(result, folder)
+            self.assertEqual(job.superseded, [])
+            self.assertEqual(job.quarantine_problems, [])
+            self.assertIsNone(job.quarantine_dir)
+            self.assertNotIn(SUPERSEDED_DIR_NAME, os.listdir(folder))
+            for name, text in others.items():
+                with self.subTest(file=name):
+                    self.assertEqual(self.read(folder, name), text)
+
+    def test_a_partial_left_by_an_interrupted_run_is_quarantined_too(self):
+        """Half a program is not a program, whatever it is called.
+
+        Nothing a completed write leaves behind is called ``.partial``, so one
+        in the folder is an earlier run that died.  Sheet 01's is simply
+        reused — this run writes through that exact name and publishes it —
+        but sheet 05's belongs to no sheet of this job and stays half a
+        program for ever, so out it goes.
+        """
+        result, _config = one_frame_per_sheet("W2036")
+        alive = "R720101N.anc" + PARTIAL_SUFFIX
+        orphan = "R720105N.anc" + PARTIAL_SUFFIX
+        with tempfile.TemporaryDirectory() as folder:
+            for name in (alive, orphan):
+                with open(os.path.join(folder, name), "w", newline="") as handle:
+                    handle.write("%\r\nO0001 (HALF A PROGRAM")
+
+            job = self.write(result, folder)
+            self.assertEqual([i.filename for i in job.superseded], [orphan])
+            self.assertIn("interrupted", job.superseded[0].reason)
+            self.assertTrue(os.path.exists(job.superseded[0].new_path))
+            self.assertEqual(job.quarantine_problems, [])
+            self.assertEqual(
+                sorted(os.listdir(folder)), ["R720101N.anc", SUPERSEDED_DIR_NAME]
+            )
+            self.assertEqual(self.read(folder, "R720101N.anc"), job.outcomes[0].text)
+
+    def test_two_runs_in_the_same_second_get_their_own_folders(self):
+        """The Generate button is right there; two runs can share a second."""
+        long_run, _config = one_frame_per_sheet("W2036", "W2436")
+        short_run, _config = one_frame_per_sheet("W2036")
+        with tempfile.TemporaryDirectory() as folder:
+            self.write(long_run, folder)
+            second = self.write(short_run, folder)
+            self.write(long_run, folder)
+            fourth = self.write(short_run, folder)
+            self.assertEqual(os.path.basename(second.quarantine_dir), self.STAMP)
+            self.assertEqual(
+                os.path.basename(fourth.quarantine_dir), f"{self.STAMP}-2"
+            )
+            self.assertEqual(len(second.superseded), 1)
+            self.assertEqual(len(fourth.superseded), 1)
+            self.assertEqual(
+                sorted(os.listdir(os.path.join(folder, SUPERSEDED_DIR_NAME))),
+                [self.STAMP, f"{self.STAMP}-2"],
+            )
+
+    def test_a_stale_file_that_cannot_be_moved_is_a_loud_problem(self):
+        """Locked by the machine's file browser, read-only, no permission.
+
+        The folder is then NOT safe to hand over, so the failure is reported
+        on the job by name — never swallowed, and never turned into a delete.
+        """
+        from faceframe_cnc.post import job as job_module
+
+        long_run, _config = one_frame_per_sheet("W2036", "W2436")
+        short_run, _config = one_frame_per_sheet("W2036")
+        with tempfile.TemporaryDirectory() as folder:
+            self.write(long_run, folder)
+            real_replace = job_module.os.replace
+
+            def refuse_the_move(src, dst):
+                if SUPERSEDED_DIR_NAME in str(dst):
+                    raise OSError(13, "permission denied")
+                return real_replace(src, dst)
+
+            job_module.os.replace = refuse_the_move
+            try:
+                job = self.write(short_run, folder)
+            finally:
+                job_module.os.replace = real_replace
+
+            self.assertEqual(job.superseded, [])
+            self.assertFalse(job.quarantine_ok)
+            self.assertTrue(
+                any("R720102N.anc" in p for p in job.quarantine_problems),
+                job.quarantine_problems,
+            )
+            self.assertTrue(
+                any("permission denied" in p for p in job.quarantine_problems),
+                job.quarantine_problems,
+            )
+            self.assertIn("STALE FILE STILL", job.summary())
+            self.assertTrue(
+                os.path.exists(os.path.join(folder, "R720102N.anc")),
+                "the report has to be honest: the file really is still there",
+            )
+            self.assertEqual([o.filename for o in job.written], ["R720101N.anc"])
+
+    def test_the_pattern_is_the_exact_inverse_of_sheet_filename(self):
+        pattern = job_file_pattern("7201")
+        for index in (1, 9, 10, 99):
+            with self.subTest(index=index):
+                self.assertTrue(pattern.match(sheet_filename("7201", index)))
+        for other in (
+            "R720201N.anc",
+            "R72010N.anc",
+            "R7201001N.anc",
+            "R7201_report.pdf",
+            "R720101N.anc" + PARTIAL_SUFFIX,
+            "R720101N.bak",
+        ):
+            with self.subTest(other=other):
+                self.assertIsNone(pattern.match(other))
+        self.assertTrue(
+            pattern.match("r720101n.anc"),
+            "the shop PC's filesystem ignores case, so the sweep must too",
+        )
+        self.assertIsNone(
+            job_file_pattern("720").match("R720101N.anc"),
+            "len(prefix) + 2 digits is what keeps prefixes apart",
+        )
+
+    def test_the_quarantine_stamp_sorts_and_carries_no_path_characters(self):
+        import time
+
+        stamp = now_stamp(time.struct_time((2026, 8, 4, 15, 12, 4, 1, 216, -1)))
+        self.assertEqual(stamp, "20260804-151204")
+        self.assertRegex(now_stamp(), r"^\d{8}-\d{6}$")
+        self.assertLess("20260804-151204", "20260804-151205")
+
+    def test_a_stamp_that_would_escape_the_output_folder_is_refused(self):
+        result, _config = one_frame_per_sheet("W2036")
+        for bad in ("..", "../..", "a/b", "a\\b", "c:x", ""):
+            with self.subTest(stamp=bad):
+                with self.assertRaises(JobError):
+                    job_for(result, quarantine_stamp=bad)
+
+
+class AtomicWriteTest(unittest.TestCase):
+    """Failure mode (c): a production file name holding half a program.
+
+    ``open(path, "w")`` truncates before the first byte goes in, so a full
+    disk, a crash or the shop PC being switched off used to leave a file that
+    starts with a valid header and simply stops.  Every gate in this package
+    is upstream of the write, so nothing would ever catch it.
+
+    Now the text goes to ``<name>.partial`` and is renamed on afterwards, so
+    the final name only ever holds the previous program or the whole new one.
+    A failure means the sheet is reported (``refusal_kind == "write"``) and
+    what was there before is intact — and then quarantined, because a file
+    this run did not write must not sit in the folder looking current.
+    """
+
+    def options(self, folder, **overrides):
+        return JobOptions(
+            output_dir=folder,
+            prefix="7201",
+            created=CREATED,
+            quarantine_stamp=overrides.pop("quarantine_stamp", "20260804-151204"),
+            **overrides,
+        )
+
+    def read(self, *parts) -> str:
+        with open(os.path.join(*parts), "r", newline="") as handle:
+            return handle.read()
+
+    def test_the_bytes_on_disk_are_exactly_what_the_verifier_saw(self):
+        """The publish-through-a-rename may not change CONTENT at all: the
+        whole post is proved byte for byte."""
+        result, _config = one_frame_per_sheet("W2036", "W2436")
+        with tempfile.TemporaryDirectory() as folder:
+            job = write_job(result, self.options(folder))
+            for outcome in job.outcomes:
+                with self.subTest(sheet=outcome.filename):
+                    with open(outcome.path, "rb") as handle:
+                        raw = handle.read()
+                    self.assertEqual(raw, outcome.text.encode("ascii"))
+                    self.assertEqual(
+                        raw.count(b"\n"), raw.count(b"\r\n"), "no bare LF may creep in"
+                    )
+                    self.assertTrue(raw.startswith(b"%\r\n"))
+                    self.assertTrue(raw.endswith(b"M30\r\n%\r\n"))
+
+            # Rerunning the same job replaces its own files and finds nothing
+            # stale: same names, same bytes, no quarantine folder.
+            again = write_job(result, self.options(folder))
+            self.assertEqual(again.superseded, [])
+            self.assertEqual(again.quarantine_problems, [])
+            self.assertEqual(
+                sorted(os.listdir(folder)), ["R720101N.anc", "R720102N.anc"]
+            )
+            for outcome in again.outcomes:
+                self.assertEqual(self.read(outcome.path), outcome.text)
+
+    def test_no_partial_file_survives_a_successful_job(self):
+        result, _config = one_frame_per_sheet("W2036", "W2436")
+        with tempfile.TemporaryDirectory() as folder:
+            write_job(result, self.options(folder))
+            self.assertEqual(
+                [n for n in os.listdir(folder) if n.endswith(PARTIAL_SUFFIX)], []
+            )
+
+    def test_a_failed_publish_leaves_the_earlier_file_whole_and_reports_it(self):
+        """``os.replace`` itself fails: nothing ever reaches the final name."""
+        from faceframe_cnc.post import job as job_module
+
+        result, _config = one_frame_per_sheet("W2036")
+        with tempfile.TemporaryDirectory() as folder:
+            write_job(result, self.options(folder))
+            before = self.read(folder, "R720101N.anc")
+            real_replace = job_module.os.replace
+
+            def die_on_publish(src, dst):
+                if str(src).endswith(PARTIAL_SUFFIX):
+                    raise OSError(28, "no space left on device")
+                return real_replace(src, dst)
+
+            job_module.os.replace = die_on_publish
+            try:
+                job = write_job(
+                    result, self.options(folder, quarantine_stamp="20260804-160000")
+                )
+            finally:
+                job_module.os.replace = real_replace
+
+            outcome = job.outcomes[0]
+            self.assertFalse(outcome.written)
+            self.assertEqual(outcome.refusal_kind, "write")
+            self.assertTrue(
+                any("could not write" in p for p in outcome.problems), outcome.problems
+            )
+            # The pre-existing program was never opened, let alone truncated:
+            # its bytes come back whole out of the quarantine folder, and the
+            # production name is empty rather than stale.
+            self.assertEqual([i.filename for i in job.superseded], ["R720101N.anc"])
+            self.assertEqual(self.read(job.superseded[0].new_path), before)
+            self.assertEqual(sorted(os.listdir(folder)), [SUPERSEDED_DIR_NAME])
+
+    def test_a_write_that_dies_mid_program_never_touches_the_final_name(self):
+        """The disk fills up half way through the text."""
+        from faceframe_cnc.post import job as job_module
+
+        result, _config = one_frame_per_sheet("W2036")
+        with tempfile.TemporaryDirectory() as folder:
+            write_job(result, self.options(folder))
+            before = self.read(folder, "R720101N.anc")
+            real_open = open
+
+            def half_write(path, *args, **kwargs):
+                handle = real_open(path, *args, **kwargs)
+                if str(path).endswith(PARTIAL_SUFFIX):
+                    return _DiesHalfWay(handle)
+                return handle
+
+            job_module.open = half_write
+            try:
+                job = write_job(
+                    result, self.options(folder, quarantine_stamp="20260804-160000")
+                )
+            finally:
+                del job_module.open
+
+            outcome = job.outcomes[0]
+            self.assertEqual(outcome.refusal_kind, "write")
+            self.assertFalse(outcome.written)
+            self.assertEqual(
+                [n for n in os.listdir(folder) if n.endswith(PARTIAL_SUFFIX)],
+                [],
+                "the half-written file is cleaned up, not published",
+            )
+            self.assertEqual([i.filename for i in job.superseded], ["R720101N.anc"])
+            self.assertEqual(
+                self.read(job.superseded[0].new_path),
+                before,
+                "the whole earlier program, not the half this run managed",
+            )
+            self.assertEqual(sorted(os.listdir(folder)), [SUPERSEDED_DIR_NAME])
+
+    def test_a_failed_write_into_a_clean_folder_leaves_no_debris(self):
+        from faceframe_cnc.post import job as job_module
+
+        result, _config = one_frame_per_sheet("W2036")
+        with tempfile.TemporaryDirectory() as folder:
+            real_open = open
+
+            def half_write(path, *args, **kwargs):
+                handle = real_open(path, *args, **kwargs)
+                if str(path).endswith(PARTIAL_SUFFIX):
+                    return _DiesHalfWay(handle)
+                return handle
+
+            job_module.open = half_write
+            try:
+                job = write_job(result, self.options(folder))
+            finally:
+                del job_module.open
+
+            self.assertEqual(os.listdir(folder), [])
+            self.assertEqual(job.superseded, [])
+            self.assertEqual(job.quarantine_problems, [])
+            self.assertEqual(job.written, [])
+            self.assertEqual(job.refused[0].refusal_kind, "write")
+
+
 class DeterminismTest(unittest.TestCase):
     def test_the_same_input_gives_byte_identical_files(self):
         result, _config = nested_order(0.455)
@@ -1317,6 +1842,45 @@ class MilestoneAcceptanceTest(unittest.TestCase):
                     self.assertGreaterEqual(low, WDC_SLOT_END_REACH - 1e-9)
                     self.assertLessEqual(high, limit - WDC_SLOT_END_REACH + 1e-9)
         self.assertTrue(seen, "the order has WDC frames to check")
+
+    def test_every_sheet_contains_every_cut_its_layout_calls_for(self):
+        """The other half of "can I take this folder to the machine?"
+        (2026-08-04 review).
+
+        ``build_job`` now hands the verifier an expected-work manifest, so
+        the run above already refuses a sheet with a cut missing.  This test
+        states the same thing from outside the job writer — manifest built
+        straight off the layout, verifier fed both — so that the acceptance
+        run cannot pass by the manifest quietly coming back empty.
+        """
+        job = job_for(self.result)
+        post = self.post()
+        self.assertEqual(len(job.outcomes), len(self.result.unique_sheets))
+        owed = 0
+        for outcome, (layout, _run) in zip(job.outcomes, self.result.unique_sheets):
+            expected = expected_work(layout, post)
+            owed += len(expected)
+            with self.subTest(sheet=outcome.filename):
+                self.assertTrue(len(expected) > 0)
+                self.assertEqual(
+                    [str(v) for v in verify(outcome.text, post, expected)], []
+                )
+        self.assertGreater(owed, 0, "the manifests must actually describe work")
+
+    def test_the_dry_run_of_the_whole_order_owes_the_same_work_lifted(self):
+        job = job_for(self.result, dry_run=True)
+        air = dry_run_config(self.post())
+        for outcome, (layout, _run) in zip(job.outcomes, self.result.unique_sheets):
+            with self.subTest(sheet=outcome.filename):
+                self.assertEqual(
+                    [str(v) for v in verify(outcome.text, air, expected_work(layout, air))],
+                    [],
+                )
+                self.assertEqual(
+                    expected_work(layout, air).counts(),
+                    expected_work(layout, self.post()).counts(),
+                    "a rehearsal owes exactly the cuts the real program does",
+                )
 
     def test_the_frame_geometry_and_the_post_table_agree_on_the_reach(self):
         """``geometry`` tells the optimizer how much room to leave and

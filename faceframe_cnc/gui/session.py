@@ -975,7 +975,17 @@ class Session:
         return [row for row in self.rows if row.included and row.status is RowStatus.READY]
 
     def set_included(self, key: str, included: bool) -> None:
-        """Tick a line in or out of the cut list (spec 5, order panel)."""
+        """Tick a line in or out of the cut list (spec 5, order panel).
+
+        A layout already on screen was optimized against whatever set of
+        lines was ticked at the time; ticking a line in or out changes
+        :meth:`demand` out from under that layout, so an actual change here
+        invalidates the current result exactly the way :meth:`edit_row`
+        does (``result = None``, problems cleared) -- the same governing
+        rule as edit_row's: a layout built from the pre-change lines must
+        never be reachable from Generate.  A no-op call (the box already
+        matched) leaves an existing result alone.
+        """
         row = self.row(key)
         if included and not row.can_include:
             raise SessionError(
@@ -985,14 +995,27 @@ class Session:
         if row.included != included:
             row.included = included
             self.dirty = True
+            self.result = None
+            self._problems = []
 
     def set_all_included(self, included: bool) -> None:
+        """Tick every includable line in or out at once (the "Cut all" /
+        "Cut none" buttons).  Same invalidation rule as :meth:`set_included`
+        -- applied once for the whole batch, not per row, so a call that
+        changes nothing (everything already at the target state) leaves an
+        existing result alone.
+        """
+        changed = False
         for row in self.rows:
             if included and not row.can_include:
                 continue
             if row.included != included:
                 row.included = included
                 self.dirty = True
+                changed = True
+        if changed:
+            self.result = None
+            self._problems = []
 
     def resolve_row(
         self,
@@ -1007,6 +1030,11 @@ class Session:
         Only the missing dimensions are taken; a value the sheet already
         had is never overwritten here.  Raises :class:`SessionError` when
         the row is still incomplete or the value is not a usable size.
+        On success the row moves onto the cut list (a demand that did not
+        exist before), so the current layout is invalidated the same way
+        :meth:`edit_row` invalidates it -- ``result = None``, problems
+        cleared -- the same governing rule: a layout built before this row
+        was resolved must never be reachable from Generate.
         """
         row = self.row(key)
         if not row.missing:
@@ -1056,6 +1084,8 @@ class Session:
 
         row.included = bool(include)
         self.dirty = True
+        self.result = None
+        self._problems = []
         return row
 
     def edit_row(

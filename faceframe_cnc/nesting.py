@@ -368,14 +368,20 @@ def _pack_dims(spec: "PartSpec", config: "NestingConfig") -> tuple[float, float]
     """The rectangle the PACKER reserves for a part, as ordered.
 
     For everything but a WDC this is the footprint itself.  A WDC's is its
-    footprint grown by the slot's full reach at both ends of its height
-    axis, and the real part is then centred in that rectangle
-    (``_build_sheet``).  Reserving the whole reach — rather than only the
-    part of it the ordinary ``part_gap`` does not already cover — is what
-    makes the SHEET EDGE safe as well as the neighbours: the padded
-    rectangle is what has to fit on the sheet, so a WDC stile end is never
-    closer than 0.875 to the edge, and never closer than 0.875 + part_gap
-    to another part.  It costs one sheet in 41 on the 7-21-26 order.
+    footprint grown at both ends of its height axis by the part of the
+    slot's reach that the ordinary ``part_gap`` does NOT already cover —
+    ``slot_end_clearance - part_gap``, 0.420 at the shipping numbers.  The
+    real part is then centred in that rectangle (``_build_sheet``).
+
+    Reserving only the top-up is deliberate and is what keeps two adjacent
+    WDCs from wasting material: the packer already leaves ``part_gap``
+    between two reserved rectangles, so 0.420 + 0.455 is exactly the 0.875
+    the stile end needs.  It also means this rectangle alone says NOTHING
+    about the sheet edge, where there is no neighbour and so no ``part_gap``
+    to top it up — that is :func:`_edge_inset`'s job, and getting it wrong
+    was the bug the 2026-08-04 review found: the packer would seat a WDC
+    reserved rectangle against the sheet edge, leaving the stile end 0.420
+    from it, and ``validate_layouts`` then rejected the whole layout.
     """
     pad = slot_end_clearance(spec.part_number, config) - config.part_gap
     if pad <= 0.0:
@@ -386,6 +392,37 @@ def _pack_dims(spec: "PartSpec", config: "NestingConfig") -> tuple[float, float]
 def _pack_pad(part_number: str, config: "NestingConfig") -> float:
     """How much :func:`_pack_dims` added at EACH end of the height axis."""
     return max(0.0, slot_end_clearance(part_number, config) - config.part_gap)
+
+
+def _edge_inset(part_number: str, config: "NestingConfig") -> float:
+    """How far a part's RESERVED rectangle must stay off the SHEET EDGES.
+
+    Zero for everything the shop cuts except a WDC, and even then only at
+    the two ends of the axis its stiles run along — the same directional
+    story as :func:`slot_end_clearance`, seen from the sheet edge instead
+    of from a neighbour.
+
+    The number is forced, not chosen: ``validate_layouts`` enforces (hard)
+    that a WDC stile END sits at least ``slot_end_clearance`` from the
+    sheet edge along the slot axis, the reserved rectangle stands
+    :func:`_pack_pad` outside that stile end, so the rectangle itself must
+    keep ``slot_end_clearance - _pack_pad`` — i.e. exactly ``part_gap`` —
+    off the edge.  Written as the difference so the invariant is visible:
+    whatever the two settings are, rectangle inset + reserved pad always
+    equals what the validator demands.
+
+    2026-08-04 review.  Before it the packer relied on ``_pack_dims``
+    alone, which is a valid argument between two parts (``part_gap`` tops
+    the pad up) and no argument at all against a sheet edge, where the only
+    thing standing between a stile end and thin air was the SOFT
+    ``edge_cushion`` — compressible to zero by design.  The packer could
+    therefore emit a layout its own validator refused, and the user got an
+    optimized job that could never reach Generate.
+    """
+    pad = _pack_pad(part_number, config)
+    if pad <= 0.0:
+        return 0.0
+    return max(0.0, slot_end_clearance(part_number, config) - pad)
 
 
 def _fmt(value: float) -> str:
@@ -662,16 +699,25 @@ def _normalize_demand(parts, config: NestingConfig) -> list[PartSpec]:
     for spec in demand:
         # A WDC has to fit with the room its slot cuts, not just with its
         # footprint, or the packer would place a part the post must refuse.
+        # Between the SHEET EDGES that room is the full reach at both ends
+        # (nothing tops up an edge — see ``_edge_inset``), so the rectangle
+        # tested here is the footprint plus 2 x slot_end_clearance along the
+        # slot axis.  A WDC taller than 97 - 1.75 = 95.25 therefore cannot be
+        # made at all, and saying so here is the only honest answer: the
+        # alternative is a layout the validator will refuse (2026-08-04).
         pw, ph = _pack_dims(spec, config)
-        upright = pw <= sw + EPS and ph <= sh + EPS
-        turned = ph <= sw + EPS and pw <= sh + EPS
+        inset = _edge_inset(spec.part_number, config)
+        ew, eh = pw, ph + 2.0 * inset
+        upright = ew <= sw + EPS and eh <= sh + EPS
+        turned = eh <= sw + EPS and ew <= sh + EPS
         if not (upright or turned):
             reserved = (
                 ""
-                if (pw, ph) == (spec.width, spec.height)
+                if (ew, eh) == (spec.width, spec.height)
                 else (
-                    f" (its T17 stile slot reserves {pw:g}x{ph:g} — see "
-                    f"NestingConfig.part_gap)"
+                    f" (its T17 stile slot needs {ew:g}x{eh:g} clear of the "
+                    f"sheet edges — see NestingConfig.part_gap and "
+                    f"nesting.slot_end_clearance)"
                 )
             )
             raise NestingError(
@@ -695,7 +741,9 @@ def _pick_scale(values) -> int:
     return _SCALE_CANDIDATES[-1]
 
 
-def _solo_cost(width: float, height: float, config: NestingConfig) -> float:
+def _solo_cost(
+    width: float, height: float, config: NestingConfig, edge_inset: float = 0.0
+) -> float:
     """Inches of sheet length one part eats when nested only with its clones.
 
     Closed form: in the better of the two orientations, a shelf holds
@@ -707,13 +755,24 @@ def _solo_cost(width: float, height: float, config: NestingConfig) -> float:
     length that row saves versus packing its parts separately — the quantity
     the optimizer is really trying to maximise, since total sheet length
     divided by 97" is the sheet count.
+
+    ``width``/``height`` are the RESERVED rectangle (``_pack_dims``), and
+    ``edge_inset`` is the distance that rectangle has to keep off the sheet
+    edges at the two ends of its slot axis (:func:`_edge_inset`, nonzero for
+    a WDC only).  Since the slot axis lies along the sheet's x exactly when
+    the part is turned 90°, the inset narrows the row for the turned
+    orientation and can rule an orientation out altogether — which is the
+    honest cost model, because the packer will not use one either.
     """
     gap = config.part_gap
     best = None
-    for w, h in ((width, height), (height, width)):
-        if w > config.sheet_width + EPS or h > config.sheet_height + EPS:
+    # (placed w, placed h, does the slot axis lie along the sheet's x?)
+    for w, h, along_x in ((width, height, False), (height, width, True)):
+        avail_w = config.sheet_width - (2.0 * edge_inset if along_x else 0.0)
+        avail_h = config.sheet_height - (0.0 if along_x else 2.0 * edge_inset)
+        if w > avail_w + EPS or h > avail_h + EPS:
             continue
-        per_row = int((config.sheet_width + gap + EPS) // (w + gap))
+        per_row = int((avail_w + gap + EPS) // (w + gap))
         if per_row < 1:
             continue
         cost = (h + gap) / per_row
@@ -738,6 +797,30 @@ class _Context:
         self.pack_dims = {s.part_number: _pack_dims(s, config) for s in demand}
         self.pack_pad = {
             s.part_number: _pack_pad(s.part_number, config) for s in demand
+        }
+        #: How far each part's reserved rectangle must stay off the sheet
+        #: edges at the two ends of its slot axis — zero for everything but a
+        #: WDC (:func:`_edge_inset`, 2026-08-04).  Consulted twice below: to
+        #: rule out an orientation that can never satisfy it
+        #: (``_legal_orientations``), and to seat rows and shelf stacks off
+        #: the edge in ``_build_sheet``.
+        self.edge_inset = {
+            s.part_number: _edge_inset(s.part_number, config) for s in demand
+        }
+        #: True when ANY part on this job demands an edge inset, i.e. when the
+        #: rule can bite at all.  Every WDC-specific branch below is skipped
+        #: outright otherwise, so a job with no WDC on it packs down exactly
+        #: the code path it always did.
+        self.has_edge_insets = any(v > 0.0 for v in self.edge_inset.values())
+
+        #: Which of the two orientations a part may be placed in at all:
+        #: ``rotated`` flags, upright first.  An orientation is out when the
+        #: reserved rectangle plus its edge insets cannot fit between the
+        #: sheet edges — a WDC2452 (18 x 52) turned 90° would need
+        #: 18 x 53.75 across a 49" sheet, so it is upright-only, and the
+        #: packer must know that before it starts filling shelves.
+        self.orientations = {
+            s.part_number: self._legal_orientations(s.part_number) for s in demand
         }
 
         dims = []
@@ -766,7 +849,11 @@ class _Context:
         self.dp_ops = 0
 
         self.solo_cost = {
-            s.part_number: _solo_cost(*self.pack_dims[s.part_number], config)
+            s.part_number: _solo_cost(
+                *self.pack_dims[s.part_number],
+                config,
+                self.edge_inset[s.part_number],
+            )
             for s in demand
         }
         self.solo_units = {
@@ -788,22 +875,66 @@ class _Context:
             ),
         )
 
+    def _legal_orientations(self, part_number: str) -> tuple[bool, ...]:
+        """``rotated`` flags this part may actually be placed with.
+
+        Only an edge inset can rule one out, so this is ``(False, True)`` for
+        every ordinary part; ``_normalize_demand`` has already refused
+        anything with no legal orientation at all, so the result is never
+        empty.
+        """
+        cfg = self.config
+        pw, ph = self.pack_dims[part_number]
+        inset = self.edge_inset[part_number]
+        legal = []
+        # Upright: the slot axis (the ordered height) runs up the sheet.
+        if pw <= cfg.sheet_width + EPS and ph + 2.0 * inset <= cfg.sheet_height + EPS:
+            legal.append(False)
+        # Turned 90°: the slot axis runs across the sheet width instead.
+        if ph + 2.0 * inset <= cfg.sheet_width + EPS and pw <= cfg.sheet_height + EPS:
+            legal.append(True)
+        return tuple(legal)
+
+    def charged_width(
+        self, part_number: str, placed_width: float, rotated: bool, inflate: bool
+    ) -> float:
+        """Row width to CHARGE a part, which may exceed the width it occupies.
+
+        Normally the reserved rectangle itself.  Under ``inflate`` a part whose
+        slot axis runs across the sheet — a turned WDC — is charged its two
+        edge insets as well, which is how ``_best_shelf`` returns a row with
+        guaranteed side room without shrinking the sheet for everyone else.
+        The inflation is only ever a charge: the emitted placement still
+        occupies ``placed_width``, so the surplus lands in the row's slack
+        where :func:`_seat` can spend it on the edge the part actually needs.
+        """
+        if not inflate or wdc_slot_axis_is_height(rotated):
+            return placed_width
+        return placed_width + 2.0 * self.edge_inset[part_number]
+
     def width_units(self, placed_width: float) -> int:
         return math.ceil(placed_width * self.scale - 1e-9) + self.gap_units
 
 
-def _orient_for_shelf(width: float, height: float, shelf_h: float):
+def _orient_for_shelf(
+    width: float, height: float, shelf_h: float, legal: tuple[bool, ...] = (False, True)
+):
     """Best orientation for a shelf of height ``shelf_h``.
 
     Returns ``(placed_width, placed_height, rotated)`` for the orientation
     whose placed height is the largest value <= ``shelf_h``, or ``None`` when
     neither orientation fits.  That orientation is also the narrower one, so
     it dominates on both height fill and width consumption.
+
+    ``legal`` restricts the choice to the orientations the part may be placed
+    in at all (:meth:`_Context._legal_orientations`) — a WDC whose slot reach
+    would hang off the sheet if it were turned must not be offered the turn,
+    or the packer builds a row the validator refuses.
     """
     best = None
-    if height <= shelf_h + EPS:
+    if False in legal and height <= shelf_h + EPS:
         best = (width, height, False)
-    if width <= shelf_h + EPS and (best is None or width > best[1] + EPS):
+    if True in legal and width <= shelf_h + EPS and (best is None or width > best[1] + EPS):
         best = (height, width, True)
     return best
 
@@ -851,13 +982,27 @@ def _bounded_knapsack(entries, capacity: int):
     return chosen
 
 
-def _best_shelf(ctx: _Context, avail: dict[str, int], shelf_h: float, seed: str | None = None):
+def _best_shelf(
+    ctx: _Context,
+    avail: dict[str, int],
+    shelf_h: float,
+    seed: str | None = None,
+    inflate_edges: bool = False,
+):
     """Best row of parts for a shelf of height ``shelf_h``.
 
     When ``seed`` is given, one part of that type is forced into the row (and
     the row is rejected if that type cannot be placed at this shelf height).
     Seeding is how the pattern loop explores sheets built around each part
     family instead of only the locally densest one.
+
+    ``inflate_edges`` charges every part whose slot axis would run ACROSS the
+    sheet — a turned WDC — the width of its two edge insets on top of its own
+    (:meth:`_Context.charged_width`), so whatever row comes back is guaranteed
+    to have the side room its ends need.  ``_build_sheet`` turns it on only
+    when the free-for-all row pinned a stile end against a side edge
+    (2026-08-04); charging per part rather than shrinking the sheet is what
+    keeps a plain 48"-wide frame placeable while the correction is in force.
 
     Returns ``(actual_height, row_width, area, items, saving)`` where
     ``items`` is a deterministic left-to-right list of
@@ -873,11 +1018,13 @@ def _best_shelf(ctx: _Context, avail: dict[str, int], shelf_h: float, seed: str 
     if seed is not None:
         if avail.get(seed, 0) <= 0:
             return None
-        oriented = _orient_for_shelf(*ctx.pack_dims[seed], shelf_h)
+        oriented = _orient_for_shelf(
+            *ctx.pack_dims[seed], shelf_h, ctx.orientations[seed]
+        )
         if oriented is None:
             return None
         pw, ph, rotated = oriented
-        wu = ctx.width_units(pw)
+        wu = ctx.width_units(ctx.charged_width(seed, pw, rotated, inflate_edges))
         if wu > capacity:
             return None
         forced = (seed, pw, ph, rotated, wu)
@@ -891,11 +1038,11 @@ def _best_shelf(ctx: _Context, avail: dict[str, int], shelf_h: float, seed: str 
             n -= 1
         if n <= 0:
             continue
-        oriented = _orient_for_shelf(*ctx.pack_dims[pn], shelf_h)
+        oriented = _orient_for_shelf(*ctx.pack_dims[pn], shelf_h, ctx.orientations[pn])
         if oriented is None:
             continue
         pw, ph, rotated = oriented
-        wu = ctx.width_units(pw)
+        wu = ctx.width_units(ctx.charged_width(pn, pw, rotated, inflate_edges))
         if wu <= 0 or wu > capacity:
             continue
         # No row can hold more than capacity // wu of anything; capping here
@@ -959,6 +1106,174 @@ def _cushion_score(layout: SheetLayout, cfg: NestingConfig) -> int:
     return good
 
 
+def _row_edge_needs(ctx: _Context, items) -> tuple[float, float]:
+    """``(left, right)`` inset this row owes the sheet's two SIDE edges.
+
+    Only the row's two END items can touch a side edge — every other item has
+    at least a neighbour and a ``part_gap`` between it and the edge — so only
+    they are asked, and only when their slot axis runs across the sheet, i.e.
+    when they are turned 90° (:func:`wdc_slot_axis_is_height`).  Both are zero
+    for any row without a turned WDC at an end, which is the overwhelming
+    majority and why the layouts of such sheets are untouched by this rule.
+    """
+    if not items or not ctx.has_edge_insets:
+        return 0.0, 0.0
+    needs = []
+    for pn, _pw, _ph, rotated in (items[0], items[-1]):
+        needs.append(0.0 if wdc_slot_axis_is_height(rotated) else ctx.edge_inset[pn])
+    return needs[0], needs[1]
+
+
+def _stack_edge_needs(ctx: _Context, shelves) -> tuple[float, float]:
+    """``(bottom, top)`` inset the shelf stack owes the sheet's END edges.
+
+    Items sit bottom-aligned in their shelf, so only the BOTTOM shelf's items
+    reach the bottom of the stack — and only the TOP shelf's can reach its
+    top, discounted by whatever headroom a shorter reserved rectangle already
+    leaves inside a taller shelf.  Both are zero unless an upright WDC is in
+    the shelf concerned.
+    """
+    if not shelves or not ctx.has_edge_insets:
+        return 0.0, 0.0
+    _bottom_h, _bw, bottom_items = shelves[0]
+    bottom = max(
+        (
+            ctx.edge_inset[pn]
+            for pn, _pw, _ph, rotated in bottom_items
+            if wdc_slot_axis_is_height(rotated)
+        ),
+        default=0.0,
+    )
+    top_h, _tw, top_items = shelves[-1]
+    top = max(
+        (
+            max(0.0, ctx.edge_inset[pn] - (top_h - ph))
+            for pn, _pw, ph, rotated in top_items
+            if wdc_slot_axis_is_height(rotated)
+        ),
+        default=0.0,
+    )
+    return bottom, top
+
+
+def _any_row_pinned(ctx: _Context, shelves) -> bool:
+    """Does any row lack the side room its end items owe the sheet edges?
+
+    The vertical rule has no counterpart here because :func:`_select_shelves`
+    charges the stack for its front and back insets as it goes and so cannot
+    produce a pinned stack.  A row is different: the knapsack decides its
+    contents, and which items land at the ends is only known afterwards — so
+    the answer is checked, and a pinned row costs a whole second selection
+    rather than a nudge, because the row that is too wide may be the one the
+    rest of the sheet was built around.
+    """
+    for _shelf_h, row_width, items in shelves:
+        need_left, need_right = _row_edge_needs(ctx, items)
+        if need_left + need_right > ctx.config.sheet_width - row_width + EPS:
+            return True
+    return False
+
+
+def _seat(preferred: float, slack: float, need_low: float, need_high: float) -> float:
+    """Where to start a row or stack: the soft preference, edge rule obeyed.
+
+    ``preferred`` is what the soft cushion or front margin would like,
+    ``slack`` is the total spare room on that axis, and the two ``need_*``
+    are the HARD insets the two ends owe the sheet edges.  Returns the
+    preference pulled into the legal window ``[need_low, slack - need_high]``,
+    with the low end winning a collision so the answer is never below zero.
+    With nothing to honour it returns ``preferred`` untouched, which is why
+    every sheet that has no WDC against an edge is laid out exactly as it was
+    before 2026-08-04.
+    """
+    return min(max(preferred, need_low), max(need_low, slack - need_high))
+
+
+def _select_shelves(
+    ctx: _Context,
+    remaining: dict[str, int],
+    seed: str | None,
+    shelf_saving: bool,
+    inflate_edges: bool = False,
+):
+    """Greedily stack shelves up the sheet; the loop of one sheet.
+
+    Returns ``(shelves, used_height)`` where a shelf is
+    ``(actual_height, row_width, items)``.
+
+    The stack pays the FRONT and BACK edge insets as it goes rather than
+    afterwards (2026-08-04), which makes the vertical half of the edge rule
+    exact and constructive: only the first shelf can reach the front of the
+    stack, so its inset is reserved the moment that shelf is committed, and
+    only the last shelf can reach the back, so every candidate is asked to fit
+    with the inset it would owe IF it turned out to be last.  Nothing is lost
+    by charging that early — a shelf stacked on top of it needs strictly more
+    room than the inset it releases — and nothing is wasted, because the
+    charge is exactly what :func:`_stack_edge_needs` will ask for at placement
+    time.  Compare ``inflate_edges``, which is the row (side-edge) half and
+    cannot be exact for the same reason a knapsack is not a queue.
+    """
+    cfg = ctx.config
+    avail = {pn: n for pn, n in sorted(remaining.items()) if n > 0}
+    shelves = []  # (actual_height, row_width, items)
+    used_height = 0.0
+    front_reserve = 0.0
+
+    while True:
+        lead_gap = cfg.part_gap if shelves else 0.0
+        space = cfg.sheet_height - front_reserve - used_height - lead_gap
+        if space <= EPS:
+            break
+
+        shelf_seed = seed if avail.get(seed or "", 0) > 0 else None
+        best = None
+        best_key = None
+        best_front = 0.0
+        for shelf_h in ctx.height_candidates:
+            if shelf_h > space + EPS:
+                continue
+            found = _best_shelf(ctx, avail, shelf_h, shelf_seed, inflate_edges)
+            if found is None:
+                continue
+            actual_h, row_width, area, items, saving = found
+            if actual_h > space + EPS or row_width > cfg.sheet_width + EPS:
+                continue
+            own_front = 0.0
+            if ctx.has_edge_insets:
+                # What this shelf would owe the sheet's two END edges: the
+                # front only if it is the first, the back on the assumption
+                # that it is last.
+                front, back = _stack_edge_needs(ctx, [(actual_h, row_width, items)])
+                own_front = 0.0 if shelves else front
+                if own_front + actual_h + back > space + EPS:
+                    continue
+            density = area / (cfg.sheet_width * actual_h)
+            cushioned = 1 if row_width <= cfg.sheet_width - 2 * cfg.edge_cushion + EPS else 0
+            key = (
+                round(density, 9),
+                round(saving / (actual_h + cfg.part_gap), 6) if shelf_saving else 0,
+                round(area, 6),
+                cushioned,
+                round(actual_h, 6),
+            )
+            if best_key is None or key > best_key:
+                best_key = key
+                best = found
+                best_front = own_front
+        if best is None:
+            break
+
+        actual_h, row_width, _area, items, _saving = best
+        for pn, _pw, _ph, _rot in items:
+            avail[pn] -= 1
+        if not shelves:
+            front_reserve = best_front
+        shelves.append((actual_h, row_width, items))
+        used_height += lead_gap + actual_h
+
+    return shelves, used_height
+
+
 def _build_sheet(
     ctx: _Context,
     remaining: dict[str, int],
@@ -976,50 +1291,27 @@ def _build_sheet(
 
     ``seed``, when given, forces that part type into every shelf it can
     occupy, so the caller can generate one candidate sheet per part family.
+
+    The sheet EDGE rule (2026-08-04) is enforced in two halves.  The front and
+    back edges are handled inside :func:`_select_shelves`, exactly.  The two
+    SIDE edges cannot be: which items land at a row's ends is a knapsack's
+    verdict, not a decision, so the free-for-all row is checked afterwards
+    (:func:`_any_row_pinned`) and, if any row put a stile end where the slot
+    would cut off the side of the sheet, the whole selection is redone with
+    every turned WDC charged its two insets on top of its width
+    (:meth:`_Context.charged_width`).  That second pass cannot come back
+    pinned — a charged row leaves at least the room its ends need — so one
+    retry settles it, and charging the guilty part rather than shrinking the
+    sheet keeps every other part exactly as placeable as it was.  On a job
+    with no WDC on it nothing here fires and the layouts are identical to
+    before.
     """
     cfg = ctx.config
-    avail = {pn: n for pn, n in sorted(remaining.items()) if n > 0}
-    shelves = []  # (actual_height, items)
-    used_height = 0.0
-
-    while True:
-        lead_gap = cfg.part_gap if shelves else 0.0
-        space = cfg.sheet_height - used_height - lead_gap
-        if space <= EPS:
-            break
-
-        shelf_seed = seed if avail.get(seed or "", 0) > 0 else None
-        best = None
-        best_key = None
-        for shelf_h in ctx.height_candidates:
-            if shelf_h > space + EPS:
-                continue
-            found = _best_shelf(ctx, avail, shelf_h, shelf_seed)
-            if found is None:
-                continue
-            actual_h, row_width, area, items, saving = found
-            if actual_h > space + EPS or row_width > cfg.sheet_width + EPS:
-                continue
-            density = area / (cfg.sheet_width * actual_h)
-            cushioned = 1 if row_width <= cfg.sheet_width - 2 * cfg.edge_cushion + EPS else 0
-            key = (
-                round(density, 9),
-                round(saving / (actual_h + cfg.part_gap), 6) if shelf_saving else 0,
-                round(area, 6),
-                cushioned,
-                round(actual_h, 6),
-            )
-            if best_key is None or key > best_key:
-                best_key = key
-                best = found
-        if best is None:
-            break
-
-        actual_h, row_width, _area, items, _saving = best
-        for pn, _pw, _ph, _rot in items:
-            avail[pn] -= 1
-        shelves.append((actual_h, row_width, items))
-        used_height += lead_gap + actual_h
+    shelves, used_height = _select_shelves(ctx, remaining, seed, shelf_saving)
+    if ctx.has_edge_insets and _any_row_pinned(ctx, shelves):
+        shelves, used_height = _select_shelves(
+            ctx, remaining, seed, shelf_saving, inflate_edges=True
+        )
 
     layout = SheetLayout()
     counts: dict[str, int] = {}
@@ -1029,12 +1321,25 @@ def _build_sheet(
     # Soft front-edge margin (2026-08-03 amendment): spend up to
     # front_margin of whatever vertical slack is left on the front (Y=0)
     # side of the stack; any slack beyond that goes to the back edge.
+    # The WDC end insets (2026-08-04) are HARD and win where they collide.
     slack_v = cfg.sheet_height - used_height
-    y = min(cfg.front_margin, max(0.0, slack_v))
+    need_bottom, need_top = _stack_edge_needs(ctx, shelves)
+    y = _seat(
+        min(cfg.front_margin, max(0.0, slack_v)),
+        max(0.0, slack_v),
+        need_bottom,
+        need_top,
+    )
 
     for shelf_h, row_width, items in shelves:
         slack_h = cfg.sheet_width - row_width
-        x = min(cfg.edge_cushion, max(0.0, slack_h) / 2.0)
+        need_left, need_right = _row_edge_needs(ctx, items)
+        x = _seat(
+            min(cfg.edge_cushion, max(0.0, slack_h) / 2.0),
+            max(0.0, slack_h),
+            need_left,
+            need_right,
+        )
         for pn, pw, ph, rotated in items:
             # ``pw``/``ph`` are the RESERVED rectangle.  The real footprint
             # sits centred in it, which for a WDC leaves the slot's reach

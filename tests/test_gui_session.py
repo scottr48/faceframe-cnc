@@ -717,6 +717,76 @@ class EditRowGenerateGuardTests(unittest.TestCase):
         self.assertTrue(session.can_generate())
 
 
+class IncludeResolveGenerateGuardTests(unittest.TestCase):
+    """2026-08-04 owner-approved review: ``set_included``, ``set_all_included``
+    and ``resolve_row`` change which lines are on the cut list but, before
+    this fix, only set ``dirty`` -- they never invalidated ``result``, so a
+    layout optimized before the change stayed reachable from Generate
+    (uncheck a line, press Generate, the NC still cut it). Same governing
+    rule as :meth:`Session.edit_row`'s (see its docstring): a layout built
+    from the pre-change lines must never be reachable from Generate.
+    """
+
+    def setUp(self):
+        self.session = Session(AppSettings())
+        self.session.set_rows(
+            [
+                row("W3036", 30.0, 36.0, 2, key="a"),
+                row("W3012", 30.0, 12.0, 2, key="b"),
+                row(
+                    "WDC2436", None, 36.0, 1, key="wdc", missing=("width",),
+                    reason="missing frame width", included=False,
+                ),
+            ]
+        )
+
+    def test_excluding_an_included_row_blocks_generate(self):
+        self.session.optimize()
+        self.assertTrue(self.session.can_generate())
+        self.session.set_included("b", False)
+        self.assertIsNone(self.session.result)
+        self.assertFalse(self.session.can_generate())
+        self.assertEqual(self.session.generate_blocker(), "Optimize a layout first")
+
+    def test_set_included_with_a_no_op_value_does_not_invalidate(self):
+        self.session.optimize()
+        self.assertTrue(self.session.can_generate())
+        self.session.set_included("b", True)  # already included
+        self.assertTrue(self.session.can_generate())
+        self.session.set_included("wdc", False)  # already excluded
+        self.assertTrue(self.session.can_generate())
+
+    def test_set_all_included_false_blocks_generate(self):
+        self.session.optimize()
+        self.assertTrue(self.session.can_generate())
+        self.session.set_all_included(False)
+        self.assertIsNone(self.session.result)
+        self.assertFalse(self.session.can_generate())
+
+    def test_set_all_included_true_that_changes_something_blocks_generate(self):
+        self.session.set_included("b", False)
+        self.session.optimize()
+        self.assertTrue(self.session.can_generate())
+        self.session.set_all_included(True)  # re-includes "b"; "wdc" still can't
+        self.assertFalse(self.session.row("wdc").included)
+        self.assertIsNone(self.session.result)
+        self.assertFalse(self.session.can_generate())
+
+    def test_set_all_included_true_with_nothing_to_change_does_not_invalidate(self):
+        self.session.optimize()
+        self.assertTrue(self.session.can_generate())
+        self.session.set_all_included(True)  # "a" and "b" already included
+        self.assertTrue(self.session.can_generate())
+
+    def test_resolve_row_on_a_needs_attention_row_blocks_generate(self):
+        self.session.optimize()
+        self.assertTrue(self.session.can_generate())
+        self.session.resolve_row("wdc", width=18.0)
+        self.assertIsNone(self.session.result)
+        self.assertFalse(self.session.can_generate())
+        self.assertEqual(self.session.generate_blocker(), "Optimize a layout first")
+
+
 # --------------------------------------------------------------------------
 # Geometry helpers shared with the canvas
 # --------------------------------------------------------------------------
