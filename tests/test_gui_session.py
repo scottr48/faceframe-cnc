@@ -518,6 +518,206 @@ class ResolveTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------
+# Editing a line's quantity and dimensions (owner request, 2026-08-03):
+# "after the change a save button or some other form of 'are you sure?'"
+# --------------------------------------------------------------------------
+
+_WDC_NOTE = (
+    "width 18 derived from part number (WDC cabinet 24x36, 2in-stile frame "
+    "is 6in narrower)"
+)
+
+
+class EditRowTests(unittest.TestCase):
+    def setUp(self):
+        self.session = Session(AppSettings())
+        self.session.set_rows(
+            [
+                row("W3036", 24.0, 30.0, 3, key="a"),
+                row("WDC2436", 18.0, 36.0, 2, key="w", note=_WDC_NOTE),
+                row(
+                    "WDC2436", None, 36.0, 1, key="wdc-missing",
+                    missing=("width",), reason="missing frame width", included=False,
+                ),
+            ]
+        )
+
+    def test_qty_change_only(self):
+        edited = self.session.edit_row("a", qty=5)
+        self.assertEqual(edited.qty, 5)
+        self.assertEqual((edited.frame_width, edited.frame_height), (24.0, 30.0))
+        self.assertTrue(edited.edited)
+        self.assertIn("qty 3 -> 5", edited.note)
+
+    def test_dims_change(self):
+        edited = self.session.edit_row("a", width=21.0, height=27.0)
+        self.assertEqual((edited.frame_width, edited.frame_height), (21.0, 27.0))
+        self.assertEqual(edited.qty, 3)
+        self.assertIn("width 24 -> 21", edited.note)
+        self.assertIn("height 30 -> 27", edited.note)
+
+    def test_qty_and_dims_together(self):
+        edited = self.session.edit_row("a", qty=5, width=21.0, height=27.0)
+        self.assertEqual(edited.qty, 5)
+        self.assertEqual((edited.frame_width, edited.frame_height), (21.0, 27.0))
+
+    def test_qty_zero_is_rejected_and_mentions_the_checkbox(self):
+        with self.assertRaises(SessionError) as caught:
+            self.session.edit_row("a", qty=0)
+        self.assertIn("checkbox", str(caught.exception))
+        self.assertEqual(self.session.row("a").qty, 3)
+        self.assertFalse(self.session.row("a").edited)
+
+    def test_a_negative_qty_is_rejected(self):
+        with self.assertRaises(SessionError):
+            self.session.edit_row("a", qty=-2)
+
+    def test_negative_and_junk_dims_are_rejected(self):
+        for bad in ("abc", -4, 0):
+            with self.assertRaises(SessionError):
+                self.session.edit_row("a", width=bad)
+        row_after = self.session.row("a")
+        self.assertEqual((row_after.frame_width, row_after.frame_height), (24.0, 30.0))
+        self.assertFalse(row_after.edited)
+
+    def test_geometry_invalid_dims_are_rejected_with_no_partial_application(self):
+        with self.assertRaises(SessionError) as caught:
+            self.session.edit_row("a", qty=9, width=24.0, height=1.0)
+        self.assertIn("too short", str(caught.exception))
+        row_after = self.session.row("a")
+        # Nothing applied -- not even the otherwise-harmless qty change.
+        self.assertEqual(row_after.qty, 3)
+        self.assertEqual((row_after.frame_width, row_after.frame_height), (24.0, 30.0))
+        self.assertFalse(row_after.edited)
+        self.assertEqual(row_after.note, "")
+
+    def test_a_successful_edit_invalidates_the_result(self):
+        self.session.optimize()
+        self.assertIsNotNone(self.session.result)
+        self.session.edit_row("a", qty=5)
+        self.assertIsNone(self.session.result)
+        self.assertEqual(self.session.problems(), [])
+
+    def test_editing_back_to_the_originals_clears_edited_and_note(self):
+        self.session.edit_row("a", qty=5, width=21.0)
+        self.assertTrue(self.session.row("a").edited)
+        settled = self.session.edit_row("a", qty=3, width=24.0)
+        self.assertFalse(settled.edited)
+        self.assertEqual(settled.note, "")
+
+    def test_a_wdc_derived_row_keeps_its_derivation_note_after_an_unrelated_qty_edit(self):
+        edited = self.session.edit_row("w", qty=4)
+        self.assertIn("derived from part number", edited.note)
+        self.assertIn("qty 2 -> 4", edited.note)
+        # The derivation note is a prefix, not replaced.
+        self.assertTrue(edited.note.startswith(_WDC_NOTE))
+
+    def test_a_missing_dim_row_is_completed_and_included(self):
+        edited = self.session.edit_row("wdc-missing", width=18.0)
+        self.assertEqual(edited.missing, ())
+        self.assertIs(edited.status, RowStatus.READY)
+        self.assertTrue(edited.included)
+        self.assertTrue(edited.resolved)
+
+    def test_completing_a_missing_dim_and_changing_the_present_one_applies_both(self):
+        # resolve_row only ever fills the GAPS, so an edit that supplies the
+        # missing width AND changes the height the sheet already had must
+        # not silently lose the height change.
+        edited = self.session.edit_row("wdc-missing", width=18.0, height=33.0)
+        self.assertEqual((edited.frame_width, edited.frame_height), (18.0, 33.0))
+        self.assertIs(edited.status, RowStatus.READY)
+        self.assertIn("height 36 -> 33", edited.note)
+
+    def test_supplying_only_some_of_what_a_missing_row_needs_is_refused(self):
+        self.session.set_rows(
+            [
+                row(
+                    "SD1212", None, None, 3, key="sd", missing=("width", "height"),
+                    reason="missing frame width and height", included=False,
+                )
+            ]
+        )
+        with self.assertRaises(SessionError):
+            self.session.edit_row("sd", width=12.0)
+        self.assertEqual(self.session.row("sd").missing, ("width", "height"))
+
+    def test_qty_only_edit_is_allowed_on_an_incomplete_row(self):
+        edited = self.session.edit_row("wdc-missing", qty=6)
+        self.assertEqual(edited.qty, 6)
+        self.assertEqual(edited.missing, ("width",))
+        self.assertFalse(edited.included)
+
+
+class RevertRowTests(unittest.TestCase):
+    def setUp(self):
+        self.session = Session(AppSettings())
+        self.session.set_rows(
+            [
+                row("W3036", 24.0, 30.0, 3, key="a"),
+                row(
+                    "WDC2436", None, 36.0, 1, key="wdc-missing",
+                    missing=("width",), reason="missing frame width", included=False,
+                ),
+            ]
+        )
+
+    def test_revert_restores_values_and_note_and_invalidates_result(self):
+        self.session.edit_row("a", qty=5, width=21.0)
+        self.session.optimize()
+        self.assertIsNotNone(self.session.result)
+
+        reverted = self.session.revert_row("a")
+        self.assertEqual((reverted.qty, reverted.frame_width, reverted.frame_height), (3, 24.0, 30.0))
+        self.assertEqual(reverted.note, "")
+        self.assertFalse(reverted.edited)
+        self.assertIsNone(self.session.result)
+
+    def test_revert_raises_on_a_never_edited_row(self):
+        with self.assertRaises(SessionError):
+            self.session.revert_row("a")
+
+    def test_revert_restores_the_derivation_note(self):
+        self.session.set_rows([row("WDC2436", 18.0, 36.0, 2, key="w", note=_WDC_NOTE)])
+        self.session.edit_row("w", qty=4)
+        reverted = self.session.revert_row("w")
+        self.assertEqual(reverted.note, _WDC_NOTE)
+        self.assertEqual(reverted.qty, 2)
+
+    def test_revert_restores_missing_state_for_a_row_resolved_by_edit(self):
+        self.session.edit_row("wdc-missing", width=18.0)
+        self.assertIs(self.session.row("wdc-missing").status, RowStatus.READY)
+
+        reverted = self.session.revert_row("wdc-missing")
+        self.assertIsNone(reverted.frame_width)
+        self.assertEqual(reverted.missing, ("width",))
+        self.assertFalse(reverted.included)
+        self.assertFalse(reverted.resolved)
+        self.assertIs(reverted.status, RowStatus.NEEDS_ATTENTION)
+
+
+class EditRowGenerateGuardTests(unittest.TestCase):
+    """Spec item 8: an edit after Optimize must make Generate impossible
+    until the layout is re-optimized -- a stale layout must never reach
+    Generate just because nothing rebuilt ``self.result``."""
+
+    def test_editing_a_row_after_optimize_blocks_generate_until_reoptimized(self):
+        session = Session(AppSettings())
+        session.set_rows([row("W3036", 30.0, 36.0, 2, key="a")])
+        session.optimize()
+        self.assertTrue(session.can_generate())
+
+        session.edit_row("a", qty=4)
+        self.assertIsNone(session.result)
+        self.assertFalse(session.can_generate())
+        self.assertEqual(session.generate_blocker(), "Optimize a layout first")
+        with self.assertRaises(SessionError):
+            session.generate_nc("nowhere", prefix="1234")
+
+        session.optimize()
+        self.assertTrue(session.can_generate())
+
+
+# --------------------------------------------------------------------------
 # Geometry helpers shared with the canvas
 # --------------------------------------------------------------------------
 
@@ -1252,6 +1452,22 @@ class RealOrderTests(unittest.TestCase):
         fewer = session.optimize().total_sheets
         self.assertLess(fewer, full)
         self.assertFalse(session.dirty)
+
+    def test_editing_a_lines_qty_then_reoptimizing_reflects_it(self):
+        session = self.load()
+        session.optimize()
+        target = next(
+            r for r in session.rows if r.included and r.status is RowStatus.READY
+        )
+        before_frames = session.total_frames
+
+        session.edit_row(target.key, qty=target.qty + 5)
+        self.assertIsNone(session.result)
+        self.assertEqual(session.total_frames, before_frames + 5)
+
+        result = session.optimize()
+        self.assertEqual(result.total_parts, before_frames + 5)
+        self.assertEqual(validate_layouts(result, session.config), [])
 
     def test_an_edit_on_the_real_layout_keeps_the_totals_straight(self):
         session = self.load()

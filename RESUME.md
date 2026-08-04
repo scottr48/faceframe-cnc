@@ -30,7 +30,7 @@ spec and the reference `.anc` files disagree, the .anc files win.
   Fable may do directly.
 - Check in with Scott after each milestone; only commit when asked.
 
-## State: Milestones 1-5 complete and reviewed
+## State: ALL milestones (1-6) complete, reviewed and committed
 
 - `faceframe_cnc/geometry.py` — frame-type inference + opening geometry.
   WDC is special (2026-08-03 amendment): 2" stiles, WDC2436 is 18x36 →
@@ -60,7 +60,12 @@ spec and the reference `.anc` files disagree, the .anc files win.
   Py 3.14): headless `session.py` holds ALL logic (order load/resolve/include,
   optimize, move/rotate/cross-sheet/nest/unnest edits validated on trial
   copies — invalid edits snap back with the violated rule; spec-4c run
-  splitting and re-grouping). Qt widgets are thin. Launch:
+  splitting and re-grouping; row editing — `Session.edit_row`/`revert_row`
+  change a line's qty/dimensions with the same trial-then-commit discipline,
+  double-click a row or "Edit..." opens `EditRowDialog` with an explicit
+  "Save changes" step and a live before/after summary, and any successful
+  edit invalidates the current layout so a stale one can never reach
+  Generate). Qt widgets are thin. Launch:
   `.venv\Scripts\python.exe -m faceframe_cnc.gui` (`--self-test N` for
   headless smoke). Settings persist to faceframe_settings.json (gitignored).
 
@@ -94,26 +99,59 @@ spec and the reference `.anc` files disagree, the .anc files win.
     unique pictures and **all 17 generate and verify clean, zero refusals**,
     in production and in dry-run form.
 
-## Where the last session left off (2026-08-03)
+- `faceframe_cnc/report/` — Milestone 6 PDF cut-sheet report. `pdf.py` is a
+  stdlib-only, byte-deterministic PDF 1.4 writer (real Helvetica AFM
+  metrics); `cutsheet.py` composes a cover page (headline tiles,
+  unique-sheet table, run-quantity sum cross-check) plus one page per
+  unique sheet: boxed RUN QTY, layout to scale with openings/nested frames/
+  T17 slot centrelines (dashed, on WDC parts), labels, and a cut list.
+  Refused sheets get a marked page; dry runs marked on every page.
+  Generate writes `R<prefix>_report.pdf` beside the .anc files (default-on
+  checkbox; a report failure never blocks the NC programs).
+  `tests/test_report.py` parses the PDF back and asserts structure,
+  determinism and drawn coordinates.
 
-- Milestone 5 committed in full ("Milestone 5 complete: NC generation for
-  optimized sheets, T17 WDC slot, 0.455 part gap"). Verified at commit
-  time: `.venv\Scripts\python.exe -m unittest discover tests` →
-  **399 tests, OK**. A hand-check of an emitted T17 section (R720102N,
-  3xWDC2436) matched the amendment's geometry exactly.
-- Milestone 6 (PDF report) complete, reviewed and committed:
-  `faceframe_cnc/report/` (stdlib-only PDF 1.4 writer + cut-sheet composer),
-  Generate flow writes `R<prefix>_report.pdf` beside the .anc files
-  (default on; report failure never blocks NC). 454 tests OK (+55).
-- **One session at a time in this tree.** An earlier session collided with a
-  leftover coder agent from a disconnected session editing the same files
-  concurrently. It merged cleanly that time; do not count on that again.
+## Where the last session left off (2026-08-03/04)
+
+Session log, in order — commits `91757dd` (Milestone 5 complete),
+`ec2da9a` (Milestone 6 PDF report), `b7212d6` (part-gap floor + WDC
+auto-resolution), then row editing (committed at wrap-up; see git log):
+
+- **Row editing** (Scott's request): `Session.edit_row`/`revert_row` +
+  `EditRowDialog`; provenance originals kept on `OrderRow`, edited rows
+  amber with note tooltip, "Save changes" disabled until something differs
+  with a live before/after summary. Review caught and fixed two corner
+  bugs: completing a missing dim while changing the present one no longer
+  drops the second change, and an untouched 0.001 placeholder spin value is
+  never sent as a real width. **515 tests, OK** at wrap-up.
+- **Owner-reported bugs fixed** (b7212d6): stale persisted part_gap 0.375
+  caused 7-8 refused sheets at Generate (verifier foreign-cut, correctly)
+  → hard floor + migration; WDC2436 prompted for width on every load →
+  parser auto-derives from the part name (contradictions still prompt).
+  The 7-21 order now loads with an EMPTY needs-attention list.
+- **WDC trust displays** (Scott: "how do I know it has the 2 inch stiles
+  and the special T17 routing?"): order-panel "WDC frames — what the
+  machine does" fact box and PDF slot centrelines + cut-list note, every
+  number derived from geometry.py constants. Pattern to keep (see memory):
+  auto-apply derived values AND show visible proof — no silent magic, no
+  bare prompts.
+- **Dev tooling**: PyMuPDF is installed in `.venv` (dev-only, NOT an app
+  dependency) so PDF pages can be rasterized to PNG and inspected:
+  `python -c "import pymupdf; d=pymupdf.open('R7201_report.pdf');
+  d[0].get_pixmap(dpi=130).save('page1.png')"`. A desktop shortcut
+  "Faceframe Optimizer" (pythonw -m faceframe_cnc.gui, workdir this repo)
+  launches whatever code is checked out — no reinstall step ever.
+- **One session at a time in this tree.** An earlier session collided with
+  a leftover coder agent from a disconnected session editing the same
+  files concurrently. It merged cleanly that time; do not count on it.
 
 ### Decisions made (Scott, 2026-08-03)
 
 - **WDC end clearance stays** even though it costs 1 sheet on the 7-21
   order (41 vs 40): "the extra sheet is worth it for the padding."
   Do not re-raise trading it back for shallow T17 nicks in neighbours.
+- **Part gap 0.455 is a hard floor**; **WDC width is derived, not
+  prompted**; derived values must always come with visible proof.
 
 ### Known follow-ups (recorded, non-blocking)
 
@@ -122,11 +160,15 @@ spec and the reference `.anc` files disagree, the .anc files win.
 - `verifier._owner_of` attributes a move to the smallest containing grown
   box, which can self-skip a lead-in intrusion; the v-slot check has its
   own correct ownership rule. Fix someday, with a failing test first.
+- The PDF has been eyeballed rendered at screen resolution (cover, plain,
+  nested and WDC pages all correct); nobody has checked a PRINTED page yet.
+- The cover table's continuation page is written but unexercised (needs a
+  job with ~40+ unique sheets to trigger).
+- `report/cutsheet.py` and the .anc job stamp "now" independently when no
+  `created` is injected — they can differ across a minute boundary.
 
-## Next: Milestone 6 — PDF report
+## Next
 
-One labeled page per unique sheet: the layout drawn to scale with part
-numbers, the run quantity, and the cut list — the paperwork that goes to the
-machine beside the .anc files. `gui/sheet_canvas.py` already draws the sheet
-picture the page needs, and `post/job.py` already computes the per-sheet
-contents and run quantities.
+No milestone is open — the spec is fully delivered. Candidates, Scott's
+call: the verifier feed-word check (top of the follow-ups), a printed-page
+check of the PDF report, or whatever the shop floor turns up next.

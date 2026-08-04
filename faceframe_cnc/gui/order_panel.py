@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMessageBox,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -28,6 +29,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .edit_row_dialog import EditRowDialog
 from .session import RowStatus, Session, SessionError, suggest_dimensions, wdc_detail
 
 _HEADERS = ("Cut", "Part #", "Qty", "Frame W x H", "Type")
@@ -66,14 +68,20 @@ class OrderPanel(QWidget):
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         self.table.itemChanged.connect(self._on_item_changed)
         self.table.itemSelectionChanged.connect(self._on_table_selection_changed)
+        self.table.cellDoubleClicked.connect(self._on_cell_double_clicked)
 
         buttons = QHBoxLayout()
         self.all_button = QPushButton("Cut all")
         self.none_button = QPushButton("Cut none")
+        self.edit_button = QPushButton("Edit...")
+        self.edit_button.setEnabled(False)
+        self.edit_button.setToolTip("Change this line's quantity or frame dimensions")
         self.all_button.clicked.connect(lambda: self._set_all(True))
         self.none_button.clicked.connect(lambda: self._set_all(False))
+        self.edit_button.clicked.connect(self._on_edit_button)
         buttons.addWidget(self.all_button)
         buttons.addWidget(self.none_button)
+        buttons.addWidget(self.edit_button)
         buttons.addStretch(1)
         self.count_label = QLabel("no order loaded")
         buttons.addWidget(self.count_label)
@@ -172,7 +180,7 @@ class OrderPanel(QWidget):
                 cells = (
                     row.part_number,
                     str(row.qty),
-                    row.size_text,
+                    row.size_text + (" (edited)" if row.edited else ""),
                     row.type_text,
                 )
                 for column, text in enumerate(cells, start=1):
@@ -189,10 +197,16 @@ class OrderPanel(QWidget):
                     elif row.status is RowStatus.INVALID:
                         item.setForeground(QBrush(QColor("#b91c1c")))
                         item.setToolTip(row.geometry_error or "")
+                    elif row.edited:
+                        # Owner request (2026-08-03): a line changed with the
+                        # Edit dialog is marked the same amber used elsewhere
+                        # for "look at this", with the note (what changed,
+                        # from what) as the tooltip.
+                        item.setForeground(QBrush(QColor("#8a6410")))
+                        item.setToolTip(row.note)
                     elif row.note:
-                        # 2026-08-03 amendment: a dimension the parser
-                        # derived (a WDC width from the part number) says
-                        # where it came from.
+                        # A dimension the parser derived (a WDC width from
+                        # the part number) says where it came from.
                         item.setToolTip(row.note)
                     self.table.setItem(index, column, item)
 
@@ -242,6 +256,10 @@ class OrderPanel(QWidget):
             )
         finally:
             self._loading = False
+        # itemSelectionChanged is ignored while _loading, so the Edit
+        # button's enabled state needs a manual refresh against whatever
+        # selection (if any) survived the rebuild.
+        self.edit_button.setEnabled(bool(self.table.selectedItems()))
 
     # -- events ----------------------------------------------------------
 
@@ -284,6 +302,7 @@ class OrderPanel(QWidget):
         if self._loading:
             return
         items = self.table.selectedItems()
+        self.edit_button.setEnabled(bool(items))
         if not items:
             return
         key = items[0].data(Qt.ItemDataRole.UserRole)
@@ -292,6 +311,55 @@ class OrderPanel(QWidget):
         row = self.session.row(key)
         if row.status is RowStatus.NO_FRAME:
             self._show_editor_for(key)
+
+    # -- edit dialog (owner request, 2026-08-03) --------------------------
+
+    def _on_cell_double_clicked(self, row_index: int, _column: int) -> None:
+        item = self.table.item(row_index, 0)
+        if item is None:
+            return
+        key = item.data(Qt.ItemDataRole.UserRole)
+        if key is not None:
+            self._open_edit_dialog(key)
+
+    def _on_edit_button(self) -> None:
+        items = self.table.selectedItems()
+        if not items:
+            return
+        key = items[0].data(Qt.ItemDataRole.UserRole)
+        if key is not None:
+            self._open_edit_dialog(key)
+
+    def _open_edit_dialog(self, key: str) -> None:
+        dialog = EditRowDialog(self.session, key, self)
+        dialog.saveRequested.connect(lambda: self._on_dialog_save(dialog, key))
+        dialog.revertRequested.connect(lambda: self._on_dialog_revert(dialog, key))
+        dialog.exec()
+
+    def _on_dialog_save(self, dialog: EditRowDialog, key: str) -> None:
+        # Only what the user actually changed is sent: an untouched
+        # placeholder in a missing dimension's spin box must not ride along
+        # as a real 0.001" width on a qty-only edit.
+        try:
+            row = self.session.edit_row(key, **dialog.changes())
+        except SessionError as exc:
+            QMessageBox.warning(dialog, "Cannot save", str(exc))
+            return
+        dialog.accept()
+        self.reload()
+        self.statusMessage.emit(f"{row.part_number}: {row.note or 'no changes'}")
+        self.includeChanged.emit()
+
+    def _on_dialog_revert(self, dialog: EditRowDialog, key: str) -> None:
+        try:
+            row = self.session.revert_row(key)
+        except SessionError as exc:
+            QMessageBox.warning(dialog, "Cannot revert", str(exc))
+            return
+        dialog.accept()
+        self.reload()
+        self.statusMessage.emit(f"{row.part_number} reverted to order form values")
+        self.includeChanged.emit()
 
     def _show_editor_for(self, key: Optional[str]) -> None:
         self._resolve_key = key

@@ -29,8 +29,10 @@ except ImportError:  # pragma: no cover - depends on the environment
     HAVE_QT = False
 
 if HAVE_QT:
+    from faceframe_cnc.gui.edit_row_dialog import EditRowDialog
     from faceframe_cnc.gui.main_window import GENERATE_TOOLTIP, MainWindow
-    from faceframe_cnc.gui.session import AppSettings, OrderRow, Session
+    from faceframe_cnc.gui.order_panel import OrderPanel
+    from faceframe_cnc.gui.session import AppSettings, OrderRow, Session, SessionError
     from faceframe_cnc.gui.settings_dialog import SettingsDialog
 
 _APP = None
@@ -351,6 +353,169 @@ class MainWindowSmokeTests(unittest.TestCase):
         self.assertFalse(edited.inside_nesting)
         # The original object is untouched until the caller adopts the copy.
         self.assertEqual(self.session.settings.sheet_width, 49.0)
+
+    # -- editing a line (owner request, 2026-08-03) -----------------------
+
+    def test_double_clicking_a_row_opens_the_edit_dialog(self):
+        panel = self.window.order_panel
+        captured = {}
+        original = module_order_panel().EditRowDialog
+
+        class Capturing(original):
+            def __init__(self, session, key, parent=None):
+                super().__init__(session, key, parent)
+                captured["key"] = key
+                captured["dialog"] = self
+
+            def exec(self):
+                # A real exec() would block on a modal event loop this
+                # offscreen test never feeds -- only the construction (and
+                # so the key it was opened for) is under test here.
+                return int(self.DialogCode.Rejected)
+
+        module_order_panel().EditRowDialog = Capturing
+        try:
+            panel._on_cell_double_clicked(0, 2)
+        finally:
+            module_order_panel().EditRowDialog = original
+            if "dialog" in captured:
+                captured["dialog"].close()
+        self.assertEqual(captured.get("key"), "a")
+
+    def test_the_edit_button_tracks_the_selection(self):
+        panel = self.window.order_panel
+        self.assertFalse(panel.edit_button.isEnabled())
+        panel.table.selectRow(0)
+        self.assertTrue(panel.edit_button.isEnabled())
+        panel.table.clearSelection()
+        self.assertFalse(panel.edit_button.isEnabled())
+
+        # A reload that drops the selected row's index (fewer rows than
+        # before) leaves nothing selected there any more, and the button
+        # (refreshed outside the _loading-guarded signal handler, since
+        # itemSelectionChanged is ignored while reload() rebuilds the
+        # table) must follow.
+        panel.table.selectRow(2)
+        self.session.set_rows([self.session.rows[0]])
+        panel.reload()
+        self.assertFalse(panel.edit_button.isEnabled())
+
+    def test_saving_an_edit_marks_the_row_and_updates_the_status_bar(self):
+        panel = self.window.order_panel
+        panel.session.edit_row("a", qty=9)
+        panel.reload()
+        item = panel.table.item(0, 3)  # "Frame W x H" column
+        self.assertIn("edited", item.text())
+        self.assertIn("qty 2 -> 9", item.toolTip())
+
+
+def module_order_panel():
+    import faceframe_cnc.gui.order_panel as module
+
+    return module
+
+
+@unittest.skipUnless(HAVE_QT, "PySide6 is not installed")
+class EditRowDialogSmokeTests(unittest.TestCase):
+    def setUp(self):
+        self.session = fake_order()
+        self.dialog = EditRowDialog(self.session, "a")
+        self.addCleanup(self.dialog.close)
+
+    def _ok_button(self, dialog=None):
+        from PySide6.QtWidgets import QDialogButtonBox
+
+        dialog = dialog or self.dialog
+        return dialog.buttons.button(QDialogButtonBox.StandardButton.Ok)
+
+    def test_save_is_disabled_with_no_changes(self):
+        self.assertEqual(self.dialog.summary_label.text(), "no changes")
+        self.assertFalse(self._ok_button().isEnabled())
+
+    def test_save_enables_and_the_summary_shows_the_arrow_after_a_change(self):
+        self.dialog.qty.setValue(5)
+        self.assertTrue(self._ok_button().isEnabled())
+        self.assertIn("->", self.dialog.summary_label.text())
+        self.assertIn("qty 2 -> 5", self.dialog.summary_label.text())
+
+    def test_revert_button_hidden_on_an_unedited_row(self):
+        self.assertTrue(self.dialog.revert_button.isHidden())
+
+    def test_revert_button_shown_once_the_row_is_edited(self):
+        self.session.edit_row("a", qty=9)
+        dialog = EditRowDialog(self.session, "a")
+        self.addCleanup(dialog.close)
+        self.assertFalse(dialog.revert_button.isHidden())
+
+    def test_a_missing_dims_placeholder_is_not_sent_on_a_qty_only_edit(self):
+        # Qt spin boxes cannot show "unset", so a missing dimension is
+        # prefilled with a 0.001 placeholder.  Untouched, it must count as
+        # unset: no change in the summary, and never sent to the session as
+        # a real width alongside a qty edit.
+        session = Session(AppSettings())
+        session.set_rows(
+            [
+                OrderRow(
+                    key="m", part_number="WDC2436", qty=1, frame_height=36.0,
+                    missing=("width",), reason="missing frame width",
+                    included=False,
+                )
+            ]
+        )
+        dialog = EditRowDialog(session, "m")
+        self.addCleanup(dialog.close)
+        self.assertEqual(dialog.summary_label.text(), "no changes")
+        self.assertFalse(self._ok_button(dialog).isEnabled())
+
+        dialog.qty.setValue(4)
+        self.assertEqual(dialog.changes(), {"qty": 4})
+        self.assertIn("qty 1 -> 4", dialog.summary_label.text())
+        self.assertNotIn("width", dialog.summary_label.text())
+
+        # Dialling a real width DOES count, attributed as "not set ->".
+        dialog.width.setValue(18.0)
+        self.assertEqual(dialog.changes(), {"qty": 4, "width": 18.0})
+        self.assertIn("width ? -> 18", dialog.summary_label.text())
+
+    def test_a_session_error_leaves_the_dialog_open_with_values_intact(self):
+        panel = OrderPanel(self.session)
+        self.addCleanup(panel.close)
+        self.dialog.width.setValue(24.0)
+
+        accepted = []
+        self.dialog.accept = lambda: accepted.append(True)
+
+        original_warning = module_order_panel().QMessageBox.warning
+        module_order_panel().QMessageBox.warning = staticmethod(lambda *a, **k: None)
+
+        def boom(*args, **kwargs):
+            raise SessionError("no way")
+
+        original_edit_row = self.session.edit_row
+        self.session.edit_row = boom
+        try:
+            panel._on_dialog_save(self.dialog, "a")
+        finally:
+            self.session.edit_row = original_edit_row
+            module_order_panel().QMessageBox.warning = original_warning
+
+        self.assertEqual(accepted, [])
+        self.assertEqual(self.dialog.width.value(), 24.0)
+
+    def test_revert_via_the_panel_calls_session_revert_row(self):
+        panel = OrderPanel(self.session)
+        self.addCleanup(panel.close)
+        self.session.edit_row("a", qty=9)
+        dialog = EditRowDialog(self.session, "a", panel)
+        self.addCleanup(dialog.close)
+
+        accepted = []
+        dialog.accept = lambda: accepted.append(True)
+        panel._on_dialog_revert(dialog, "a")
+
+        self.assertEqual(accepted, [True])
+        self.assertEqual(self.session.row("a").qty, 2)
+        self.assertFalse(self.session.row("a").edited)
 
 
 @unittest.skipUnless(HAVE_QT, "PySide6 is not installed")

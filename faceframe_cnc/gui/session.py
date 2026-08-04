@@ -434,6 +434,17 @@ def wdc_detail(
     return "\n".join(lines)
 
 
+def _dims_equal(a: Optional[float], b: Optional[float]) -> bool:
+    """``True`` for equal numbers, equal ``None``, but never one of each."""
+    if a is None or b is None:
+        return a is None and b is None
+    return abs(a - b) <= 1e-9
+
+
+def _format_dim(value: Optional[float]) -> str:
+    return "?" if value is None else f"{value:g}"
+
+
 @dataclass
 class OrderRow:
     """One line of the order as the GUI shows it.
@@ -462,6 +473,78 @@ class OrderRow:
     row_index: int = -1
     #: Set once the user has typed the missing dimension.
     resolved: bool = False
+
+    #: As-loaded provenance for :meth:`Session.edit_row` /
+    #: :meth:`Session.revert_row` (2026-08-03, "edit a line" amendment).
+    #: ``None`` here is a sentinel meaning "not yet captured" -- resolved to
+    #: whatever the field held at construction by :meth:`__post_init__`, so
+    #: every row built the ordinary way (parser, tests, fixtures) gets a
+    #: correct baseline for free, with no separate call required.  A field
+    #: legitimately being ``None`` (an unresolved dimension) and the
+    #: sentinel collapse to the same value on purpose: "the original was
+    #: None" and "capture whatever is there" mean the same thing here.
+    original_qty: Optional[int] = None
+    original_width: Optional[float] = None
+    original_height: Optional[float] = None
+    #: The row's ``missing``/``reason`` as loaded, kept so
+    #: :meth:`Session.revert_row` can put an auto-resolved-by-hand row (one
+    #: that was NEEDS_ATTENTION or NO_FRAME until :meth:`Session.edit_row`
+    #: supplied the missing dimension) back into that state instead of
+    #: leaving it READY with a dimension quietly wiped back to ``None``.
+    original_missing: Optional[tuple[str, ...]] = None
+    original_reason: Optional[str] = None
+    #: The note as loaded (a WDC derivation remark, or ``""``) -- the part
+    #: :meth:`OrderRow._compose_note` never overwrites, only appends to.
+    base_note: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.original_qty is None:
+            self.original_qty = self.qty
+        if self.original_width is None:
+            self.original_width = self.frame_width
+        if self.original_height is None:
+            self.original_height = self.frame_height
+        if self.original_missing is None:
+            self.original_missing = self.missing
+        if self.original_reason is None:
+            self.original_reason = self.reason
+        if self.base_note is None:
+            self.base_note = self.note
+
+    @property
+    def edited(self) -> bool:
+        """True once qty/width/height differ from the order-form originals."""
+        return (
+            self.qty != self.original_qty
+            or not _dims_equal(self.frame_width, self.original_width)
+            or not _dims_equal(self.frame_height, self.original_height)
+        )
+
+    def _compose_note(self) -> str:
+        """The note :meth:`Session.edit_row` installs after applying a change.
+
+        Always recomputed from scratch against the order-form originals
+        (never against whatever the previous edit's note said), so two
+        edits in a row describe the NET change, not a diff of diffs -- and
+        an edit that lands back on the originals collapses to
+        :attr:`base_note` with no "edited" text left over.  A pre-existing
+        note (the WDC part-number derivation) is a prefix, never overwritten.
+        """
+        changes: list[str] = []
+        if self.qty != self.original_qty:
+            changes.append(f"qty {self.original_qty} -> {self.qty}")
+        if not _dims_equal(self.frame_width, self.original_width):
+            changes.append(
+                f"width {_format_dim(self.original_width)} -> {_format_dim(self.frame_width)}"
+            )
+        if not _dims_equal(self.frame_height, self.original_height):
+            changes.append(
+                f"height {_format_dim(self.original_height)} -> {_format_dim(self.frame_height)}"
+            )
+        if not changes:
+            return self.base_note or ""
+        edit_text = f"edited: {', '.join(changes)} (order form values kept for reference)"
+        return f"{self.base_note}; {edit_text}" if self.base_note else edit_text
 
     @property
     def frame_type(self) -> FrameType:
@@ -973,6 +1056,148 @@ class Session:
 
         row.included = bool(include)
         self.dirty = True
+        return row
+
+    def edit_row(
+        self,
+        key: str,
+        *,
+        qty: Optional[int] = None,
+        width: Optional[float] = None,
+        height: Optional[float] = None,
+    ) -> OrderRow:
+        """Change a line's quantity and/or frame dimensions (owner request,
+        2026-08-03: "after the change a save button or some other form of
+        'are you sure?'" -- that confirmation lives in the GUI dialog; this
+        is where the change actually gets checked and applied).
+
+        ``None`` leaves that field alone.  Validation mirrors
+        :meth:`resolve_row`'s coercion: quantity must be a positive
+        integer -- zero is refused, since excluding a line is what the Cut
+        checkbox is for, and the error says so -- and a supplied dimension
+        must be a positive finite number.  The candidate is applied on a
+        trial basis first; if :func:`~faceframe_cnc.geometry.compute_geometry`
+        cannot make openings out of the result, :class:`SessionError` is
+        raised with its message and the row is left byte-for-byte as it
+        was, the same discipline :meth:`resolve_row` and the layout edits
+        already use.
+
+        A row still missing a dimension is completed exactly the way
+        :meth:`resolve_row` completes it -- that plumbing is reused here
+        rather than duplicated -- when this call supplies whatever it is
+        still missing; supplying only part of what an incomplete row needs
+        is refused with the same message :meth:`resolve_row` gives.  A qty-
+        only edit is allowed on an incomplete row without resolving it.
+
+        On success the note is rewritten to say what changed from the
+        order-form originals (never losing a pre-existing derivation note —
+        see :meth:`OrderRow._compose_note`), and the current layout is
+        invalidated exactly like :meth:`load_order` invalidates it
+        (``result = None``, problems cleared): a layout built from the
+        pre-edit numbers must never be reachable from Generate.
+        """
+        row = self.row(key)
+
+        def coerce_dim(name: str, value: object) -> float:
+            try:
+                number = float(value)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                raise SessionError(f"{name} {value!r} is not a number") from None
+            if not math.isfinite(number) or number <= 0:
+                raise SessionError(f"{name} must be a positive number, got {value!r}")
+            return number
+
+        new_qty = row.qty
+        if qty is not None:
+            try:
+                as_float = float(qty)  # type: ignore[arg-type]
+                new_qty = int(as_float)
+                if as_float != new_qty:
+                    raise ValueError
+            except (TypeError, ValueError):
+                raise SessionError(f"quantity {qty!r} is not a whole number") from None
+            if new_qty <= 0:
+                raise SessionError(
+                    f"quantity must be at least 1 (got {qty!r}) - use the Cut "
+                    f"checkbox to exclude a line instead of setting its "
+                    f"quantity to zero"
+                )
+
+        new_width = row.frame_width if width is None else coerce_dim("width", width)
+        new_height = row.frame_height if height is None else coerce_dim("height", height)
+
+        if row.missing and (width is not None or height is not None):
+            still_missing = [
+                name
+                for name, value in (("width", new_width), ("height", new_height))
+                if value is None
+            ]
+            if still_missing:
+                raise SessionError(
+                    f"{row.part_number} still needs a frame {' and '.join(still_missing)}"
+                )
+            # Every missing dimension is now supplied.  resolve_row is
+            # reused to complete the row, but it deliberately takes ONLY
+            # the dimension(s) actually missing -- if this same save also
+            # changed the dimension the sheet DID have, that change must
+            # not be silently dropped, so the FULL candidate is validated
+            # here first and both dimensions are installed explicitly
+            # afterwards.
+            probe = compute_geometry(row.part_number, new_width, new_height)
+            if probe.errors:
+                raise SessionError(
+                    f"{row.part_number} {new_width:g} x {new_height:g}: "
+                    f"{probe.errors[0]}"
+                )
+            self.resolve_row(key, width=new_width, height=new_height, include=True)
+            row.frame_width, row.frame_height = new_width, new_height
+        elif new_width is not None and new_height is not None:
+            before = (row.frame_width, row.frame_height)
+            row.frame_width, row.frame_height = new_width, new_height
+            error = row.geometry_error
+            if error is not None:
+                row.frame_width, row.frame_height = before
+                raise SessionError(
+                    f"{row.part_number} {new_width:g} x {new_height:g}: {error}"
+                )
+        # else: the row is still missing a dimension and this call did not
+        # supply one -- a qty-only edit on an incomplete row falls through.
+
+        row.qty = new_qty
+        row.note = row._compose_note()
+        self.dirty = True
+        self.result = None
+        self._problems = []
+        return row
+
+    def revert_row(self, key: str) -> OrderRow:
+        """Undo every :meth:`edit_row` change, back to the order-form values.
+
+        Restores qty/width/height and the original note (the WDC derivation
+        note when there was one) verbatim.  If the row had been NEEDS_
+        ATTENTION or NO_FRAME before an edit supplied its missing
+        dimension, that incomplete state comes back too -- a dimension
+        :meth:`edit_row` filled in does not get to survive as a floating
+        READY value once its own provenance is reverted away.  Raises
+        :class:`SessionError` if the row was never edited: there is nothing
+        to revert to that is not already showing.  Invalidates the current
+        layout the same way :meth:`edit_row` does.
+        """
+        row = self.row(key)
+        if not row.edited:
+            raise SessionError(f"{row.part_number} has not been edited")
+        row.qty = row.original_qty
+        row.frame_width = row.original_width
+        row.frame_height = row.original_height
+        row.note = row.base_note or ""
+        if row.original_missing:
+            row.missing = row.original_missing
+            row.reason = row.original_reason or ""
+            row.resolved = False
+            row.included = False
+        self.dirty = True
+        self.result = None
+        self._problems = []
         return row
 
     # -- demand ----------------------------------------------------------
