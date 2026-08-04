@@ -18,7 +18,10 @@ Recovery rules (all measured, see :mod:`~faceframe_cnc.post.model`):
 *   routed opening  = T11 opening loop grown by 0.1975 (radius + finish
     stock), cross-checked against the T12 loop grown by 0.1;
 *   rotation        = which pair of T13 grooves sits 0.5625 in from the
-    edge (the stile pair);
+    edge (the stile pair) — or, for a WDC frame, which pair of T17 slots
+    sits 0.6614 in, since a WDC has no T13 stile grooves to vote with;
+*   WDC slot        = two passes on one centreline, matched against the
+    emitter's own per-pass overrun;
 *   nesting         = a part whose footprint lies inside another part's
     opening is that part's child (spec 4b).
 """
@@ -40,10 +43,11 @@ from .model import (
     SECTION_OPENINGS,
     SECTION_PANEL,
     SECTION_PERIMETER,
+    SECTION_WDC_SLOT,
     SheetProgram,
     default_config,
 )
-from .generator import default_entry_side, groove_segment
+from .generator import default_entry_side, groove_segment, wdc_slot_segment
 
 __all__ = ["ReconstructionError", "reconstruct", "reconstruct_text"]
 
@@ -212,6 +216,8 @@ def reconstruct_text(text: str, config: PostConfig | None = None):
         features = _scan_features(body)
         if tool_number == 13:
             name = SECTION_PANEL
+        elif tool_number == 17:
+            name = SECTION_WDC_SLOT
         elif tool_number == 12:
             name = SECTION_DETAIL
         elif tool_number == 11:
@@ -298,22 +304,18 @@ def reconstruct_text(text: str, config: PostConfig | None = None):
     flat = program.flat_parts()
     index_of = {id(part): i for i, part in enumerate(flat)}
 
-    # --- rotation, from the T13 grooves -----------------------------------
-    grooves = []
-    for feature in sections.get(SECTION_PANEL, []):
-        if not feature.is_groove or len(feature.points) != 2:
-            raise ReconstructionError(
-                "a T13 feature is not a straight groove (plunge then one move); "
-                "this post only knows the panel-groove grammar"
-            )
-        grooves.append((feature.pre, (feature.points[-1][0], feature.points[-1][1])))
-    if grooves:
-        _apply_rotation(parts, grooves, cfg)
+    # --- rotation, from the T13 grooves and the T17 slots ------------------
+    grooves = _straight_runs(sections.get(SECTION_PANEL, []), "T13 groove")
+    slots = _straight_runs(sections.get(SECTION_WDC_SLOT, []), "T17 slot")
+    if grooves or slots:
+        _apply_rotation(parts, grooves, slots, cfg)
 
     # --- plan -------------------------------------------------------------
     panel_refs: list[FeatureRef] = []
     for start, end in grooves:
         panel_refs.append(_groove_ref(parts, index_of, start, end, cfg))
+
+    slot_refs = _slot_refs(parts, index_of, slots, cfg)
 
     opening_refs: list[FeatureRef] = []
     for box, side in zip(opening_boxes, opening_sides):
@@ -358,6 +360,7 @@ def reconstruct_text(text: str, config: PostConfig | None = None):
 
     plan = CutPlan(
         panel=panel_refs,
+        wdc_slot=slot_refs,
         openings=opening_refs,
         perimeter=perimeter_refs,
         detail=detail_refs,
@@ -389,30 +392,119 @@ def _host_of(parts: list[PartProgram], part: PartProgram) -> PartProgram | None:
     return None
 
 
-def _apply_rotation(parts: list[PartProgram], grooves, cfg: PostConfig) -> None:
-    """Set each part's ``rotated`` flag from its T13 groove pattern."""
-    stile = cfg.panel.stile_inset
+def _straight_runs(features: list[_Feature], what: str):
+    """``[(start, end)]`` for a section of straight two-point cuts."""
+    runs = []
+    for feature in features:
+        if not feature.is_groove or len(feature.points) != 2:
+            raise ReconstructionError(
+                f"a {what} is not a straight cut (plunge then one move); this "
+                f"post only knows that grammar"
+            )
+        runs.append((feature.pre, (feature.points[-1][0], feature.points[-1][1])))
+    return runs
+
+
+def _apply_rotation(
+    parts: list[PartProgram], grooves, slots, cfg: PostConfig
+) -> None:
+    """Set each part's ``rotated`` flag from its stile-cut pattern.
+
+    An upright part's STILES are its left and right edges, so the cuts that
+    run down them are vertical.  Which cut that is depends on the frame: an
+    ordinary part has a T13 groove 0.5625 in from each stile edge, while a
+    WDC has no T13 stile groove at all and a T17 slot 0.6614 in instead
+    (2026-08-03 amendment).  Both vote here, and a part cannot have both.
+    """
+    candidates = [(cfg.panel.stile_inset, cfg.panel.overrun, grooves)]
+    if slots:
+        candidates.append(
+            (
+                cfg.wdc_slot.inset_from_outside_edge,
+                max(
+                    cfg.wdc_slot_reach(position)
+                    for position in range(len(cfg.wdc_slot.z_cuts))
+                ),
+                slots,
+            )
+        )
+
     for part in parts:
         votes = {False: 0, True: 0}
-        for start, end in grooves:
-            horizontal = abs(start[1] - end[1]) < TOL
-            box = part.box
-            if horizontal:
-                y = start[1]
-                if abs(y - (box.y0 + stile)) < TOL or abs(y - (box.y1 - stile)) < TOL:
-                    if box.x0 - TOL <= min(start[0], end[0]) + cfg.panel.overrun <= box.x1 + TOL:
-                        votes[True] += 1
-            else:
-                x = start[0]
-                if abs(x - (box.x0 + stile)) < TOL or abs(x - (box.x1 - stile)) < TOL:
-                    if box.y0 - TOL <= min(start[1], end[1]) + cfg.panel.overrun <= box.y1 + TOL:
-                        votes[False] += 1
+        box = part.box
+        for inset, overrun, runs in candidates:
+            for start, end in runs:
+                horizontal = abs(start[1] - end[1]) < TOL
+                if horizontal:
+                    y = start[1]
+                    if abs(y - (box.y0 + inset)) < TOL or abs(y - (box.y1 - inset)) < TOL:
+                        if box.x0 - TOL <= min(start[0], end[0]) + overrun <= box.x1 + TOL:
+                            votes[True] += 1
+                else:
+                    x = start[0]
+                    if abs(x - (box.x0 + inset)) < TOL or abs(x - (box.x1 - inset)) < TOL:
+                        if box.y0 - TOL <= min(start[1], end[1]) + overrun <= box.y1 + TOL:
+                            votes[False] += 1
         if votes[True] and votes[False]:
             raise ReconstructionError(
-                f"part {part.box} has stile grooves on both axes - cannot tell "
+                f"part {part.box} has stile cuts on both axes - cannot tell "
                 f"its rotation"
             )
         part.rotated = votes[True] > 0
+
+
+def _slot_refs(parts, index_of, slots, cfg: PostConfig) -> list[FeatureRef]:
+    """One :class:`FeatureRef` per WDC slot, from its depth passes.
+
+    The emitter writes every configured depth pass of one slot back to back
+    on a single centreline, so the section reads as consecutive groups of
+    ``len(z_cuts)`` cuts.  Each group is matched against the geometry the
+    emitter would produce for some part and stile; anything else is a file
+    this post did not write, and is refused rather than guessed at.
+    """
+    if not slots:
+        return []
+    spec = cfg.wdc_slot
+    stride = len(spec.z_cuts)
+    if len(slots) % stride:
+        raise ReconstructionError(
+            f"the T17 section has {len(slots)} cuts, which is not a whole number "
+            f"of {stride}-pass slots"
+        )
+
+    refs: list[FeatureRef] = []
+    for base in range(0, len(slots), stride):
+        group = slots[base : base + stride]
+        for part in parts:
+            for index in (0, 1):
+                if all(
+                    _matches(
+                        wdc_slot_segment(
+                            part, index, spec, cfg.wdc_slot_reach(position)
+                        ),
+                        group[position],
+                    )
+                    for position in range(stride)
+                ):
+                    refs.append(
+                        FeatureRef(index_of[id(part)], "wdc_slot", index)
+                    )
+                    break
+            else:
+                continue
+            break
+        else:
+            raise ReconstructionError(
+                f"the T17 cuts starting {group[0][0]} -> {group[0][1]} do not match "
+                f"any part's stile slot (centreline "
+                f"{spec.inset_from_inside_edge:g} from the inside edge of a "
+                f"{spec.stile_width:g}\" stile, one pass per configured depth)"
+            )
+    return refs
+
+
+def _matches(want, got) -> bool:
+    return _same(want[0], got[0]) and _same(want[1], got[1])
 
 
 def _groove_ref(parts, index_of, start, end, cfg: PostConfig) -> FeatureRef:

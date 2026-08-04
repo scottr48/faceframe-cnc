@@ -35,6 +35,18 @@ A straight T13 groove, lines 26-28::
     Y31.0175 F490.        one axis moves; cut feed
     G0 Z2.5
 
+A T17 WDC stile slot is the same three lines at T17's own feeds, twice —
+once per depth pass, both on the one centreline (``RFK0101N.anc`` 21-28)::
+
+    G1 Z0.4062 F150.      first bite
+    Y37.3438 F400.
+    G0 Z2.5
+    X1.6614 Y0.5625 Z2.5  back to the start of the SAME centreline, but
+    Z2.                   0.0937 further out: the deeper pass's V is wider,
+    G1 Z0.3125 F150.      so its overrun past the part end is longer
+    Y37.4375 F400.
+    G0 Z2.5
+
 A closed profile loop (T11/T12), lines 112-120::
 
     G1 X15. Z0.15 F150.   ramp in: 2 units of travel per unit of Z
@@ -69,12 +81,20 @@ from .model import (
     SECTION_OPENINGS,
     SECTION_PANEL,
     SECTION_PERIMETER,
+    SECTION_WDC_SLOT,
     SheetProgram,
     ToolSpec,
+    WdcSlotSpec,
     default_config,
 )
 
-__all__ = ["generate", "fmt", "groove_segment", "default_entry_side"]
+__all__ = [
+    "generate",
+    "fmt",
+    "groove_segment",
+    "wdc_slot_segment",
+    "default_entry_side",
+]
 
 NEWLINE = "\r\n"
 
@@ -176,6 +196,37 @@ def groove_segment(part: PartProgram, index: int, panel: PanelSpec):
     return (x, stile_lines[0]), (x, stile_lines[1])
 
 
+def wdc_slot_segment(
+    part: PartProgram, index: int, spec: WdcSlotSpec, overrun: float
+):
+    """``((x0, y0), (x1, y1))`` for one T17 stile slot centreline of ``part``.
+
+    ``index`` 0 is the LOW-side stile and 1 the high-side one, in sheet
+    coordinates — the same low-then-high pair, and the same rotation
+    reasoning, as :func:`groove_segment`'s stile grooves (indices 0 and 2),
+    which is exactly the pair a WDC frame gives up to get this slot.  An
+    upright part's stiles are its left and right edges, so its slots run in
+    Y; a rotated part's run in X.
+
+    The centreline is measured from the stile's OUTSIDE edge here
+    (``stile_width - inset_from_inside_edge`` = 0.6614 for the measured
+    2"/34 mm pair) because that is the edge the part's own box gives us.
+
+    ``overrun`` is how far past each part end the tool CENTRE runs, which
+    the caller takes per pass from :meth:`~.model.PostConfig.wdc_slot_reach`:
+    a 45-degree V bit's effective radius is its depth of cut, so the deeper
+    pass overruns LESS than the shallower, wider one.  The segment always
+    runs low-to-high.
+    """
+    box = part.box
+    inset = spec.inset_from_outside_edge
+    if not part.rotated:
+        x = box.x0 + inset if index == 0 else box.x1 - inset
+        return (x, box.y0 - overrun), (x, box.y1 + overrun)
+    y = box.y0 + inset if index == 0 else box.y1 - inset
+    return (box.x0 - overrun, y), (box.x1 + overrun, y)
+
+
 class _Emitter:
     """Accumulates lines while tracking the modal machine position."""
 
@@ -243,6 +294,26 @@ class _Emitter:
         self.line(f"G1 Z{fmt(panel.z_cut)} F{fmt(panel.entry_feed)}")
         self.line(f"{self._axis_words(end[0], end[1])} F{fmt(panel.cut_feed)}")
         self.retract()
+
+    def slot(
+        self,
+        part: PartProgram,
+        index: int,
+        tool: ToolSpec,
+        spec: WdcSlotSpec,
+        first: bool,
+    ) -> None:
+        """Cut one WDC stile slot: every configured depth pass, in order,
+        on the one centreline."""
+        cfg = self.config
+        for position, z_cut in enumerate(spec.z_cuts):
+            start, end = wdc_slot_segment(
+                part, index, spec, cfg.wdc_slot_reach(position)
+            )
+            self.preposition(start[0], start[1], tool, first and position == 0)
+            self.line(f"G1 Z{fmt(z_cut)} F{fmt(spec.entry_feed)}")
+            self.line(f"{self._axis_words(end[0], end[1])} F{fmt(spec.cut_feed)}")
+            self.retract()
 
     def loop(
         self,
@@ -343,6 +414,10 @@ def _check_config(cfg: PostConfig, program: SheetProgram) -> None:
         ("panel groove", cfg.panel.z_cut),
         ("opening", cfg.openings_pass.z_cut),
         ("detail", cfg.detail_pass.z_cut),
+        *[
+            (f"WDC slot pass {i + 1}", z)
+            for i, z in enumerate(cfg.wdc_slot.z_cuts)
+        ],
         *[(f"perimeter pass {i + 1}", p.z_cut) for i, p in enumerate(cfg.perimeter_passes)],
     ]
     for what, z in depths:
@@ -354,6 +429,29 @@ def _check_config(cfg: PostConfig, program: SheetProgram) -> None:
     for what, z in (("ramp plane", cfg.approach_z), ("rapid plane", cfg.rapid_z)):
         if z > cfg.z_max + 1e-9:
             raise ValueError(f"the {what} Z{z} is above the Z{cfg.z_max} ceiling")
+
+    # The V-slot geometry everything downstream uses -- overrun, swept
+    # width, the optimizer's end clearance -- is the cone's "radius equals
+    # depth" rule, which stops being true once the bit is buried past its
+    # own shoulder.  Refuse rather than silently model a flat-bottomed cut.
+    if cfg.wdc_slot.overruns is not None and len(cfg.wdc_slot.overruns) != len(
+        cfg.wdc_slot.z_cuts
+    ):
+        raise ValueError(
+            f"the post table pins {len(cfg.wdc_slot.overruns)} WDC slot overrun(s) "
+            f"for {len(cfg.wdc_slot.z_cuts)} depth pass(es)"
+        )
+    v_tool = cfg.tools.get(SECTION_WDC_SLOT)
+    if v_tool is not None and cfg.wdc_slot.overruns is None:
+        for position, z_cut in enumerate(cfg.wdc_slot.z_cuts, start=1):
+            depth = cfg.stock_top_z - z_cut
+            if depth * cfg.wdc_slot.flank_slope > v_tool.radius - 1e-9:
+                raise ValueError(
+                    f"WDC slot pass {position} cuts {depth:g} deep, at or past the "
+                    f"{v_tool.radius:g} radius of the {v_tool.diameter:g} T"
+                    f"{v_tool.number} bit - the 45-degree cone model does not "
+                    f"describe that cut"
+                )
 
 
 def _require_cuttable(box: Box, what: str) -> None:
@@ -367,6 +465,8 @@ def _require_cuttable(box: Box, what: str) -> None:
 def _section_features(plan: CutPlan, section: str) -> list:
     if section == SECTION_PANEL:
         return plan.panel
+    if section == SECTION_WDC_SLOT:
+        return plan.wdc_slot
     if section == SECTION_OPENINGS:
         return plan.openings
     if section == SECTION_DETAIL:
@@ -416,6 +516,11 @@ def generate(
     sections = [s for s in plan.sections if _section_features(plan, s)]
     for position, section in enumerate(sections):
         last_section = position == len(sections) - 1
+        if section not in cfg.tools:
+            raise ValueError(
+                f"the plan has {section!r} cuts but the post table has no tool "
+                f"for that section"
+            )
         tool = cfg.tool(section)
         emitter.blank()
         emitter.line(tool.header_comment)
@@ -430,6 +535,16 @@ def generate(
                 if not 0 <= ref.index <= 3:
                     raise ValueError(f"groove index {ref.index} out of range 0..3")
                 emitter.groove(part, ref.index, ref.reverse, tool, cfg.panel, i == 0)
+
+        elif section == SECTION_WDC_SLOT:
+            for i, ref in enumerate(plan.wdc_slot):
+                part = part_of(ref, "wdc_slot")
+                if not 0 <= ref.index <= 1:
+                    raise ValueError(
+                        f"WDC slot index {ref.index} out of range 0..1 (a frame "
+                        f"has two stiles)"
+                    )
+                emitter.slot(part, ref.index, tool, cfg.wdc_slot, i == 0)
 
         elif section in (SECTION_OPENINGS, SECTION_DETAIL):
             spec = cfg.openings_pass if section == SECTION_OPENINGS else cfg.detail_pass

@@ -40,9 +40,34 @@ What is checked
                   for shallow ones: R710101N line 44-47 runs a T13 groove
                   0.375 past a part edge, which puts 0.235 of the 0.6299
                   tool body over the neighbour's stile at 0.20 depth.
+``v-slot``        the 45-degree T17 slot, judged on the cone it actually
+                  sweeps rather than on its centreline (see below).  V-bit
+                  moves are excluded from ``foreign-cut`` so that one rule
+                  owns them.
 ``geometry``      every cut happens at a Z the post knows (panel groove,
-                  opening, detail or a configured perimeter pass) and every
-                  closed loop closes.
+                  WDC slot pass, opening, detail or a configured perimeter
+                  pass) and every closed loop closes.
+
+The V-slot rule
+---------------
+A 45-degree V bit does not cut a slot as wide as the tool: it cuts a cone,
+so at depth ``d`` the material it removes is ``d`` wide either side of the
+centreline and the cut spreads ``d`` past each END of the commanded move.
+That makes the swept region of a slot pass the centreline dilated by ``d``
+— which for the deep pass reaches 0.875 past the part it belongs to, twice
+the ordinary trim overhang and nearly twice the part gap.
+
+This check re-derives that region from the text: it finds the moves made
+with the V bit (by the diameter the program itself declares), works out
+each one's depth of cut from the commanded Z, and rejects the file if the
+swept region touches the solid of any part other than the one the cut runs
+down the middle of, or leaves the sheet plus its 0.375 overhang.  The
+dilation is applied to the move's bounding box, which over-states the two
+rounded ends by a corner each — deliberately, since erring outward is the
+safe direction for a check whose job is to catch a cut nobody approved.
+
+Cuts that never reach the stock (a dry-run file) have no cone and are
+skipped, exactly as they are by ``foreign-cut``.
 """
 
 from __future__ import annotations
@@ -50,7 +75,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from .model import Box, PostConfig, default_config
+from .model import SECTION_WDC_SLOT, Box, PostConfig, default_config
 
 __all__ = ["Violation", "verify", "verify_file"]
 
@@ -155,6 +180,7 @@ def verify(text: str, config: PostConfig | None = None) -> list[Violation]:
     problems.extend(geometry_problems)
     problems.extend(_check_part_bounds(parts, cfg))
     problems.extend(_check_foreign_cuts(moves, parts, cfg))
+    problems.extend(_check_v_slot_cuts(moves, parts, cfg))
 
     problems.sort(key=lambda v: (v.line, v.code))
     return problems
@@ -499,6 +525,10 @@ def _recover_parts(
     """Rebuild part footprints and openings from the cut coordinates alone."""
     problems: list[Violation] = []
     known = {round(cfg.panel.z_cut, 9): ("panel", 0.0)}
+    # Straight cuts, like the panel groove: they carry no footprint to
+    # recover, and their own rule is _check_v_slot_cuts below.
+    for z_cut in cfg.wdc_slot.z_cuts:
+        known[round(z_cut, 9)] = ("panel", 0.0)
     known[round(cfg.openings_pass.z_cut, 9)] = ("opening", cfg.openings_pass.offset)
     known[round(cfg.detail_pass.z_cut, 9)] = ("opening", cfg.detail_pass.offset)
     for spec in cfg.perimeter_passes:
@@ -605,6 +635,8 @@ def _check_foreign_cuts(
             continue
         if min(move.z0, move.z1) >= cfg.stock_top_z - TOL:
             continue  # never enters the stock
+        if _v_bit_radius(move, cfg) is not None:
+            continue  # the cone rule owns these (see _check_v_slot_cuts)
         own = _owner_of(move, parts, cfg)
         through = min(move.z0, move.z1) <= through_z + TOL
         band = 0.0
@@ -633,6 +665,111 @@ def _check_foreign_cuts(
                 continue
             break
     return problems
+
+
+def _v_bit_radius(move: _Move, cfg: PostConfig) -> float | None:
+    """The V bit's own radius when ``move`` is being made with it, else None.
+
+    Identified by the diameter the PROGRAM declares for the tool it called,
+    which is the only thing in the text that says which cutter is in the
+    spindle.  No other tool in the post table shares 0.96.
+    """
+    tool = cfg.tools.get(SECTION_WDC_SLOT)
+    if tool is None:
+        return None
+    return tool.radius if abs(2.0 * move.radius - tool.diameter) <= TOL else None
+
+
+def _check_v_slot_cuts(
+    moves: list[_Move], parts: list[_RecoveredPart], cfg: PostConfig
+) -> list[Violation]:
+    """The 45-degree slot, judged on the cone it sweeps (module docstring)."""
+    problems: list[Violation] = []
+    solids = [(part, part.solids()) for part in parts]
+    low_x, low_y = -cfg.overhang, -cfg.overhang
+    high_x = cfg.sheet_width + cfg.overhang
+    high_y = cfg.sheet_length + cfg.overhang
+
+    for move in moves:
+        if move.rapid:
+            continue
+        tool_radius = _v_bit_radius(move, cfg)
+        if tool_radius is None:
+            continue
+        depth = cfg.stock_top_z - min(move.z0, move.z1)
+        if depth <= TOL:
+            continue  # above the stock: an air cut removes nothing
+        # 45 degrees per side, so the cut is as wide as it is deep - until
+        # the bit is buried to its shoulder, where it can get no wider.
+        reach = min(depth * cfg.wdc_slot.flank_slope, tool_radius)
+        centre = Box(
+            min(move.x0, move.x1),
+            min(move.y0, move.y1),
+            max(move.x0, move.x1),
+            max(move.y0, move.y1),
+        )
+        swept = centre.grow(reach)
+
+        if (
+            swept.x0 < low_x - TOL
+            or swept.y0 < low_y - TOL
+            or swept.x1 > high_x + TOL
+            or swept.y1 > high_y + TOL
+        ):
+            problems.append(
+                Violation(
+                    "v-slot",
+                    f"the 45-degree slot at Z{min(move.z0, move.z1)} cuts "
+                    f"{reach} wide either side of its path, sweeping "
+                    f"x[{swept.x0:.4f}, {swept.x1:.4f}] "
+                    f"y[{swept.y0:.4f}, {swept.y1:.4f}] - outside the "
+                    f"{cfg.sheet_width}x{cfg.sheet_length} sheet plus its "
+                    f"{cfg.overhang} overhang",
+                    move.line,
+                )
+            )
+            continue
+
+        own = _smallest_containing(parts, centre.mid_x, centre.mid_y)
+        for part, bands in solids:
+            if part is own:
+                continue
+            for solid in bands:
+                if solid.overlaps(swept, TOL):
+                    problems.append(
+                        Violation(
+                            "v-slot",
+                            f"the 45-degree slot at Z{min(move.z0, move.z1)} "
+                            f"sweeps x[{swept.x0:.4f}, {swept.x1:.4f}] "
+                            f"y[{swept.y0:.4f}, {swept.y1:.4f}] and cuts up to "
+                            f"{depth} deep into the part at {part.box}",
+                            move.line,
+                        )
+                    )
+                    break
+            else:
+                continue
+            break
+    return problems
+
+
+def _smallest_containing(parts: list[_RecoveredPart], x: float, y: float):
+    """The smallest recovered footprint holding ``(x, y)``, or None.
+
+    A slot runs down the middle of a stile, so the part it belongs to is
+    simply the part its midpoint is inside — no tolerance games with how far
+    the ends over-run.  Part footprints never overlap except when one is
+    nested in another's opening, which is what "smallest" settles.
+    """
+    best = None
+    for part in parts:
+        box = part.box
+        if box.x0 - TOL <= x <= box.x1 + TOL and box.y0 - TOL <= y <= box.y1 + TOL:
+            if best is None or (box.width * box.height) < (
+                best.box.width * best.box.height
+            ):
+                best = part
+    return best
 
 
 def _owner_of(move: _Move, parts: list[_RecoveredPart], cfg: PostConfig):

@@ -1,0 +1,136 @@
+"""Generate-NC dialog (spec section 5's Generate button).
+
+Thin, like every other widget here: it collects four choices and hands them
+to :meth:`faceframe_cnc.gui.session.Session.generate_nc`, which owns all the
+rules.  Nothing in this file decides whether a sheet may be cut.
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from typing import Optional
+
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QDialog,
+    QDialogButtonBox,
+    QFileDialog,
+    QFormLayout,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
+
+from .session import Session
+
+
+@dataclass(frozen=True)
+class GenerateChoices:
+    """What the user picked."""
+
+    output_dir: str
+    prefix: str
+    dry_run: bool
+    per_physical_sheet: bool
+
+
+class GenerateDialog(QDialog):
+    """Ask where the programs go, what to call them, and how to cut them."""
+
+    def __init__(self, session: Session, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setWindowTitle("Generate NC programs")
+        self.session = session
+
+        start = session.settings.last_output_dir or os.getcwd()
+        self.output_dir = QLineEdit(start)
+        browse = QPushButton("Browse...")
+        browse.clicked.connect(self._browse)
+        folder_row = QHBoxLayout()
+        folder_row.addWidget(self.output_dir, 1)
+        folder_row.addWidget(browse)
+        folder_widget = QWidget()
+        folder_widget.setLayout(folder_row)
+
+        self.prefix = QLineEdit(session.default_job_prefix())
+        self.prefix.setToolTip(
+            "Digits between the leading R and the two-digit sheet index: "
+            "prefix 7201 gives R720101N.anc, R720102N.anc, ..."
+        )
+        self.prefix.textChanged.connect(self._refresh_preview)
+
+        self.dry_run = QCheckBox(
+            "Dry run (air cut): lift every cut above the stock for a first article"
+        )
+        self.per_physical = QCheckBox(
+            "One file per physical sheet instead of one per unique sheet"
+        )
+
+        self.preview = QLabel()
+        self.preview.setStyleSheet("color:#54606b;")
+
+        form = QFormLayout()
+        form.addRow("Output folder", folder_widget)
+        form.addRow("Job prefix", self.prefix)
+        form.addRow(self.dry_run)
+        form.addRow(self.per_physical)
+        form.addRow("First file", self.preview)
+
+        note = QLabel(
+            "Every program is verified in memory before it is written. A sheet "
+            "that fails is reported and NOT written; the rest of the job still "
+            "goes out. WDC frames now get their 45-degree T17 stile slots, but "
+            "that slot cuts 0.875 in past each end of the stile, so a WDC frame "
+            "with a neighbour or a sheet edge closer than that is refused "
+            "rather than cut into the part next to it. A dry-run file is an air "
+            "cut only: it must never be treated as the production program."
+        )
+        note.setWordWrap(True)
+
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Generate")
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(note)
+        layout.addWidget(self.buttons)
+        self._refresh_preview()
+
+    # -- helpers ---------------------------------------------------------
+
+    def _browse(self) -> None:
+        folder = QFileDialog.getExistingDirectory(
+            self, "Where should the .anc programs go?", self.output_dir.text()
+        )
+        if folder:
+            self.output_dir.setText(folder)
+
+    def _refresh_preview(self) -> None:
+        from ..post.job import sheet_filename
+
+        text = self.prefix.text().strip()
+        if text.isdigit() and len(text) <= 8:
+            self.preview.setText(sheet_filename(text, 1))
+            ok = True
+        else:
+            self.preview.setText("the prefix must be 1-8 digits")
+            ok = False
+        button = self.buttons.button(QDialogButtonBox.StandardButton.Ok)
+        if button is not None:
+            button.setEnabled(ok)
+
+    def choices(self) -> GenerateChoices:
+        return GenerateChoices(
+            output_dir=self.output_dir.text().strip(),
+            prefix=self.prefix.text().strip(),
+            dry_run=self.dry_run.isChecked(),
+            per_physical_sheet=self.per_physical.isChecked(),
+        )

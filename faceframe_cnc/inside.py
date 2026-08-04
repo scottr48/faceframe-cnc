@@ -48,12 +48,18 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 
-from .geometry import compute_geometry
+from .geometry import (
+    WDC_SLOT_END_REACH,
+    FrameType,
+    compute_geometry,
+    infer_frame_type,
+)
 
 __all__ = [
     "DEFAULT_CLEARANCE",
     "UPRIGHT",
     "ROTATED",
+    "end_clearance_for",
     "InnerFit",
     "InsideAssignment",
     "host_openings",
@@ -65,8 +71,13 @@ __all__ = [
 ]
 
 #: Hard minimum clearance between an inner frame and the opening it sits in,
-#: on every side (spec 4b).  Equal to the sheet-level part gap; callers pass
-#: ``NestingConfig.part_gap`` so the two can never drift apart.
+#: on every side (spec 4b).  Callers pass ``NestingConfig.inner_clearance``,
+#: which is this same 0.375 by default but is a setting of its OWN since
+#: 2026-08-03: it used to alias ``NestingConfig.part_gap``, and when the
+#: owner raised the sheet-level gap to 0.455 the two had to part company.
+#: 0.375 is what ``reference/nc_files/R720101N.anc`` — the production file
+#: this project reproduces byte for byte — holds around both of its nested
+#: frames, so it is measured, not preferred.
 DEFAULT_CLEARANCE = 0.375
 
 #: Orientation labels used by :func:`eligibility_table`.
@@ -74,6 +85,25 @@ UPRIGHT = "upright"
 ROTATED = "rotated"
 
 _EPS = 1e-9
+
+
+def end_clearance_for(part_number: str, clearance: float = DEFAULT_CLEARANCE) -> float:
+    """Clearance a part needs beyond the two ENDS of its height axis.
+
+    :data:`DEFAULT_CLEARANCE` for every ordinary frame, but a WDC frame's
+    stiles take a 45-degree T17 slot whose cut spreads
+    :data:`~faceframe_cnc.geometry.WDC_SLOT_END_REACH` past each end of the
+    stile — into the host's rail, if the inner is nested and the rail is
+    closer than that.  A WDC is small enough to nest (18 x 36 fits W2742 and
+    W2442), so this is not hypothetical.
+
+    The stiles run along the frame's HEIGHT axis, so this applies to the
+    opening dimension that the inner's height ends up along — which
+    :func:`candidate_fits` works out per orientation.
+    """
+    if infer_frame_type(part_number) is FrameType.WDC:
+        return max(clearance, WDC_SLOT_END_REACH)
+    return clearance
 
 
 @dataclass(frozen=True)
@@ -161,19 +191,35 @@ def candidate_fits(
     inner_w: float,
     inner_h: float,
     clearance: float = DEFAULT_CLEARANCE,
+    inner_part_number: str | None = None,
 ) -> list[InnerFit]:
     """Every legal centred placement of an inner across ``openings``.
 
     The fit rule is the spec's, verbatim: ``inner + 2 * clearance`` must fit
     the opening on both axes.  Nothing here ever alters the inner's
     dimensions — rotation only swaps which one runs along the host's x axis.
+
+    ``inner_part_number``, when given, lets the rule be DIRECTIONAL: a WDC
+    inner needs :func:`end_clearance_for` beyond the two ends of its height
+    axis rather than the plain clearance, because its T17 stile slot cuts
+    that far past them.  Which host axis that lands on depends on the
+    orientation, which is why it is decided here and not by the caller.
     """
+    ends = (
+        clearance
+        if inner_part_number is None
+        else end_clearance_for(inner_part_number, clearance)
+    )
     fits: list[InnerFit] = []
     for index, opening in enumerate(openings):
         for local_w, local_h, rotated in _orientations(inner_w, inner_h):
-            if local_w + 2.0 * clearance > opening.width + _EPS:
+            # The inner's height axis - the one its stiles run along - lies
+            # along the host's x when the inner is turned 90 degrees.
+            need_x = ends if rotated else clearance
+            need_y = clearance if rotated else ends
+            if local_w + 2.0 * need_x > opening.width + _EPS:
                 continue
-            if local_h + 2.0 * clearance > opening.height + _EPS:
+            if local_h + 2.0 * need_y > opening.height + _EPS:
                 continue
             slack_x = (opening.width - local_w) / 2.0
             slack_y = (opening.height - local_h) / 2.0
@@ -213,11 +259,13 @@ def best_fit(
     inner_w: float,
     inner_h: float,
     clearance: float = DEFAULT_CLEARANCE,
+    inner_part_number: str | None = None,
 ) -> InnerFit | None:
     """Where an inner of ``inner_w x inner_h`` should sit inside a host frame.
 
     Returns ``None`` when it does not fit any of the host's openings in
-    either orientation.
+    either orientation.  Pass ``inner_part_number`` so a WDC inner is held
+    to its slot's end clearance (:func:`candidate_fits`).
     """
     return _pick(
         candidate_fits(
@@ -225,6 +273,7 @@ def best_fit(
             inner_w,
             inner_h,
             clearance,
+            inner_part_number,
         )
     )
 
@@ -236,6 +285,7 @@ def fitting_orientations(
     inner_w: float,
     inner_h: float,
     clearance: float = DEFAULT_CLEARANCE,
+    inner_part_number: str | None = None,
 ) -> tuple[str, ...]:
     """Orientation labels in which the inner fits the host, ``()`` if none.
 
@@ -243,7 +293,11 @@ def fitting_orientations(
     comparable in tests and stable in reports.
     """
     fits = candidate_fits(
-        host_openings(host_part_number, host_w, host_h), inner_w, inner_h, clearance
+        host_openings(host_part_number, host_w, host_h),
+        inner_w,
+        inner_h,
+        clearance,
+        inner_part_number,
     )
     found = {f.inner_rotated for f in fits}
     labels = []
@@ -271,7 +325,7 @@ def eligibility_table(
         row: dict[str, tuple[str, ...]] = {}
         for inner in sorted(by_name):
             i = by_name[inner]
-            fits = candidate_fits(openings, i.width, i.height, clearance)
+            fits = candidate_fits(openings, i.width, i.height, clearance, inner)
             found = {f.inner_rotated for f in fits}
             if not found:
                 continue
@@ -513,7 +567,9 @@ def assign_inners(
             if qty[inner] <= 0 or inner in blocked:
                 continue
             i = by_name[inner]
-            fit = _pick(candidate_fits(openings, i.width, i.height, clearance))
+            fit = _pick(
+                candidate_fits(openings, i.width, i.height, clearance, inner)
+            )
             if fit is None:
                 continue
             edges.append((inner, host, fit))

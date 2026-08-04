@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .generate_dialog import GenerateDialog
 from .order_panel import OrderPanel
 from .session import (
     AppSettings,
@@ -38,7 +39,9 @@ from .settings_dialog import SettingsDialog
 from .sheet_canvas import SheetCanvas
 from .summary_panel import SummaryPanel
 
-GENERATE_TOOLTIP = "NC generation arrives in Milestone 5"
+#: Shown when the Generate button is live.  The PDF report is Milestone 6;
+#: the button writes NC today.
+GENERATE_TOOLTIP = "Write one verified .anc program per sheet"
 
 
 class MainWindow(QMainWindow):
@@ -144,9 +147,10 @@ class MainWindow(QMainWindow):
         bar.addAction(self.settings_action)
 
         bar.addSeparator()
-        self.generate_button = QPushButton("Generate NC + PDF")
+        self.generate_button = QPushButton("Generate NC")
         self.generate_button.setEnabled(False)
         self.generate_button.setToolTip(GENERATE_TOOLTIP)
+        self.generate_button.clicked.connect(self.generate_nc)
         bar.addWidget(self.generate_button)
 
     # -- actions ---------------------------------------------------------
@@ -200,6 +204,59 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"{summary['total_sheets']} sheets, {summary['unique_sheets']} unique"
             + (f", {saved} saved by inside nesting" if saved is not None else "")
+        )
+
+    def generate_nc(self) -> None:
+        """Write one verified .anc per sheet (spec sections 5 and 6)."""
+        blocker = self.session.generate_blocker()
+        if blocker is not None:
+            QMessageBox.warning(self, "Cannot generate", blocker)
+            return
+        dialog = GenerateDialog(self.session, self)
+        if dialog.exec() != int(GenerateDialog.DialogCode.Accepted):
+            return
+        choices = dialog.choices()
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            job = self.session.generate_nc(
+                choices.output_dir,
+                prefix=choices.prefix,
+                dry_run=choices.dry_run,
+                per_physical_sheet=choices.per_physical_sheet,
+            )
+        except SessionError as exc:
+            QMessageBox.warning(self, "Cannot generate", str(exc))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        save_settings(self.session.settings, self.settings_path)
+        self._report_job(job)
+
+    def _report_job(self, job) -> None:
+        written = len(job.written)
+        refused = job.refused
+        head = f"{written} program{'' if written == 1 else 's'} written to {job.output_dir}"
+        if job.dry_run:
+            head += "\n\nDRY RUN: these are AIR CUTS, not production programs."
+        box = QMessageBox(self)
+        box.setWindowTitle("Generate NC")
+        box.setIcon(
+            QMessageBox.Icon.Warning if refused else QMessageBox.Icon.Information
+        )
+        if refused:
+            head += (
+                f"\n\n{len(refused)} sheet{'' if len(refused) == 1 else 's'} refused - "
+                f"nothing was written for those."
+            )
+        box.setText(head)
+        box.setDetailedText(job.summary())
+        box.exec()
+        self.statusBar().showMessage(
+            f"{written} NC program(s) written"
+            + (f", {len(refused)} sheet(s) refused" if refused else "")
+            + (" [dry run]" if job.dry_run else "")
         )
 
     def edit_settings(self) -> None:
@@ -304,6 +361,7 @@ class MainWindow(QMainWindow):
         self.prev_button.setEnabled(has_sheets)
         self.next_button.setEnabled(has_sheets)
         self.optimize_action.setEnabled(bool(self.session.included_rows()))
+        self.generate_button.setEnabled(self.session.can_generate())
         self.generate_button.setToolTip(GENERATE_TOOLTIP)
 
     # -- self test -------------------------------------------------------

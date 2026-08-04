@@ -23,13 +23,14 @@ Modules
 ``verifier``
     An INDEPENDENT re-parse of a finished program (shares no code with
     ``generator``) that gates bounds, Z limits, foreign-footprint
-    intrusion and header/footer integrity.
+    intrusion, the swept cone of the T17 V slot, and header/footer
+    integrity.
 ``from_layout``
     Turns an OPTIMIZER sheet (:class:`faceframe_cnc.nesting.SheetLayout`)
     into a ``SheetProgram`` + ``CutPlan``, implementing the 2026-08-03
-    onion-skin cutting order — and refusing sheets that hold a WDC frame,
-    whose 45-degree T17 stile slot has no tool table entry in any reference
-    file.
+    onion-skin cutting order and the T17 WDC stile slot — and refusing a
+    sheet where that slot's 45-degree cone would reach a neighbouring part
+    or run off the sheet.
 ``job``
     Writes a whole optimizer run out as one ``.anc`` per sheet, with the
     verifier gating every single write, plus the dry-run (air cut) mode.

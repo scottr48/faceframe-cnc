@@ -24,11 +24,59 @@ __all__ = [
     "FrameGeometry",
     "infer_frame_type",
     "compute_geometry",
+    "WDC_SLOT_INSET_FROM_INSIDE_EDGE",
+    "WDC_SLOT_DEPTH",
+    "WDC_SLOT_END_REACH",
+    "wdc_slot_axis_is_height",
 ]
 
 MEMBER = 1.5
 STILE_INSET = 1.5
 WDC_STILE_INSET = 2.0
+
+# --------------------------------------------------------------------------
+# The WDC 45-degree stile slot (2026-08-03 amendment)
+# --------------------------------------------------------------------------
+#
+# A WDC frame's 2" stiles do NOT take the standard T13 stile grooves; each
+# gets a straight 45-degree V groove down its length so the frame can meet a
+# diagonal-corner cabinet.  The three numbers below are the FRAME-side facts
+# — where the slot runs and how far its cut reaches past the part — and they
+# are what the optimizer needs to leave room for.  The machine-side table
+# (tool, feeds, the two depth passes) lives in
+# :class:`faceframe_cnc.post.model.WdcSlotSpec`, which derives the same reach
+# from its own numbers; ``tests/test_nc_job.py`` cross-checks the two, so the
+# optimizer cannot start reserving room for a slot the post no longer cuts.
+
+#: Centreline distance from the stile's INSIDE (opening-side) edge: 34 mm.
+#: The amendment's earlier 15/16" was a tape measurement and is superseded.
+WDC_SLOT_INSET_FROM_INSIDE_EDGE = 1.3386
+
+#: Total slot depth, 7/16".  Cut from the face-down back like the T13
+#: grooves, so the slot bottom sits at machine Z0.3125 in 3/4" stock.
+WDC_SLOT_DEPTH = 0.4375
+
+#: How far the cut reaches past each END of a WDC stile, at the surface.
+#:
+#: The bit is 45 degrees per side, so at depth ``d`` its cutting surface has
+#: radius ``d``.  The deepest pass runs its CENTRE ``d`` past the part end
+#: (the amendment's "overrun by the tool's effective radius at that pass's
+#: depth"), and the cone reaches a further ``d`` past that centre where it
+#: breaks the surface — so the swept material ends ``2 * d`` = 0.875" beyond
+#: the stile.  Anything within that of a WDC stile end gets carved, which is
+#: why WDC parts need directional clearance the ordinary ``part_gap`` does
+#: not give (see :class:`faceframe_cnc.nesting.NestingConfig`).
+WDC_SLOT_END_REACH = 2.0 * WDC_SLOT_DEPTH
+
+
+def wdc_slot_axis_is_height(rotated: bool) -> bool:
+    """True when a WDC's slots (and so their end reach) run along sheet Y.
+
+    The stiles run along the frame's HEIGHT axis, which the packer's 90
+    degree counter-clockwise rotation maps onto the sheet's X axis — so an
+    upright WDC reaches past its ends in Y and a rotated one in X.
+    """
+    return not rotated
 
 _TOP_DRAWER_HEIGHT = 5.0
 _MIDDLE_DRAWER_HEIGHT = 9.875

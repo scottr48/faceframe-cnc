@@ -62,8 +62,13 @@ class SettingsDialog(QDialog):
         form.addRow(self.inside_recursion)
 
         note = QLabel(
-            "The gap is a hard minimum between any two parts, and between a nested "
-            "frame and the opening it sits in. The edge cushion is a preference: "
+            "The gap is a hard minimum between any two parts on the sheet; the "
+            "default 0.455 in is what the shop's own programs use and the least "
+            "the NC post can cut without the perimeter lead-in reaching the next "
+            "part. A frame nested inside another frame's opening keeps its own "
+            "fixed 0.375 in clearance instead, and a WDC frame keeps 0.875 in "
+            "beyond each end of its stiles, where its 45-degree slot cuts past "
+            "the frame. The edge cushion is a preference: "
             "parts may reach the sheet edge when the packing needs it. The front "
             "edge margin is also a preference: when a sheet has vertical slack, "
             "parts start this far off the front edge (Y=0); any slack beyond "
@@ -93,4 +98,7 @@ class SettingsDialog(QDialog):
             inside_nesting=self.inside_nesting.isChecked(),
             inside_recursion=self.inside_recursion.isChecked(),
             last_order_path=self._settings.last_order_path,
+            # Not editable here, but must survive an edit of what is.
+            last_output_dir=self._settings.last_output_dir,
+            job_prefix=self._settings.job_prefix,
         )

@@ -2,9 +2,10 @@
 
 Covers spec sections 4a (footprint packing), 4b (frame-inside-frame) and 4c
 (sheet uniqueness): pack whole faceframe footprints (outside W x H) onto
-49 x 97 sheets, honouring the 0.375" edge-to-edge part gap, allowing 90
-degree rotation of every part, and grouping identical sheet pictures into
-runs.
+49 x 97 sheets, honouring the edge-to-edge part gap (0.455" by default —
+:attr:`NestingConfig.part_gap` says why it is not the spec's 0.375"),
+allowing 90 degree rotation of every part, and grouping identical sheet
+pictures into runs.
 
 Frame-inside-frame (spec 4b, the capability the shop's CAM lacks) is opt-in
 via ``NestingConfig.inside_nesting``; with it off, this module behaves
@@ -62,8 +63,14 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
-from .geometry import compute_geometry
-from .inside import assign_inners, best_fit
+from .geometry import (
+    WDC_SLOT_END_REACH,
+    FrameType,
+    compute_geometry,
+    infer_frame_type,
+    wdc_slot_axis_is_height,
+)
+from .inside import assign_inners, best_fit, end_clearance_for
 
 __all__ = [
     "EPS",
@@ -75,6 +82,8 @@ __all__ = [
     "NestingResult",
     "nest",
     "place_inner",
+    "slot_end_clearance",
+    "clearance_needs",
     "validate_layouts",
 ]
 
@@ -147,13 +156,19 @@ _STRATEGIES: tuple[_Strategy, ...] = tuple(
 #: returns promptly.
 _OPS_BUDGET = 40_000_000
 
-#: Grid resolutions tried when quantising widths for the knapsack.  Inch
-#: dimensions plus a 3/8" gap are exact at 8; the larger values cover odd
-#: user-entered sizes.  Anything not representable falls back to the largest
-#: scale with conservative rounding (item widths up, capacity down), which
-#: can only ever under-fill a shelf, never overfill it — at worst a row is
-#: judged 1/16" wider than it is.  Capping the grid at 16 keeps the DP small
-#: for orders with awkward fractional dimensions.
+#: Grid resolutions tried when quantising widths for the knapsack.  Frame
+#: dimensions in inches and half inches are exact at 8; the larger values
+#: cover odd user-entered sizes.  Anything not representable falls back to
+#: the largest scale with conservative rounding (item widths up, capacity
+#: down), which can only ever under-fill a shelf, never overfill it — at
+#: worst a row is judged 1/16" wider than it is.  Capping the grid at 16
+#: keeps the DP small for orders with awkward fractional dimensions.
+#:
+#: The PART GAP is deliberately not one of the values the grid has to
+#: represent (see :attr:`_Context.gap_units`): the production gap 0.455 is
+#: not a dyadic fraction, and asking the grid to carry it both drove every
+#: order to the coarsest scale and cost a whole unit of capacity per row —
+#: enough that a part exactly as wide as the sheet no longer fit on it.
 _SCALE_CANDIDATES = (1, 2, 4, 8, 16)
 
 
@@ -174,7 +189,28 @@ class NestingConfig:
     sheet_width: float = 49.0
     sheet_height: float = 97.0
     #: Minimum edge-to-edge distance between any two parts on a sheet.
-    part_gap: float = 0.375
+    #:
+    #: 0.455, not the spec's 0.375 (owner decision 2026-08-03).  Two
+    #: independent measurements say so: ``R710101N.anc`` — a program the shop
+    #: has run — spaces its own parts exactly 0.455 apart, and the post needs
+    #: it, because a perimeter lead-in stands 0.05 off a profile that is
+    #: already 0.1875 outside the part edge, so the 0.1875-radius tool sweeps
+    #: 0.425 past the edge.  At 0.375 the neighbouring part is inside that
+    #: sweep and the NC verifier refuses the sheet.  On the 7-21-26 order the
+    #: wider gap costs nothing: 47 sheets footprint-only and 40 with inside
+    #: nesting, the same as at 0.375.
+    part_gap: float = 0.455
+    #: Minimum clearance per side between a frame nested inside another
+    #: frame's opening and that opening (spec 4b).
+    #:
+    #: INDEPENDENT of :attr:`part_gap` since 2026-08-03.  It used to alias it,
+    #: on the reasoning that both are "how close may material get"; they are
+    #: not the same question.  ``part_gap`` is set by what the perimeter tool
+    #: sweeps outside a part (above), while 0.375 here is the clearance
+    #: ``R720101N.anc`` actually holds around both of its nested frames — the
+    #: file this post reproduces byte for byte — so raising the sheet gap must
+    #: not tighten or loosen the nest.
+    inner_clearance: float = 0.375
     #: SOFT preference: keep parts this far from the sheet edges when the
     #: packing allows it.  Parts may go all the way to the edge when they
     #: must; edge contact is scored as a last resort, never as an error.
@@ -205,16 +241,6 @@ class NestingConfig:
     @property
     def sheet_area(self) -> float:
         return self.sheet_width * self.sheet_height
-
-    @property
-    def inner_clearance(self) -> float:
-        """Required clearance per side between an inner and its opening.
-
-        Spec 4b's ``inner + 0.75 <= opening`` is the same 0.375" the parts
-        keep from each other on the sheet, so the two follow one setting and
-        can never drift apart.
-        """
-        return self.part_gap
 
 
 @dataclass(frozen=True)
@@ -265,6 +291,78 @@ class Placement:
     @property
     def area(self) -> float:
         return self.width * self.height
+
+
+# --------------------------------------------------------------------------
+# Directional clearance: the WDC 45-degree stile slot (2026-08-03)
+# --------------------------------------------------------------------------
+#
+# Every other rule in this module is isotropic — ``part_gap`` in all four
+# directions — because every other cut this shop makes stays inside the trim
+# margin.  The T17 slot does not: it is a 45-degree V groove down each 2"
+# stile, and a 45-degree bit cutting 0.4375 deep removes material 0.4375
+# either side of its path.  The pass runs its centre 0.4375 past the end of
+# the stile and the cone reaches 0.4375 further, so a WDC frame CUTS the
+# 0.875 beyond each of its two stile ends.
+#
+# That direction is the frame's HEIGHT axis (stiles are the vertical
+# members), which the packer's 90-degree rotation maps onto the sheet's X
+# axis.  A neighbour or a sheet edge inside that reach gets carved up to
+# 0.42 deep; the owner has not approved marking a finished frame, so the
+# room is reserved rather than the damage accepted.
+
+
+def slot_end_clearance(part_number: str, config: "NestingConfig") -> float:
+    """Clearance a part needs beyond each END of its height axis.
+
+    ``part_gap`` for everything the shop cuts except a WDC frame, which
+    needs the full reach of its T17 slot.  Accepts the packer's synthetic
+    ``HOST\\x1fINNER`` names: it is the HOST whose stiles are on the sheet.
+    """
+    host = part_number.split(_SYNTHETIC_SEP)[0]
+    if infer_frame_type(host) is FrameType.WDC:
+        return max(config.part_gap, WDC_SLOT_END_REACH)
+    return config.part_gap
+
+
+def clearance_needs(
+    placement: "Placement", config: "NestingConfig"
+) -> tuple[float, float]:
+    """``(x, y)`` clearance this PLACED part demands from other material.
+
+    Both are ``part_gap`` unless the part is a WDC, in which case the axis
+    its stiles run along carries the slot's reach instead.
+    """
+    ends = slot_end_clearance(placement.part_number, config)
+    if ends <= config.part_gap:
+        return config.part_gap, config.part_gap
+    if wdc_slot_axis_is_height(placement.rotated):
+        return config.part_gap, ends
+    return ends, config.part_gap
+
+
+def _pack_dims(spec: "PartSpec", config: "NestingConfig") -> tuple[float, float]:
+    """The rectangle the PACKER reserves for a part, as ordered.
+
+    For everything but a WDC this is the footprint itself.  A WDC's is its
+    footprint grown by the slot's full reach at both ends of its height
+    axis, and the real part is then centred in that rectangle
+    (``_build_sheet``).  Reserving the whole reach — rather than only the
+    part of it the ordinary ``part_gap`` does not already cover — is what
+    makes the SHEET EDGE safe as well as the neighbours: the padded
+    rectangle is what has to fit on the sheet, so a WDC stile end is never
+    closer than 0.875 to the edge, and never closer than 0.875 + part_gap
+    to another part.  It costs one sheet in 41 on the 7-21-26 order.
+    """
+    pad = slot_end_clearance(spec.part_number, config) - config.part_gap
+    if pad <= 0.0:
+        return spec.width, spec.height
+    return spec.width, spec.height + 2.0 * pad
+
+
+def _pack_pad(part_number: str, config: "NestingConfig") -> float:
+    """How much :func:`_pack_dims` added at EACH end of the height axis."""
+    return max(0.0, slot_end_clearance(part_number, config) - config.part_gap)
 
 
 def _fmt(value: float) -> str:
@@ -499,6 +597,10 @@ def _check_config(config: NestingConfig) -> None:
         problems.append(f"sheet_height must be positive and finite, got {config.sheet_height!r}")
     if not (math.isfinite(config.part_gap) and config.part_gap >= 0):
         problems.append(f"part_gap must be >= 0 and finite, got {config.part_gap!r}")
+    if not (math.isfinite(config.inner_clearance) and config.inner_clearance >= 0):
+        problems.append(
+            f"inner_clearance must be >= 0 and finite, got {config.inner_clearance!r}"
+        )
     if not (math.isfinite(config.edge_cushion) and config.edge_cushion >= 0):
         problems.append(f"edge_cushion must be >= 0 and finite, got {config.edge_cushion!r}")
     if not (math.isfinite(config.front_margin) and config.front_margin >= 0):
@@ -535,13 +637,24 @@ def _normalize_demand(parts, config: NestingConfig) -> list[PartSpec]:
 
     sw, sh = config.sheet_width, config.sheet_height
     for spec in demand:
-        upright = spec.width <= sw + EPS and spec.height <= sh + EPS
-        turned = spec.height <= sw + EPS and spec.width <= sh + EPS
+        # A WDC has to fit with the room its slot cuts, not just with its
+        # footprint, or the packer would place a part the post must refuse.
+        pw, ph = _pack_dims(spec, config)
+        upright = pw <= sw + EPS and ph <= sh + EPS
+        turned = ph <= sw + EPS and pw <= sh + EPS
         if not (upright or turned):
+            reserved = (
+                ""
+                if (pw, ph) == (spec.width, spec.height)
+                else (
+                    f" (its T17 stile slot reserves {pw:g}x{ph:g} — see "
+                    f"NestingConfig.part_gap)"
+                )
+            )
             raise NestingError(
                 f"{spec.part_number}: {spec.width}x{spec.height} does not fit on a "
                 f"{sw}x{sh} sheet in either orientation "
-                f"(rotated it would be {spec.height}x{spec.width}); "
+                f"(rotated it would be {spec.height}x{spec.width}){reserved}; "
                 f"the part cannot be nested and dimensions must never be altered"
             )
     return demand
@@ -594,14 +707,33 @@ class _Context:
         self.specs = {s.part_number: s for s in demand}
         self.part_numbers = sorted(self.specs)
 
+        #: What the packer reserves per part type, as ordered: the footprint
+        #: for everything but a WDC, whose T17 stile slot needs room past
+        #: its ends (see ``_pack_dims``).  EVERY packing decision below —
+        #: shelf heights, knapsack widths, solo costs — uses these; the real
+        #: footprint reappears only when a Placement is emitted.
+        self.pack_dims = {s.part_number: _pack_dims(s, config) for s in demand}
+        self.pack_pad = {
+            s.part_number: _pack_pad(s.part_number, config) for s in demand
+        }
+
         dims = []
-        for s in demand:
-            dims.extend((s.width, s.height))
-        self.scale = _pick_scale(dims + [config.part_gap, config.sheet_width])
+        for pw, ph in self.pack_dims.values():
+            dims.extend((pw, ph))
+        self.scale = _pick_scale(dims + [config.sheet_width])
 
         # Conservative quantisation: capacity rounded down, item widths up.
-        self.capacity = math.floor(
-            (config.sheet_width + config.part_gap) * self.scale + 1e-9
+        # A row of n parts occupies ``sum(w) + gap * (n - 1)``, modelled as
+        # ``sum(w + gap) <= sheet_width + gap``, so the gap is carried once
+        # per item and once in the capacity.  It gets its own rounding — UP
+        # onto the grid, i.e. the row is asked for slightly MORE space than
+        # it needs — because the production gap (0.455) is not a dyadic
+        # fraction: quantising ``w + gap`` as one number would spend the
+        # rounding allowance of every single item on the gap's remainder and
+        # leave a full-sheet-width part unable to fit its own sheet.
+        self.gap_units = math.ceil(config.part_gap * self.scale - 1e-9)
+        self.capacity = (
+            math.floor(config.sheet_width * self.scale + 1e-9) + self.gap_units
         )
         # Distinct candidate shelf heights, tallest first (deterministic).
         self.height_candidates = sorted({d for d in dims}, reverse=True)
@@ -611,7 +743,8 @@ class _Context:
         self.dp_ops = 0
 
         self.solo_cost = {
-            s.part_number: _solo_cost(s.width, s.height, config) for s in demand
+            s.part_number: _solo_cost(*self.pack_dims[s.part_number], config)
+            for s in demand
         }
         self.solo_units = {
             pn: int(round(c * _SOLO_SCALE)) for pn, c in self.solo_cost.items()
@@ -633,7 +766,7 @@ class _Context:
         )
 
     def width_units(self, placed_width: float) -> int:
-        return math.ceil((placed_width + self.config.part_gap) * self.scale - 1e-9)
+        return math.ceil(placed_width * self.scale - 1e-9) + self.gap_units
 
 
 def _orient_for_shelf(width: float, height: float, shelf_h: float):
@@ -705,7 +838,11 @@ def _best_shelf(ctx: _Context, avail: dict[str, int], shelf_h: float, seed: str 
 
     Returns ``(actual_height, row_width, area, items, saving)`` where
     ``items`` is a deterministic left-to-right list of
-    ``(part_number, w, h, rotated)``, or ``None`` when nothing fits.
+    ``(part_number, w, h, rotated)``, or ``None`` when nothing fits.  The
+    ``w``/``h`` carried in ``items`` are the RESERVED rectangle
+    (``_Context.pack_dims``), so a WDC's slot room is spent here and given
+    back when the placement is emitted; ``area`` is the real footprint area,
+    since padding is a cost, not value.
     """
     cfg = ctx.config
     capacity = ctx.capacity
@@ -713,8 +850,7 @@ def _best_shelf(ctx: _Context, avail: dict[str, int], shelf_h: float, seed: str 
     if seed is not None:
         if avail.get(seed, 0) <= 0:
             return None
-        spec = ctx.specs[seed]
-        oriented = _orient_for_shelf(spec.width, spec.height, shelf_h)
+        oriented = _orient_for_shelf(*ctx.pack_dims[seed], shelf_h)
         if oriented is None:
             return None
         pw, ph, rotated = oriented
@@ -732,8 +868,7 @@ def _best_shelf(ctx: _Context, avail: dict[str, int], shelf_h: float, seed: str 
             n -= 1
         if n <= 0:
             continue
-        spec = ctx.specs[pn]
-        oriented = _orient_for_shelf(spec.width, spec.height, shelf_h)
+        oriented = _orient_for_shelf(*ctx.pack_dims[pn], shelf_h)
         if oriented is None:
             continue
         pw, ph, rotated = oriented
@@ -745,8 +880,9 @@ def _best_shelf(ctx: _Context, avail: dict[str, int], shelf_h: float, seed: str 
         n_eff = min(n, capacity // wu)
         if n_eff <= 0:
             continue
+        spec = ctx.specs[pn]
         value = (
-            _area_units(pw, ph) * _AREA_WEIGHT
+            _area_units(spec.width, spec.height) * _AREA_WEIGHT
             + ctx.solo_units[pn] * _SOLO_WEIGHT
             + min(n, _ABUNDANCE_CAP)
         )
@@ -777,7 +913,7 @@ def _best_shelf(ctx: _Context, avail: dict[str, int], shelf_h: float, seed: str 
     items.sort(key=lambda it: (-it[2], -it[1], it[0], it[3]))
     actual_h = max(it[2] for it in items)
     row_width = sum(it[1] for it in items) + cfg.part_gap * (len(items) - 1)
-    area = sum(it[1] * it[2] for it in items)
+    area = sum(ctx.specs[it[0]].area for it in items)
     # Sheet length this row saves versus nesting its parts on their own.
     saving = sum(ctx.solo_cost[it[0]] for it in items) - (actual_h + cfg.part_gap)
     result = (actual_h, row_width, area, items, saving)
@@ -877,13 +1013,19 @@ def _build_sheet(
         slack_h = cfg.sheet_width - row_width
         x = min(cfg.edge_cushion, max(0.0, slack_h) / 2.0)
         for pn, pw, ph, rotated in items:
+            # ``pw``/``ph`` are the RESERVED rectangle.  The real footprint
+            # sits centred in it, which for a WDC leaves the slot's reach
+            # free at both ends of its stiles and nowhere else.
+            pad = ctx.pack_pad[pn]
+            dx = pad if (pad and rotated) else 0.0
+            dy = pad if (pad and not rotated) else 0.0
             layout.placements.append(
                 Placement(
                     part_number=pn,
-                    x=round(x, 9),
-                    y=round(y, 9),
-                    width=pw,
-                    height=ph,
+                    x=round(x + dx, 9),
+                    y=round(y + dy, 9),
+                    width=pw - 2.0 * dx,
+                    height=ph - 2.0 * dy,
                     rotated=rotated,
                 )
             )
@@ -1038,7 +1180,12 @@ def place_inner(
     """Centre ``inner_spec`` in one of ``host``'s openings, in sheet coords.
 
     Returns ``None`` when the inner does not fit any of the host's openings
-    with the required clearance, so a GUI drag can reject the drop.
+    with the required clearance, so a GUI drag can reject the drop.  "The
+    required clearance" is ``inner_clearance`` on three sides and, for a WDC
+    inner, the reach of its T17 stile slot beyond the two ends of its
+    stiles (:func:`faceframe_cnc.inside.end_clearance_for`) — a WDC nests
+    inside W2742 and W2442, where the host's rail is what the slot would
+    otherwise cut into.
 
     The host's own openings come from the geometry engine in frame-local
     coordinates; this maps them onto the sheet.  Rotation convention (used
@@ -1055,6 +1202,7 @@ def place_inner(
         inner_spec.width,
         inner_spec.height,
         config.inner_clearance,
+        inner_spec.part_number,
     )
     if fit is None:
         return None
@@ -1360,8 +1508,20 @@ def _check_containment(
     ordered: dict[str, PartSpec],
     config: NestingConfig,
 ) -> list[str]:
-    """Child footprint + clearance must lie wholly inside ONE parent opening."""
+    """Child footprint + clearance must lie wholly inside ONE parent opening.
+
+    The clearance is ``inner_clearance`` on every side except the two ends
+    of a WDC child's stiles, which need the reach of its T17 slot: the cut
+    runs past the frame, and what is past the frame here is the host's own
+    rail.
+    """
     clearance = config.inner_clearance
+    ends = end_clearance_for(child.part_number, clearance)
+    if wdc_slot_axis_is_height(child.rotated):
+        need_x, need_y = clearance, ends
+    else:
+        need_x, need_y = ends, clearance
+
     rects, error = _sheet_openings(parent, ordered)
     if error is not None:
         return [
@@ -1369,10 +1529,10 @@ def _check_containment(
             f"{parent.part_number} but {error}"
         ]
 
-    need_x0 = child.x - clearance
-    need_y0 = child.y - clearance
-    need_x1 = child.x + child.width + clearance
-    need_y1 = child.y + child.height + clearance
+    need_x0 = child.x - need_x
+    need_y0 = child.y - need_y
+    need_x1 = child.x + child.width + need_x
+    need_y1 = child.y + child.height + need_y
 
     best_shortfall = None
     for ox, oy, ow, oh in rects:
@@ -1387,11 +1547,19 @@ def _check_containment(
         if best_shortfall is None or shortfall < best_shortfall:
             best_shortfall = shortfall
 
+    wanted = (
+        f"{clearance} clearance"
+        if ends <= clearance
+        else (
+            f"{clearance} clearance, and {ends} beyond its stile ends for the "
+            f"T17 slot"
+        )
+    )
     return [
         f"sheet {sheet}: {child.part_number} @({child.x:.4f},{child.y:.4f}) "
         f"{child.width:.4f}x{child.height:.4f} does not fit inside any single "
         f"opening of {parent.part_number} @({parent.x:.4f},{parent.y:.4f}) with "
-        f"{clearance} clearance — closest opening is short by "
+        f"{wanted} — closest opening is short by "
         f"{best_shortfall:.4f}"
     ]
 
@@ -1412,8 +1580,10 @@ def validate_layouts(result: NestingResult, config: NestingConfig) -> list[str]:
 
     Frame-inside-frame adds (spec 4b):
 
-    *   every child's footprint plus ``part_gap`` on all four sides must lie
-        wholly within ONE opening of its parent.  The openings are recomputed
+    *   every child's footprint plus ``inner_clearance`` on all four sides
+        must lie wholly within ONE opening of its parent — its own setting
+        since 2026-08-03, no longer an alias of ``part_gap``.  The openings
+        are recomputed
         from :func:`~faceframe_cnc.geometry.compute_geometry` using the
         parent's part number and ORDERED dimensions and then transformed by
         the parent's own placement — nothing the packer recorded about the
@@ -1426,15 +1596,20 @@ def validate_layouts(result: NestingResult, config: NestingConfig) -> list[str]:
         opening are checked, while a child is not reported for "overlapping"
         the host it is by definition inside.
 
-    The soft edge cushion is a preference, not a rule, so a part sitting on
-    the sheet edge is never reported here.
+    The WDC 45-degree stile slot adds one DIRECTIONAL rule (2026-08-03), on
+    top of and independent of everything the packer does to satisfy it:
+    beyond the two ends of a WDC frame's stiles, both the gap to any other
+    part and the distance to the sheet edge must clear the slot's full
+    reach, :func:`slot_end_clearance`.  Everywhere else a WDC is an ordinary
+    part.  This is the one place a HARD rule applies to the sheet edge — the
+    edge cushion is a preference, so a part sitting on the sheet edge is
+    never otherwise reported here.
     """
     problems: list[str] = []
 
     sw = config.sheet_width
     sh = config.sheet_height
     gap = config.part_gap
-    half = gap / 2.0
 
     if not (math.isfinite(sw) and sw > 0) or not (math.isfinite(sh) and sh > 0):
         return [f"invalid sheet size {sw}x{sh}"]
@@ -1500,6 +1675,23 @@ def validate_layouts(result: NestingResult, config: NestingConfig) -> list[str]:
                     f"on a {sw}x{sh} sheet"
                 )
 
+            # A WDC's slot cuts past its stile ends, so those ends need
+            # room against the SHEET EDGE too - the only hard edge rule.
+            ends = slot_end_clearance(p.part_number, config)
+            if ends > gap:
+                if wdc_slot_axis_is_height(p.rotated):
+                    low, high, limit, axis = p.y, p.y + p.height, sh, "y"
+                else:
+                    low, high, limit, axis = p.x, p.x + p.width, sw, "x"
+                if low < ends - EPS or high > limit - ends + EPS:
+                    problems.append(
+                        f"sheet {i}: {p.part_number} @({p.x:.4f},{p.y:.4f}) has its "
+                        f"stile ends at {axis}[{low:.4f}, {high:.4f}], within "
+                        f"{ends} of the edge of the {sw}x{sh} sheet — its 45-degree "
+                        f"T17 slot cuts that far past each end, so the cut would "
+                        f"run off the sheet"
+                    )
+
             spec = ordered.get(p.part_number)
             if spec is not None:
                 same = (
@@ -1528,20 +1720,28 @@ def validate_layouts(result: NestingResult, config: NestingConfig) -> list[str]:
                     # containment check below is what polices that pair.
                     continue
                 b = nodes[b_idx][0]
-                overlap_x = min(a.x + a.width + half, b.x + b.width + half) - max(
-                    a.x - half, b.x - half
-                )
-                overlap_y = min(a.y + a.height + half, b.y + b.height + half) - max(
-                    a.y - half, b.y - half
-                )
-                if overlap_x > EPS and overlap_y > EPS:
-                    clear_x = max(a.x, b.x) - min(a.x + a.width, b.x + b.width)
-                    clear_y = max(a.y, b.y) - min(a.y + a.height, b.y + b.height)
-                    clearance = max(clear_x, clear_y)
-                    if clearance < 0:
+                # Two parts are far enough apart when EITHER axis separates
+                # them by what that axis demands.  The demand is normally
+                # part_gap both ways; a WDC raises it along the axis its
+                # stiles - and so its slot - run.
+                a_need = clearance_needs(a, config)
+                b_need = clearance_needs(b, config)
+                need_x = max(a_need[0], b_need[0])
+                need_y = max(a_need[1], b_need[1])
+                clear_x = max(a.x, b.x) - min(a.x + a.width, b.x + b.width)
+                clear_y = max(a.y, b.y) - min(a.y + a.height, b.y + b.height)
+                if clear_x < need_x - EPS and clear_y < need_y - EPS:
+                    if max(clear_x, clear_y) < 0:
                         detail = "footprints overlap"
+                    elif clear_x >= clear_y:
+                        detail = f"clearance {clear_x:.4f} < required {need_x:g} in x"
                     else:
-                        detail = f"clearance {clearance:.4f} < required {gap}"
+                        detail = f"clearance {clear_y:.4f} < required {need_y:g} in y"
+                    if max(need_x, need_y) > gap:
+                        detail += (
+                            " (a WDC frame's 45-degree stile slot cuts past its "
+                            "stile ends)"
+                        )
                     problems.append(
                         f"sheet {i}: gap violation between {a.part_number} "
                         f"@({a.x:.4f},{a.y:.4f}) and {b.part_number} "

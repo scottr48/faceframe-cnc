@@ -400,12 +400,43 @@ prevent:
   T17 REFERENCE NOW AVAILABLE: `reference/nc_files/RFK0101N.anc` (owner-
   supplied 2026-08-03) contains a production T17 section — tool comment
   "(ROUTE TOOL #17: T17 45 VTIP 158-562SC.026-1W-A)", DIAMETER 0.96,
-  S16000, straight plunge F150, cut F400, multi-pass technique stepping
-  down a 45° line (equal ΔY/ΔZ per pass, shallowest first), 0.125 overrun
-  past the part ends. The WDC slot is designed with that grammar at the
-  owner's measurements (7/16 deep, 15/16 from the stile's inside edge,
-  full stile length). Until the slot's tilt direction is confirmed by the
-  owner, NC generation still refuses WDC sheets.
+  S16000, straight plunge F150, cut F400. The WDC slot (owner-confirmed):
+  a STRAIGHT V-groove — no tilt, 3-axis machine, the 45° is the bit's own
+  flanks — run along the centerline **34 mm (1.3386") from the stile's
+  INSIDE edge** (supersedes the earlier 15/16" tape measurement), to
+  **7/16" total depth** (Z0.3125), full stile length, **overrunning each
+  part end by the tool's effective radius at that pass's depth** (45° per
+  side ⇒ radius = depth; 0.4375" per end at full depth). Cut in two depth
+  passes on the same centerline (Z0.4062 then Z0.3125) so no single bite
+  exceeds the deepest demonstrated in RFK0101N. WDC rails get the
+  standard T13 rail routing; WDC stiles get NO T13 groove.
+  **Section order (owner-confirmed): the T13 and T17 groove routing runs
+  FIRST**, before any opening or perimeter cutting — generated sheets use
+  T13 → T17 (when WDC present) → T11 openings → T12 detail → T11
+  perimeter passes. This matches the references (T13 leads every modern
+  frame file; T17 leads RFK0101N).
+
+- **2026-08-03 — part spacing (owner-approved)**: the edge-to-edge gap
+  between parts is **0.455"**, not §4a's 0.375". Measured two ways: the
+  shop's own R710101N.anc spaces its parts exactly 0.455 apart, and the
+  post needs it — a perimeter lead-in ramp stands 0.05 off a profile that
+  is already 0.1875 outside the part edge, so the 0.1875-radius tool sweeps
+  0.425 past the edge and 0.375 physically cannot be verified. The
+  **frame-inside-frame clearance stays 0.375"** (§4b, proven by
+  R720101N.anc) and is now a setting of its own (`inner_clearance`) rather
+  than an alias of the part gap.
+
+- **2026-08-03 — WDC end clearance (architect's decision, owner informed)**:
+  the T17 slot's deep pass is as wide as it is deep, so the material it
+  removes ends **0.875" (2 × 0.4375) past each end of the stile** — the
+  0.4375 centre overrun plus the cone's own half width where it breaks the
+  surface. At the 0.455 part gap that would carve up to ~0.42" deep into a
+  neighbouring frame, which the owner has NOT approved. Therefore a WDC
+  frame reserves the full 0.875" beyond both stile ends (the part's HEIGHT
+  axis before rotation) against neighbours AND against the sheet edge, in
+  the packer, in `validate_layouts`, in the NC planner and in the NC
+  verifier's swept-cone check. Cost on the 7-21-26 order: 40 → 41 sheets
+  with inside nesting, 47 → 49 without.
 
 - **2026-08-03 — NC perimeter cutting order (onion skin)**: part perimeters
   are cut in TWO depth passes. Pass 1 takes EVERY part's perimeter down to

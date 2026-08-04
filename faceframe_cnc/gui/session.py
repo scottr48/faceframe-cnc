@@ -54,6 +54,7 @@ from ..nesting import (
     PartSpec,
     Placement,
     SheetLayout,
+    clearance_needs,
     nest,
     place_inner,
     validate_layouts,
@@ -105,7 +106,15 @@ class AppSettings:
 
     sheet_width: float = 49.0
     sheet_height: float = 97.0
-    part_gap: float = 0.375
+    #: 0.455 (owner decision 2026-08-03), matching
+    #: ``NestingConfig.part_gap``: it is the spacing the shop's own
+    #: R710101N.anc uses and the least the NC post can cut without the
+    #: perimeter lead-in sweeping into the neighbouring part.  A saved
+    #: settings file still wins — whatever the user persisted is honoured.
+    #: The frame-inside-frame clearance is deliberately NOT this setting and
+    #: is not exposed here: it stays at the 0.375 proven by R720101N (see
+    #: ``NestingConfig.inner_clearance``).
+    part_gap: float = 0.455
     edge_cushion: float = 0.5
     #: Spec 4a amendment (2026-08-03): soft front-edge target — see
     #: ``NestingConfig.front_margin``.
@@ -115,6 +124,14 @@ class AppSettings:
     #: default; when off the validator rejects hand-built depth-2 nests.
     inside_recursion: bool = False
     last_order_path: Optional[str] = None
+    #: Milestone 5: where the last NC job was written, and the digit prefix
+    #: it used (the file name is ``R<prefix><sheet index>N.anc``, spec
+    #: section 6).  Empty prefix means "offer a date-derived one".  The
+    #: dry-run and one-file-per-physical-sheet toggles are deliberately NOT
+    #: persisted: a dry run silently left on from yesterday would send an
+    #: operator to the machine with an air cut.
+    last_output_dir: Optional[str] = None
+    job_prefix: str = ""
 
     def to_config(self) -> NestingConfig:
         """The optimizer config this app runs with.
@@ -143,6 +160,8 @@ class AppSettings:
             "inside_nesting": bool(self.inside_nesting),
             "inside_recursion": bool(self.inside_recursion),
             "last_order_path": self.last_order_path,
+            "last_output_dir": self.last_output_dir,
+            "job_prefix": str(self.job_prefix or ""),
         }
 
     @classmethod
@@ -172,6 +191,8 @@ class AppSettings:
             return bool(value) if isinstance(value, (bool, int)) else bool(getattr(defaults, key))
 
         path = data.get("last_order_path")
+        out_dir = data.get("last_output_dir")
+        prefix = data.get("job_prefix")
         return cls(
             sheet_width=number("sheet_width", 1e-6),
             sheet_height=number("sheet_height", 1e-6),
@@ -181,6 +202,8 @@ class AppSettings:
             inside_nesting=flag("inside_nesting"),
             inside_recursion=flag("inside_recursion"),
             last_order_path=path if isinstance(path, str) and path else None,
+            last_output_dir=out_dir if isinstance(out_dir, str) and out_dir else None,
+            job_prefix=prefix if isinstance(prefix, str) and prefix.isdigit() else "",
         )
 
     def validate(self) -> list[str]:
@@ -521,11 +544,27 @@ def _rotate_about(placement: Placement, cx: float, cy: float) -> None:
         _rotate_about(child, cx, cy)
 
 
-def _conflicts(a: Placement, bx: float, by: float, bw: float, bh: float, gap: float) -> bool:
-    half = gap / 2.0
-    overlap_x = min(a.x + a.width + half, bx + bw + half) - max(a.x - half, bx - half)
-    overlap_y = min(a.y + a.height + half, by + bh + half) - max(a.y - half, by - half)
-    return overlap_x > EPS and overlap_y > EPS
+def _conflicts(
+    a: Placement,
+    bx: float,
+    by: float,
+    bw: float,
+    bh: float,
+    gap: float,
+    need: tuple[float, float] | None = None,
+) -> bool:
+    """True when a ``bw x bh`` part at ``(bx, by)`` would crowd ``a``.
+
+    ``need`` is the ``(x, y)`` clearance the MOVING part demands, which is
+    only ever more than ``gap`` for a WDC frame (its 45-degree stile slot
+    cuts past its stile ends).  Mirrors
+    :func:`faceframe_cnc.nesting.validate_layouts`, which has the final say
+    — this one only picks where to offer a drop.
+    """
+    need_x, need_y = need if need is not None else (gap, gap)
+    clear_x = max(a.x, bx) - min(a.x + a.width, bx + bw)
+    clear_y = max(a.y, by) - min(a.y + a.height, by + bh)
+    return clear_x < need_x - EPS and clear_y < need_y - EPS
 
 
 class _Picture:
@@ -1165,7 +1204,9 @@ class Session:
 
         target = _at(source.layout, path)
         if x is None or y is None:
-            spot = self._free_spot(destination.layout, target.width, target.height)
+            spot = self._free_spot(
+                destination.layout, target.width, target.height, moving=target
+            )
             if spot is None:
                 return EditResult(
                     False,
@@ -1323,20 +1364,30 @@ class Session:
             # place_inner may pick the other orientation; keep the user's.
             if abs(child.width - inner.width) > EPS or abs(child.height - inner.height) > EPS:
                 rects = self.sheet_openings(host)
-                return self._centre_in_rects(rects, inner, clearance)
+                return self._centre_in_rects(rects, inner, clearance, self.config)
             return child.x, child.y
 
         rects = [r for r in self.sheet_openings(host) if r.index == opening_index]
-        return self._centre_in_rects(rects, inner, clearance)
+        return self._centre_in_rects(rects, inner, clearance, self.config)
 
     @staticmethod
     def _centre_in_rects(
-        rects: Sequence[OpeningRect], inner: Placement, clearance: float
+        rects: Sequence[OpeningRect],
+        inner: Placement,
+        clearance: float,
+        config: Optional[NestingConfig] = None,
     ) -> Optional[tuple[float, float]]:
+        need_x, need_y = clearance, clearance
+        if config is not None:
+            # A WDC inner needs its slot's reach past its stile ends, which
+            # inside a host opening means past the host's rails.
+            wants = clearance_needs(inner, config)
+            need_x = max(clearance, wants[0] if wants[0] > config.part_gap else 0.0)
+            need_y = max(clearance, wants[1] if wants[1] > config.part_gap else 0.0)
         for rect in rects:
             if (
-                inner.width + 2 * clearance <= rect.width + EPS
-                and inner.height + 2 * clearance <= rect.height + EPS
+                inner.width + 2 * need_x <= rect.width + EPS
+                and inner.height + 2 * need_y <= rect.height + EPS
             ):
                 return (
                     round(rect.x + (rect.width - inner.width) / 2.0, 9),
@@ -1351,6 +1402,7 @@ class Session:
         height: float,
         *,
         ignore: Optional[Placement] = None,
+        moving: Optional[Placement] = None,
     ) -> Optional[tuple[float, float]]:
         """First bottom-left position with room for a ``width x height`` part.
 
@@ -1359,34 +1411,143 @@ class Session:
         The soft edge cushion (spec 4a) is honoured on the first pass and
         given up on the second, so a part lands against the sheet edge only
         when that is the only way to fit it.
+
+        ``moving`` is the part being placed, needed only for the one part
+        type whose clearance is directional: a WDC frame's 45-degree stile
+        slot cuts past its stile ends, so it needs more room there — and
+        hard room against the sheet edge, which is otherwise a preference.
         """
         config = self.config
         gap = config.part_gap
         cushion = config.edge_cushion
         others = [p for p in layout.placements if p is not ignore]
 
+        subject = moving if moving is not None else ignore
+        need_x, need_y = gap, gap
+        if subject is not None:
+            need_x, need_y = clearance_needs(subject, config)
+        edge_x = need_x if need_x > gap else 0.0
+        edge_y = need_y if need_y > gap else 0.0
+
         xs = {cushion}
         ys = {cushion}
         for placement in others:
-            xs.add(round(placement.x + placement.width + gap, 9))
-            ys.add(round(placement.y + placement.height + gap, 9))
-            xs.add(round(placement.x - gap - width, 9))
-            ys.add(round(placement.y - gap - height, 9))
+            other_x, other_y = clearance_needs(placement, config)
+            step_x = max(need_x, other_x)
+            step_y = max(need_y, other_y)
+            xs.add(round(placement.x + placement.width + step_x, 9))
+            ys.add(round(placement.y + placement.height + step_y, 9))
+            xs.add(round(placement.x - step_x - width, 9))
+            ys.add(round(placement.y - step_y - height, 9))
 
         for margin in (cushion, 0.0):
+            low_x = max(margin, edge_x)
+            low_y = max(margin, edge_y)
             candidates = sorted(
                 (y, x)
                 for y in ys | ({0.0} if margin == 0.0 else set())
                 for x in xs | ({0.0} if margin == 0.0 else set())
-                if x >= margin - EPS
-                and y >= margin - EPS
-                and x + width <= config.sheet_width - margin + EPS
-                and y + height <= config.sheet_height - margin + EPS
+                if x >= low_x - EPS
+                and y >= low_y - EPS
+                and x + width <= config.sheet_width - low_x + EPS
+                and y + height <= config.sheet_height - low_y + EPS
             )
             for y, x in candidates:
-                if all(not _conflicts(other, x, y, width, height, gap) for other in others):
+                if all(
+                    not _conflicts(
+                        other,
+                        x,
+                        y,
+                        width,
+                        height,
+                        gap,
+                        (
+                            max(need_x, clearance_needs(other, config)[0]),
+                            max(need_y, clearance_needs(other, config)[1]),
+                        ),
+                    )
+                    for other in others
+                ):
                     return round(x, 9), round(y, 9)
         return None
+
+    # -- NC generation (Milestone 5 phase 2) -----------------------------
+
+    def can_generate(self) -> bool:
+        """True when there is a validated layout to write NC for."""
+        return self.result is not None and bool(self.sheets) and not self._problems
+
+    def generate_blocker(self) -> Optional[str]:
+        """Why :meth:`generate_nc` would refuse right now, or ``None``."""
+        if self.result is None or not self.sheets:
+            return "Optimize a layout first"
+        if self._problems:
+            return f"The layout has {len(self._problems)} unresolved problem(s)"
+        return None
+
+    def default_job_prefix(self, today: Optional[str] = None) -> str:
+        """The digit prefix to offer in the Generate dialog.
+
+        The saved one if there is one, otherwise today's date as ``MMDD`` —
+        spec section 6 describes the prefix as "job/date digits", and the
+        shop's own numbering is not derivable from the reference file names.
+        ``today`` is injectable so the dialog and its tests agree.
+        """
+        saved = str(self.settings.job_prefix or "")
+        if saved.isdigit():
+            return saved
+        if today is not None:
+            return today
+        import time as _time
+
+        return _time.strftime("%m%d")
+
+    def generate_nc(
+        self,
+        output_dir: str,
+        *,
+        prefix: str,
+        dry_run: bool = False,
+        per_physical_sheet: bool = False,
+        created: Optional[str] = None,
+        remember: bool = True,
+    ):
+        """Write one ``.anc`` per sheet and return the
+        :class:`~faceframe_cnc.post.job.JobResult`.
+
+        Every gate lives in :mod:`faceframe_cnc.post.job` — this method only
+        turns the session's state into a job and its failures into a
+        :class:`SessionError` the UI can show.  Sheets refused individually
+        (one the verifier rejects, or a WDC frame with something inside the
+        reach of its T17 slot) come back inside the result; only a whole-job
+        failure raises.
+        """
+        from ..post.job import JobError, JobOptions, write_job
+
+        blocker = self.generate_blocker()
+        if blocker is not None:
+            raise SessionError(blocker)
+
+        options = JobOptions(
+            output_dir=str(output_dir),
+            prefix=str(prefix).strip(),
+            dry_run=bool(dry_run),
+            per_physical_sheet=bool(per_physical_sheet),
+            created=created,
+        )
+        problems = options.validate()
+        if problems:
+            raise SessionError("; ".join(problems))
+
+        try:
+            job = write_job(self.result, options)
+        except JobError as exc:
+            raise SessionError(str(exc)) from exc
+
+        if remember:
+            self.settings.last_output_dir = job.output_dir
+            self.settings.job_prefix = options.prefix
+        return job
 
     # -- summary ---------------------------------------------------------
 

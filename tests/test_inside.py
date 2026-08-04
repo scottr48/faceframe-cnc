@@ -31,8 +31,12 @@ from faceframe_cnc.nesting import (
 )
 from tests.test_nesting import ORDER_7_21_26, TOTAL_PARTS
 
-#: The Milestone 2 sheet count for this order, with inside nesting off.
-M2_BASELINE_SHEETS = 47
+#: The footprint-only sheet count for this order, with inside nesting off.
+#: 49 since 2026-08-03: it was 47 until WDC frames started reserving the
+#: 0.875 their T17 stile slot cuts past each stile end (the owner has not
+#: approved nicking a neighbour, so the room is left).  The 0.375 -> 0.455
+#: part gap that landed the same day cost nothing on its own.
+M2_BASELINE_SHEETS = 49
 
 BY_NAME = {s.part_number: s for s in ORDER_7_21_26}
 
@@ -282,7 +286,7 @@ class FullOrderInsideNestingTests(unittest.TestCase):
         self.assertLess(self.result.total_sheets, M2_BASELINE_SHEETS)
         self.assertLessEqual(
             self.result.total_sheets,
-            40,
+            41,
             f"inside nesting quality regressed: {self.result.total_sheets} sheets",
         )
         self.assertEqual(self.result.sheets_saved, M2_BASELINE_SHEETS - self.result.total_sheets)
@@ -296,11 +300,11 @@ class FullOrderInsideNestingTests(unittest.TestCase):
         """80 frames nested, not the 92 the pairing phase can reach.
 
         Spec section 4 ranks "minimise total sheets" above "maximise inside
-        placements", and on this order they conflict: the 92-inner assignment
-        needs 41 sheets, while giving up B18 as an inner nests 80 and needs
-        40.  B18 is 18 x 30 and rides for free in the 18" left beside a
-        30"-wide frame, so hiding it inside a host recovers nothing and
-        wastes a host slot.  The packer chooses; this pins the choice.
+        placements", and on this order they conflict: the flat-out maximum
+        assignment costs a sheet, while giving up B18 as an inner nests 80
+        and does not.  B18 is 18 x 30 and rides for free in the 18" left
+        beside a 30"-wide frame, so hiding it inside a host recovers nothing
+        and wastes a host slot.  The packer chooses; this pins the choice.
         """
         self.assertEqual(self.result.inside_placements, 80)
         counted = sum(
@@ -403,7 +407,7 @@ class FullOrderInsideNestingTests(unittest.TestCase):
 class MilestoneTwoRegressionTests(unittest.TestCase):
     """Inside nesting off must change absolutely nothing."""
 
-    def test_default_config_reproduces_the_47_sheet_layout(self):
+    def test_default_config_reproduces_the_footprint_only_layout(self):
         default = nest(ORDER_7_21_26, NestingConfig())
         explicit = nest(ORDER_7_21_26, NestingConfig(inside_nesting=False))
         self.assertEqual(default.total_sheets, M2_BASELINE_SHEETS)
@@ -538,7 +542,7 @@ class ValidatorInsideRulesTests(unittest.TestCase):
         host = self._host(
             [
                 Placement("N7", 6.0, 10.0, 7.0, 20.0),
-                Placement("N7", 13.375, 10.0, 7.0, 20.0),
+                Placement("N7", 13.455, 10.0, 7.0, 20.0),
             ]
         )
         result = self._result(

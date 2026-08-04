@@ -106,11 +106,14 @@ class FullOrderTests(unittest.TestCase):
         print("\n" + self.result.summary())
         print(f"  nest() elapsed: {self.elapsed * 1000:.0f} ms")
         # Guard against a silent quality regression.  The packer currently
-        # returns 47 sheets (85.8% overall fill) against the 41-sheet area
-        # floor; 50 leaves room for tuning without letting it rot.
+        # returns 49 sheets against the 41-sheet area floor; 52 leaves room
+        # for tuning without letting it rot.  (47 before 2026-08-03: the
+        # WDC frames now reserve the 0.875 their T17 stile slot cuts past
+        # each end, which costs two footprint-only sheets and one nested
+        # one — see NestingConfig.part_gap and nesting.slot_end_clearance.)
         self.assertLessEqual(
             self.result.total_sheets,
-            50,
+            52,
             f"packing quality regressed: {self.result.total_sheets} sheets "
             f"vs an area lower bound of {lower}",
         )
@@ -318,7 +321,7 @@ class ValidatorCatchesBadLayoutsTests(unittest.TestCase):
         result = self._result(
             [
                 Placement("A", 1.0, 1.0, 20.0, 20.0),
-                Placement("B", 21.2, 1.0, 20.0, 20.0),  # 0.2 clear, needs 0.375
+                Placement("B", 21.2, 1.0, 20.0, 20.0),  # 0.2 clear, needs 0.455
             ],
             demand=[PartSpec("A", 20.0, 20.0, 1), PartSpec("B", 20.0, 20.0, 1)],
         )
@@ -329,7 +332,7 @@ class ValidatorCatchesBadLayoutsTests(unittest.TestCase):
         result = self._result(
             [
                 Placement("A", 1.0, 1.0, 20.0, 20.0),
-                Placement("B", 21.375, 1.0, 20.0, 20.0),
+                Placement("B", 21.455, 1.0, 20.0, 20.0),
             ],
             demand=[PartSpec("A", 20.0, 20.0, 1), PartSpec("B", 20.0, 20.0, 1)],
         )
@@ -433,14 +436,15 @@ class FrontMarginTests(unittest.TestCase):
 
     ``front_margin`` only nudges where an already-decided shelf stack sits
     vertically; it must never change which parts fit on a sheet, so the
-    sheet count is pinned to the same 47 as before this feature existed.
+    sheet count is pinned to whatever the packer reaches without it — 49
+    since the WDC slot clearance landed (47 before it).
     """
 
     def test_full_order_front_margin_holds_and_sheet_count_is_unchanged(self):
         config = NestingConfig()
         result = nest(ORDER_7_21_26, config)
 
-        self.assertEqual(result.total_sheets, 47, "front_margin changed the sheet count")
+        self.assertEqual(result.total_sheets, 49, "front_margin changed the sheet count")
         self.assertEqual(validate_layouts(result, config), [])
 
         for i, (layout, _run) in enumerate(result.unique_sheets, start=1):

@@ -105,7 +105,11 @@ class SettingsTests(unittest.TestCase):
         self.assertTrue(config.inside_baseline)
         self.assertFalse(config.inside_recursion)
         self.assertEqual((config.sheet_width, config.sheet_height), (49.0, 97.0))
-        self.assertEqual(config.part_gap, 0.375)
+        # 0.455 (2026-08-03): the shop's own spacing, and the least the NC
+        # post can cut -- see NestingConfig.part_gap.  The frame-inside-frame
+        # clearance does NOT follow it.
+        self.assertEqual(config.part_gap, 0.455)
+        self.assertEqual(config.inner_clearance, 0.375)
         self.assertEqual(config.edge_cushion, 0.5)
 
     def test_round_trip_through_json(self):
@@ -140,7 +144,7 @@ class SettingsTests(unittest.TestCase):
         )
         self.assertEqual(settings.sheet_width, 49.0)
         self.assertEqual(settings.sheet_height, 97.0)
-        self.assertEqual(settings.part_gap, 0.375)
+        self.assertEqual(settings.part_gap, 0.455)
 
     def test_validate_reports_unusable_numbers(self):
         self.assertEqual(AppSettings().validate(), [])
@@ -536,13 +540,13 @@ class MoveTests(unittest.TestCase):
 
     def test_a_move_that_is_only_barely_legal_is_allowed(self):
         session = two_alike()
-        # Exactly the 0.375 gap: legal, the parts may touch that closely.
-        result = session.move_part(0, (1,), 0.5, 30.875)
+        # Exactly the 0.455 gap: legal, the parts may touch that closely.
+        result = session.move_part(0, (1,), 0.5, 30.955)
         self.assertTrue(result, result.message)
         # A thousandth closer is not.
-        result = session.move_part(result.sheet_index, (1,), 0.5, 30.8749)
+        result = session.move_part(result.sheet_index, (1,), 0.5, 30.9549)
         self.assertFalse(result)
-        self.assertIn("0.3749", result.message)
+        self.assertIn("0.4549", result.message)
 
     def test_preview_never_changes_anything(self):
         session = two_alike()
@@ -559,6 +563,74 @@ class MoveTests(unittest.TestCase):
         result = session.nudge_part(0, (0,), 0.25, 0.0)
         self.assertTrue(result, result.message)
         self.assertAlmostEqual(session.sheet(result.sheet_index)[0].placements[0].x, 0.75)
+
+
+class WdcSlotClearanceTests(unittest.TestCase):
+    """A WDC frame's 45-degree stile slot cuts 0.875 past each stile end,
+    so a hand drag has to respect that and not just the part gap."""
+
+    def wdc_and_neighbour(self) -> Session:
+        specs = [
+            PartSpec("WDC2436", 18.0, 36.0, 1),
+            PartSpec("W2436", 24.0, 36.0, 1),
+        ]
+        return build(
+            specs,
+            [
+                (
+                    [
+                        Placement("WDC2436", 1.0, 1.0, 18.0, 36.0),
+                        Placement("W2436", 1.0, 50.0, 24.0, 36.0),
+                    ],
+                    1,
+                )
+            ],
+        )
+
+    def test_dragging_a_neighbour_into_the_slot_s_reach_snaps_back(self):
+        session = self.wdc_and_neighbour()
+        before = canonical(session)
+        # 0.5 past the WDC's top stile ends: clears the 0.455 part gap and
+        # is still inside the cone.
+        result = session.move_part(0, (1,), 1.0, 37.5)
+        self.assertFalse(result)
+        self.assertIn("WDC2436", result.message)
+        self.assertEqual(canonical(session), before)
+
+    def test_the_full_reach_away_is_allowed(self):
+        session = self.wdc_and_neighbour()
+        result = session.move_part(0, (1,), 1.0, 37.875)
+        self.assertTrue(result, result.message)
+
+    def test_a_wdc_dragged_against_the_sheet_edge_snaps_back(self):
+        session = self.wdc_and_neighbour()
+        before = canonical(session)
+        result = session.move_part(0, (0,), 1.0, 0.5)
+        self.assertFalse(result)
+        self.assertIn("T17", result.message)
+        self.assertEqual(canonical(session), before)
+
+    def test_rotating_a_wdc_turns_the_direction_the_clearance_applies_in(self):
+        """Upright the room has to be above and below; turned, left and
+        right.  Rotation is about the part's own centre, so both positions
+        below are legal upright and only one survives the turn."""
+        session = self.wdc_and_neighbour()
+        # centre x 18.5 -> turned, the part runs x[0.5, 36.5]: on the sheet,
+        # but 0.5 from the edge where the slot needs 0.875.
+        tight = session.move_part(0, (0,), 9.5, 1.0)
+        self.assertTrue(tight, tight.message)
+        blocked = session.rotate_part(tight.sheet_index, (0,))
+        self.assertFalse(blocked)
+        self.assertIn("T17", blocked.message)
+
+        # half an inch further in, the turn is fine
+        clear = session.move_part(tight.sheet_index, (0,), 10.0, 1.0)
+        self.assertTrue(clear, clear.message)
+        turned = session.rotate_part(clear.sheet_index, (0,))
+        self.assertTrue(turned, turned.message)
+        placement = session.sheet(turned.sheet_index)[0].placements[0]
+        self.assertTrue(placement.rotated)
+        self.assertAlmostEqual(placement.x, 1.0)
 
 
 class RotateTests(unittest.TestCase):
@@ -668,7 +740,7 @@ class CrossSheetTests(unittest.TestCase):
                 abs(moved.y - (other.y + other.height)),
                 abs(other.y - (moved.y + moved.height)),
             ),
-            0.375 - 1e-9,
+            session.config.part_gap - 1e-9,
         )
 
     def test_a_destination_with_no_room_is_refused(self):
@@ -680,7 +752,7 @@ class CrossSheetTests(unittest.TestCase):
                 (
                     [
                         Placement("W4048", 0.5, 0.5, 48.0, 48.0),
-                        Placement("W4048", 0.5, 48.875, 48.0, 48.0),
+                        Placement("W4048", 0.5, 48.955, 48.0, 48.0),
                     ],
                     1,
                 ),
@@ -828,7 +900,7 @@ class NestByHandTests(unittest.TestCase):
         self.assertFalse(overlapping)
         self.assertIn("gap violation", overlapping.message)
 
-        ok = session.nest_part(first.sheet_index, (loose,), (0,), x=14.75, y=3.5)
+        ok = session.nest_part(first.sheet_index, (loose,), (0,), x=14.83, y=3.5)
         self.assertTrue(ok, ok.message)
         host = session.sheet(ok.sheet_index)[0].placements[0]
         self.assertEqual(len(host.children), 2)

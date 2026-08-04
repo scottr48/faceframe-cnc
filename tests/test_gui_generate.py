@@ -1,0 +1,320 @@
+"""Milestone 5 phase 2: the Generate button, session side and Qt side.
+
+The session half runs anywhere (no Qt, no display, no pandas); the Qt half
+skips itself when PySide6 is missing and otherwise builds the dialog on the
+offscreen platform plugin.  As everywhere else in this app, the rules live
+in the session and the widget only collects four choices.
+
+Run with: python -m unittest discover tests
+"""
+
+from __future__ import annotations
+
+import os
+import tempfile
+import unittest
+
+# Must be set before the first QGuiApplication is constructed.
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from faceframe_cnc.gui.session import (
+    AppSettings,
+    OrderRow,
+    Session,
+    SessionError,
+    load_settings,
+    save_settings,
+)
+from tests.test_nesting import ORDER_7_21_26
+
+CREATED = "01 JAN 27 - 08:00"
+
+
+def session_with_layout(part_gap: float = 0.455) -> Session:
+    """Two wall frames and two small ones: one sheet, one nested frame."""
+    session = Session(AppSettings(part_gap=part_gap, inside_nesting=True))
+    session.set_rows(
+        [
+            OrderRow(key="a", part_number="W3036", qty=2, frame_width=30.0, frame_height=36.0),
+            OrderRow(key="b", part_number="W3012", qty=2, frame_width=30.0, frame_height=12.0),
+        ]
+    )
+    session.optimize()
+    return session
+
+
+class SessionGenerateTests(unittest.TestCase):
+    def test_nothing_to_generate_before_the_optimizer_runs(self):
+        session = Session(AppSettings())
+        self.assertFalse(session.can_generate())
+        self.assertEqual(session.generate_blocker(), "Optimize a layout first")
+        with self.assertRaises(SessionError):
+            session.generate_nc("nowhere", prefix="1234")
+
+    def test_a_layout_with_problems_is_not_generated(self):
+        session = session_with_layout()
+        session._problems = ["sheet 1: something is wrong"]
+        self.assertFalse(session.can_generate())
+        self.assertIn("unresolved problem", session.generate_blocker() or "")
+        with self.assertRaises(SessionError):
+            session.generate_nc("nowhere", prefix="1234")
+
+    def test_it_writes_one_verified_file_per_sheet(self):
+        session = session_with_layout()
+        self.assertTrue(session.can_generate())
+        self.assertIsNone(session.generate_blocker())
+        with tempfile.TemporaryDirectory() as folder:
+            job = session.generate_nc(folder, prefix="7201", created=CREATED)
+            self.assertEqual(len(job.outcomes), session.unique_sheet_count)
+            self.assertEqual(job.refused, [], job.summary())
+            names = sorted(os.listdir(folder))
+            self.assertEqual(names, sorted(o.filename for o in job.written))
+            for name in names:
+                self.assertRegex(name, r"^R7201\d{2}N\.anc$")
+
+    def test_a_bad_prefix_never_reaches_the_disk(self):
+        session = session_with_layout()
+        with tempfile.TemporaryDirectory() as folder:
+            with self.assertRaises(SessionError):
+                session.generate_nc(folder, prefix="7-2", created=CREATED)
+            self.assertEqual(os.listdir(folder), [])
+
+    def test_the_dry_run_toggle_reaches_the_job(self):
+        session = session_with_layout()
+        with tempfile.TemporaryDirectory() as folder:
+            job = session.generate_nc(
+                folder, prefix="7201", dry_run=True, created=CREATED
+            )
+            self.assertTrue(job.dry_run)
+            with open(job.files[0], "r", newline="") as handle:
+                self.assertIn("DRY RUN", handle.read())
+
+    def test_one_file_per_physical_sheet(self):
+        session = session_with_layout()
+        with tempfile.TemporaryDirectory() as folder:
+            job = session.generate_nc(
+                folder, prefix="7201", per_physical_sheet=True, created=CREATED
+            )
+            self.assertEqual(len(job.outcomes), session.total_sheets)
+
+    def test_a_wdc_line_comes_out_with_its_t17_slot(self):
+        """WDC frames used to be refused for want of a tool; they are cut
+        now, and the optimizer leaves the room the 45-degree slot needs."""
+        session = Session(AppSettings(part_gap=0.455))
+        session.set_rows(
+            [
+                OrderRow(
+                    key="w", part_number="WDC2436", qty=2, frame_width=18.0, frame_height=36.0
+                )
+            ]
+        )
+        session.optimize()
+        with tempfile.TemporaryDirectory() as folder:
+            job = session.generate_nc(folder, prefix="7201", created=CREATED)
+            self.assertEqual(job.refused, [], job.summary())
+            self.assertEqual(os.listdir(folder), ["R720101N.anc"])
+            with open(job.files[0], "r", newline="") as handle:
+                text = handle.read()
+            self.assertIn("(ROUTE TOOL #17: T17 45 VTIP 158-562SC.026-1W-A)", text)
+
+    def test_refusals_come_back_instead_of_raising(self):
+        """A sheet the verifier will not pass is reported, not raised, and
+        the job still writes the sheets that are fine.
+
+        The 0.375 gap the spec asks for is what produces one: it is 0.05
+        short of the perimeter lead-in's sweep, so on a real order some
+        sheets cut into their neighbours.  It needs the real order — a
+        two-frame sheet has nowhere for the lead-in to reach.
+        """
+        session = Session(AppSettings(part_gap=0.375, inside_nesting=True))
+        session.set_rows(
+            [
+                OrderRow(
+                    key=spec.part_number,
+                    part_number=spec.part_number,
+                    qty=spec.qty,
+                    frame_width=spec.width,
+                    frame_height=spec.height,
+                )
+                for spec in ORDER_7_21_26
+            ]
+        )
+        session.optimize()
+        with tempfile.TemporaryDirectory() as folder:
+            job = session.generate_nc(folder, prefix="7201", created=CREATED)
+            self.assertTrue(job.refused, "0.375 cannot be cut")
+            self.assertTrue(job.written, "the rest of the job still goes out")
+            for outcome in job.refused:
+                self.assertEqual(outcome.refusal_kind, "verifier")
+                self.assertNotIn(outcome.filename, os.listdir(folder))
+
+    def test_the_output_folder_and_prefix_are_remembered(self):
+        session = session_with_layout()
+        with tempfile.TemporaryDirectory() as folder:
+            session.generate_nc(folder, prefix="7201", created=CREATED)
+            self.assertEqual(session.settings.job_prefix, "7201")
+            self.assertEqual(
+                os.path.normcase(session.settings.last_output_dir or ""),
+                os.path.normcase(os.path.abspath(folder)),
+            )
+            settings_path = os.path.join(folder, "settings.json")
+            self.assertTrue(save_settings(session.settings, settings_path))
+            reloaded = load_settings(settings_path)
+            self.assertEqual(reloaded.job_prefix, "7201")
+            self.assertEqual(reloaded.last_output_dir, session.settings.last_output_dir)
+
+    def test_the_dry_run_toggle_is_deliberately_not_persisted(self):
+        keys = AppSettings().to_dict()
+        self.assertNotIn("dry_run", keys)
+        self.assertNotIn("per_physical_sheet", keys)
+
+    def test_the_default_prefix_is_the_saved_one_or_todays_date(self):
+        session = Session(AppSettings())
+        self.assertEqual(session.default_job_prefix(today="0803"), "0803")
+        self.assertRegex(session.default_job_prefix(), r"^\d{4}$")
+        session.settings.job_prefix = "7201"
+        self.assertEqual(session.default_job_prefix(today="0803"), "7201")
+
+    def test_a_too_tight_gap_is_reported_not_written(self):
+        """The default 0.375 gap is 0.05 short of what the perimeter lead-in
+        sweeps; the verifier catches it and the file is not written."""
+        session = session_with_layout(part_gap=0.375)
+        with tempfile.TemporaryDirectory() as folder:
+            job = session.generate_nc(folder, prefix="7201", created=CREATED)
+            for outcome in job.refused:
+                self.assertEqual(outcome.refusal_kind, "verifier")
+                self.assertNotIn(outcome.filename, os.listdir(folder))
+
+
+# --------------------------------------------------------------------------
+# Qt
+# --------------------------------------------------------------------------
+
+try:
+    from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
+
+    HAVE_QT = True
+except ImportError:  # pragma: no cover - depends on the environment
+    HAVE_QT = False
+
+if HAVE_QT:
+    from faceframe_cnc.gui.generate_dialog import GenerateChoices, GenerateDialog
+    from faceframe_cnc.gui.main_window import MainWindow
+
+_APP = None
+
+
+def setUpModule():  # noqa: N802 - unittest naming
+    global _APP
+    if HAVE_QT:
+        _APP = QApplication.instance() or QApplication([])
+
+
+@unittest.skipUnless(HAVE_QT, "PySide6 is not installed")
+class GenerateDialogSmokeTests(unittest.TestCase):
+    def setUp(self):
+        self.session = session_with_layout()
+        self.dialog = GenerateDialog(self.session)
+        self.addCleanup(self.dialog.close)
+
+    def test_it_builds_offscreen_with_sensible_defaults(self):
+        self.assertRegex(self.dialog.prefix.text(), r"^\d+$")
+        self.assertFalse(self.dialog.dry_run.isChecked())
+        self.assertFalse(self.dialog.per_physical.isChecked())
+        self.assertTrue(self.dialog.output_dir.text())
+
+    def test_the_preview_shows_the_first_file_name(self):
+        self.dialog.prefix.setText("7201")
+        self.assertEqual(self.dialog.preview.text(), "R720101N.anc")
+
+    def test_a_non_numeric_prefix_disables_generate(self):
+        from PySide6.QtWidgets import QDialogButtonBox
+
+        ok = self.dialog.buttons.button(QDialogButtonBox.StandardButton.Ok)
+        self.dialog.prefix.setText("72-01")
+        self.assertFalse(ok.isEnabled())
+        self.dialog.prefix.setText("7201")
+        self.assertTrue(ok.isEnabled())
+
+    def test_choices_reports_what_was_ticked(self):
+        self.dialog.prefix.setText("7201")
+        self.dialog.dry_run.setChecked(True)
+        self.dialog.per_physical.setChecked(True)
+        choices = self.dialog.choices()
+        self.assertEqual(choices.prefix, "7201")
+        self.assertTrue(choices.dry_run)
+        self.assertTrue(choices.per_physical_sheet)
+
+
+@unittest.skipUnless(HAVE_QT, "PySide6 is not installed")
+class MainWindowGenerateTests(unittest.TestCase):
+    def setUp(self):
+        self._folder = tempfile.TemporaryDirectory()
+        self.addCleanup(self._folder.cleanup)
+        self.session = session_with_layout()
+        self.window = MainWindow(
+            session=self.session,
+            settings_path=os.path.join(self._folder.name, "settings.json"),
+        )
+        self.addCleanup(self.window.close)
+        self.window.refresh()
+
+    def test_the_button_goes_live_once_there_is_a_layout(self):
+        self.assertTrue(self.window.generate_button.isEnabled())
+        self.session.result = None
+        self.window.refresh()
+        self.assertFalse(self.window.generate_button.isEnabled())
+
+    def test_clicking_it_runs_the_job_and_reports(self):
+        import faceframe_cnc.gui.main_window as module
+
+        target = os.path.join(self._folder.name, "nc")
+        seen = {}
+
+        class FakeDialog:
+            DialogCode = QDialog.DialogCode
+
+            def __init__(self, session, parent=None):
+                seen["session"] = session
+
+            def exec(self):
+                return int(QDialog.DialogCode.Accepted)
+
+            def choices(self):
+                return GenerateChoices(target, "7201", False, False)
+
+        original_dialog = module.GenerateDialog
+        original_exec = QMessageBox.exec
+        module.GenerateDialog = FakeDialog
+        QMessageBox.exec = lambda self: 0
+        try:
+            self.window.generate_nc()
+        finally:
+            module.GenerateDialog = original_dialog
+            QMessageBox.exec = original_exec
+
+        self.assertIs(seen["session"], self.session)
+        written = sorted(os.listdir(target))
+        self.assertTrue(written)
+        for name in written:
+            self.assertRegex(name, r"^R7201\d{2}N\.anc$")
+        self.assertIn("written", self.window.statusBar().currentMessage())
+
+    def test_it_refuses_politely_with_no_layout(self):
+        import faceframe_cnc.gui.main_window as module
+
+        self.session.result = None
+        original_warning = module.QMessageBox.warning
+        calls = []
+        module.QMessageBox.warning = staticmethod(
+            lambda *args, **kwargs: calls.append(args[-1])
+        )
+        try:
+            self.window.generate_nc()
+        finally:
+            module.QMessageBox.warning = original_warning
+        self.assertEqual(calls, ["Optimize a layout first"])
+
+
+if __name__ == "__main__":
+    unittest.main()

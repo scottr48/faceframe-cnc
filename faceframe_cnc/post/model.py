@@ -71,6 +71,7 @@ __all__ = [
     "ToolSpec",
     "PassSpec",
     "PanelSpec",
+    "WdcSlotSpec",
     "PostConfig",
     "ProgramHeader",
     "PartProgram",
@@ -80,11 +81,13 @@ __all__ = [
     "default_config",
     "program_from_placements",
     "SECTION_PANEL",
+    "SECTION_WDC_SLOT",
     "SECTION_OPENINGS",
     "SECTION_DETAIL",
     "SECTION_PERIMETER",
     "DEFAULT_SECTIONS",
     "SIDES",
+    "T17",
 ]
 
 #: Geometric tolerance.  Coordinates in the reference files are exact
@@ -92,16 +95,24 @@ __all__ = [
 EPS = 1e-6
 
 SECTION_PANEL = "panel"
+SECTION_WDC_SLOT = "wdc_slot"
 SECTION_OPENINGS = "openings"
 SECTION_DETAIL = "detail"
 SECTION_PERIMETER = "perimeter"
 
 #: Section order used by every modern reference file (R710101N, R720101N,
-#: R730101N): T13 -> T11 (openings) -> T12 (detail) -> T11 (perimeters).
+#: R730101N): T13 -> T11 (openings) -> T12 (detail) -> T11 (perimeters),
+#: with the T17 WDC slot section between T13 and the first T11 (2026-08-03
+#: amendment: "the T13 and T17 groove routing runs FIRST", and T17 leads
+#: RFK0101N exactly as T13 leads every modern frame file).  A section with
+#: no features is skipped, so a sheet with no WDC frame emits the same four
+#: sections it always did.
+#:
 #: R620101N/R620102N replace the T13 section with a T2 roughing section;
 #: spec section 6 says prefer the newer sequence, so that is the default.
 DEFAULT_SECTIONS = (
     SECTION_PANEL,
+    SECTION_WDC_SLOT,
     SECTION_OPENINGS,
     SECTION_DETAIL,
     SECTION_PERIMETER,
@@ -228,6 +239,61 @@ class PanelSpec:
 
 
 @dataclass(frozen=True)
+class WdcSlotSpec:
+    """The T17 45-degree slot down each stile of a WDC frame.
+
+    Grammar and tool measured from ``reference/nc_files/RFK0101N.anc``
+    (owner-supplied 2026-08-03): a straight ``G1 Z<depth> F150.`` plunge with
+    no lateral ramp, one straight cut at F400, ``G0 Z2.5`` between — the same
+    shape as the T13 panel groove, at T17's own feeds.
+
+    Geometry from the 2026-08-03 amendment: a STRAIGHT V groove (the machine
+    is 3-axis; the 45 degrees are the bit's own flanks) run down the
+    centreline 34 mm from the stile's INSIDE edge to 7/16" total depth, in
+    two passes on that one centreline so no single bite is deeper than
+    RFK0101N demonstrates.
+
+    ``z_cuts`` are machine Z, not depths of cut: the stock top is Z0.75, so
+    the passes take 0.3438 and then the full 0.4375.
+    """
+
+    z_cuts: tuple[float, ...] = (0.4062, 0.3125)
+    entry_feed: float = 150.0
+    cut_feed: float = 400.0
+    #: How far past each part end each pass runs its tool centre.  ``None``
+    #: means "derive it from ``z_cuts``", which is what the measured table
+    #: does — the amendment defines the overrun as the bit's effective
+    #: radius at that pass's depth, so it is never a free parameter.  The
+    #: dry-run twin (:func:`~.job.dry_run_config`) is the one caller that
+    #: pins it: its cut Z levels are mirrored ABOVE the stock, where "depth
+    #: of cut" is meaningless, and an air cut has to trace the production
+    #: program's XY path exactly.
+    overruns: tuple[float, ...] | None = None
+    #: Centreline distance from the stile's INSIDE (opening-side) edge.
+    inset_from_inside_edge: float = 1.3386
+    #: Width of the stile the slot runs down (WDC frames only).
+    stile_width: float = 2.0
+    #: Rise over run of the bit's flank.  45 degrees per side means the
+    #: cutting surface radius grows one inch per inch of depth, so the
+    #: effective radius of a pass EQUALS its depth of cut.
+    flank_slope: float = 1.0
+
+    @property
+    def inset_from_outside_edge(self) -> float:
+        """The same centreline, measured from the stile's outer edge."""
+        return self.stile_width - self.inset_from_inside_edge
+
+    def surface_radius(self, depth_of_cut: float, tool_radius: float) -> float:
+        """Radius of the cut where the bit breaks the surface.
+
+        Capped at the tool's own radius: past that depth the cone has run
+        out of flank and the bit is cutting at its full diameter, which this
+        slot never does (see :func:`~.generator._check_config`).
+        """
+        return min(depth_of_cut * self.flank_slope, tool_radius)
+
+
+@dataclass(frozen=True)
 class PostConfig:
     """Every number the emitter needs, all measured from the references.
 
@@ -242,6 +308,7 @@ class PostConfig:
     detail_pass: PassSpec
     perimeter_passes: tuple[PassSpec, ...]
     panel: PanelSpec
+    wdc_slot: WdcSlotSpec = WdcSlotSpec()
 
     rapid_z: float = 2.5
     approach_z: float = 2.0
@@ -292,6 +359,22 @@ class PostConfig:
     def tool(self, section: str) -> ToolSpec:
         return self.tools[section]
 
+    def wdc_slot_reach(self, position: int) -> float:
+        """Surface radius of the V bit on WDC slot pass ``position``.
+
+        One number, used twice, which is why it lives here rather than in
+        two callers: it is how far past the part end that pass runs its tool
+        CENTRE (the amendment's per-pass overrun) AND how far past the
+        centre the cone reaches where it breaks the surface.  The swept
+        material of a pass therefore ends ``2 * reach`` past the part.
+        """
+        spec = self.wdc_slot
+        if spec.overruns is not None:
+            return spec.overruns[position]
+        tool = self.tools.get(SECTION_WDC_SLOT)
+        radius = tool.radius if tool is not None else float("inf")
+        return spec.surface_radius(self.stock_top_z - spec.z_cuts[position], radius)
+
 
 T13 = ToolSpec(
     number=13,
@@ -314,6 +397,17 @@ T12 = ToolSpec(
     diameter=0.2,
     speed=17000,
 )
+#: The 45-degree V bit that cuts the WDC stile slot, verbatim from
+#: ``reference/nc_files/RFK0101N.anc`` lines 13-18.  0.96 is the diameter at
+#: the bit's shoulder, i.e. the widest cut it can make and the cap on the
+#: cone geometry in :meth:`WdcSlotSpec.surface_radius`.
+T17 = ToolSpec(
+    number=17,
+    header_comment="(ROUTE TOOL #17: T17 45 VTIP 158-562SC.026-1W-A)",
+    diameter_comment="(DIAMETER: 0.96)",
+    diameter=0.96,
+    speed=16000,
+)
 
 
 def default_config(**overrides) -> PostConfig:
@@ -332,6 +426,7 @@ def default_config(**overrides) -> PostConfig:
     config = PostConfig(
         tools={
             SECTION_PANEL: T13,
+            SECTION_WDC_SLOT: T17,
             SECTION_OPENINGS: T11,
             SECTION_DETAIL: T12,
             SECTION_PERIMETER: T11,
@@ -553,10 +648,14 @@ class FeatureRef:
     coordinate, no G-code and no feed ever travels in a plan; those all
     come from :class:`PostConfig` and the part geometry.
 
-    ``kind`` is ``"perimeter"``, ``"opening"`` or ``"groove"``.  For
-    ``"opening"``, ``index`` selects the part's opening.  For ``"groove"``,
-    ``index`` is 0..3 = stile-low, rail-low, stile-high, rail-high in the
-    part's own orientation.
+    ``kind`` is ``"perimeter"``, ``"opening"``, ``"groove"`` or
+    ``"wdc_slot"``.  For ``"opening"``, ``index`` selects the part's
+    opening.  For ``"groove"``, ``index`` is 0..3 = stile-low, rail-low,
+    stile-high, rail-high in the part's own orientation.  For
+    ``"wdc_slot"``, ``index`` is 0 or 1 = the low-side then high-side stile
+    in sheet coordinates; ONE reference emits both depth passes, because the
+    two bites of one slot are a property of the post table
+    (:class:`WdcSlotSpec`), not a sequencing choice.
     """
 
     part: int
@@ -584,6 +683,8 @@ class CutPlan:
     """
 
     panel: list[FeatureRef] = field(default_factory=list)
+    #: T17 stile slots, empty unless the sheet holds a WDC frame.
+    wdc_slot: list[FeatureRef] = field(default_factory=list)
     openings: list[FeatureRef] = field(default_factory=list)
     perimeter: list[list[FeatureRef]] = field(default_factory=list)
     detail: list[FeatureRef] | None = None
