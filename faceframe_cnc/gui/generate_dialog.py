@@ -1,8 +1,9 @@
 """Generate-NC dialog (spec section 5's Generate button).
 
-Thin, like every other widget here: it collects four choices and hands them
+Thin, like every other widget here: it collects five choices and hands them
 to :meth:`faceframe_cnc.gui.session.Session.generate_nc`, which owns all the
-rules.  Nothing in this file decides whether a sheet may be cut.
+rules.  Nothing in this file decides whether a sheet may be cut, and nothing
+in it composes the PDF report — it only ticks the box that asks for one.
 """
 
 from __future__ import annotations
@@ -36,6 +37,11 @@ class GenerateChoices:
     prefix: str
     dry_run: bool
     per_physical_sheet: bool
+    #: Milestone 6: write ``R<prefix>_report.pdf`` beside the programs.  On
+    #: by default — the printed cut sheets are what the operator works from,
+    #: and a job that goes to the machine without them is a job somebody has
+    #: to come back to the office to ask about.
+    pdf_report: bool = True
 
 
 class GenerateDialog(QDialog):
@@ -69,6 +75,14 @@ class GenerateDialog(QDialog):
         self.per_physical = QCheckBox(
             "One file per physical sheet instead of one per unique sheet"
         )
+        self.pdf_report = QCheckBox(
+            "Write PDF cut-sheet report (one page per sheet, drawn to scale)"
+        )
+        self.pdf_report.setChecked(True)
+        self.pdf_report.setToolTip(
+            "Saved as R<prefix>_report.pdf in the same folder. If it cannot be "
+            "written the .anc programs still go out."
+        )
 
         self.preview = QLabel()
         self.preview.setStyleSheet("color:#54606b;")
@@ -78,6 +92,7 @@ class GenerateDialog(QDialog):
         form.addRow("Job prefix", self.prefix)
         form.addRow(self.dry_run)
         form.addRow(self.per_physical)
+        form.addRow(self.pdf_report)
         form.addRow("First file", self.preview)
 
         note = QLabel(
@@ -87,7 +102,10 @@ class GenerateDialog(QDialog):
             "that slot cuts 0.875 in past each end of the stile, so a WDC frame "
             "with a neighbour or a sheet edge closer than that is refused "
             "rather than cut into the part next to it. A dry-run file is an air "
-            "cut only: it must never be treated as the production program."
+            "cut only: it must never be treated as the production program. The "
+            "PDF report gives one page per unique sheet, drawn to scale with "
+            "every part labelled and the run quantity in the header; a sheet "
+            "that was refused still gets a page, marked REFUSED."
         )
         note.setWordWrap(True)
 
@@ -133,4 +151,5 @@ class GenerateDialog(QDialog):
             prefix=self.prefix.text().strip(),
             dry_run=self.dry_run.isChecked(),
             per_physical_sheet=self.per_physical.isChecked(),
+            pdf_report=self.pdf_report.isChecked(),
         )

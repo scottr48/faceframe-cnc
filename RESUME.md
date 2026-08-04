@@ -93,7 +93,10 @@ spec and the reference `.anc` files disagree, the .anc files win.
   time: `.venv\Scripts\python.exe -m unittest discover tests` →
   **399 tests, OK**. A hand-check of an emitted T17 section (R720102N,
   3xWDC2436) matched the amendment's geometry exactly.
-- Milestone 6 (PDF report) is in progress.
+- Milestone 6 (PDF report) complete, reviewed and committed:
+  `faceframe_cnc/report/` (stdlib-only PDF 1.4 writer + cut-sheet composer),
+  Generate flow writes `R<prefix>_report.pdf` beside the .anc files
+  (default on; report failure never blocks NC). 454 tests OK (+55).
 - **One session at a time in this tree.** An earlier session collided with a
   leftover coder agent from a disconnected session editing the same files
   concurrently. It merged cleanly that time; do not count on that again.

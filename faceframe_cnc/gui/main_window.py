@@ -224,6 +224,7 @@ class MainWindow(QMainWindow):
                 prefix=choices.prefix,
                 dry_run=choices.dry_run,
                 per_physical_sheet=choices.per_physical_sheet,
+                pdf_report=choices.pdf_report,
             )
         except SessionError as exc:
             QMessageBox.warning(self, "Cannot generate", str(exc))
@@ -250,12 +251,25 @@ class MainWindow(QMainWindow):
                 f"\n\n{len(refused)} sheet{'' if len(refused) == 1 else 's'} refused - "
                 f"nothing was written for those."
             )
+        # Milestone 6: the report is paperwork, so its failure is reported
+        # beside the job rather than as part of it (the programs went out).
+        report_path = getattr(job, "report_path", None)
+        report_problem = getattr(job, "report_problem", None)
+        if report_path:
+            head += f"\n\nCut-sheet report: {os.path.basename(report_path)}"
+        elif report_problem:
+            head += f"\n\n{report_problem}"
+            box.setIcon(QMessageBox.Icon.Warning)
         box.setText(head)
-        box.setDetailedText(job.summary())
+        details = job.summary()
+        if report_problem:
+            details += f"\n\n{report_problem}"
+        box.setDetailedText(details)
         box.exec()
         self.statusBar().showMessage(
             f"{written} NC program(s) written"
             + (f", {len(refused)} sheet(s) refused" if refused else "")
+            + (" + PDF report" if report_path else "")
             + (" [dry run]" if job.dry_run else "")
         )
 

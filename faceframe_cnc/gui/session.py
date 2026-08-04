@@ -37,6 +37,7 @@ from __future__ import annotations
 import copy
 import json
 import math
+import os
 import re
 from collections import Counter
 from dataclasses import dataclass, field
@@ -1509,6 +1510,7 @@ class Session:
         prefix: str,
         dry_run: bool = False,
         per_physical_sheet: bool = False,
+        pdf_report: bool = True,
         created: Optional[str] = None,
         remember: bool = True,
     ):
@@ -1521,6 +1523,24 @@ class Session:
         (one the verifier rejects, or a WDC frame with something inside the
         reach of its T17 slot) come back inside the result; only a whole-job
         failure raises.
+
+        Milestone 6: with ``pdf_report`` on (the default) the printable
+        cut-sheet report is written beside the programs as
+        ``R<prefix>_report.pdf``.  It is written LAST and its failure can
+        never take the NC with it — the operator can cut from a folder with
+        no paperwork in it, but paperwork with no programs is useless — so
+        the report is reported as its own problem on the returned job:
+
+        ``job.report_path``
+            Where the PDF landed, or ``None`` if none was asked for or
+            written.
+        ``job.report_problem``
+            Why there is no PDF, or ``None``.
+
+        Those two live on the job object rather than in
+        :class:`~faceframe_cnc.post.job.JobResult` itself because the report
+        is this layer's business: the NC post neither writes it nor depends
+        on it.
         """
         from ..post.job import JobError, JobOptions, write_job
 
@@ -1544,10 +1564,45 @@ class Session:
         except JobError as exc:
             raise SessionError(str(exc)) from exc
 
+        job.report_path = None
+        job.report_problem = None
+        if pdf_report:
+            self._write_report(job, options)
+
         if remember:
             self.settings.last_output_dir = job.output_dir
             self.settings.job_prefix = options.prefix
         return job
+
+    def _write_report(self, job, options) -> None:
+        """Write the PDF cut sheets beside the programs, never fatally.
+
+        Deliberately catches everything: a report is paperwork, and no
+        failure to produce paperwork may unwrite a verified NC program that
+        is already on disk.  The reason comes back on the job so the UI can
+        say so out loud rather than leave the user to notice the missing
+        file.
+        """
+        path = os.path.join(job.output_dir, self.report_filename(options.prefix))
+        try:
+            from ..report.cutsheet import write_report
+
+            job.report_path = write_report(
+                self.result, job, path, created=options.created
+            )
+        except Exception as exc:  # noqa: BLE001 - see the docstring
+            job.report_path = None
+            job.report_problem = (
+                f"the PDF cut-sheet report could not be written ({exc}); the NC "
+                f"programs are unaffected"
+            )
+
+    @staticmethod
+    def report_filename(prefix: str) -> str:
+        """``R<prefix>_report.pdf``, the report that goes with this job."""
+        from ..report.cutsheet import report_filename
+
+        return report_filename(str(prefix).strip())
 
     # -- summary ---------------------------------------------------------
 

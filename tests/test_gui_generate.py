@@ -64,13 +64,17 @@ class SessionGenerateTests(unittest.TestCase):
         self.assertTrue(session.can_generate())
         self.assertIsNone(session.generate_blocker())
         with tempfile.TemporaryDirectory() as folder:
-            job = session.generate_nc(folder, prefix="7201", created=CREATED)
+            job = session.generate_nc(
+                folder, prefix="7201", pdf_report=False, created=CREATED
+            )
             self.assertEqual(len(job.outcomes), session.unique_sheet_count)
             self.assertEqual(job.refused, [], job.summary())
             names = sorted(os.listdir(folder))
             self.assertEqual(names, sorted(o.filename for o in job.written))
             for name in names:
                 self.assertRegex(name, r"^R7201\d{2}N\.anc$")
+            self.assertIsNone(job.report_path, "no report was asked for")
+            self.assertIsNone(job.report_problem)
 
     def test_a_bad_prefix_never_reaches_the_disk(self):
         session = session_with_layout()
@@ -110,7 +114,9 @@ class SessionGenerateTests(unittest.TestCase):
         )
         session.optimize()
         with tempfile.TemporaryDirectory() as folder:
-            job = session.generate_nc(folder, prefix="7201", created=CREATED)
+            job = session.generate_nc(
+                folder, prefix="7201", pdf_report=False, created=CREATED
+            )
             self.assertEqual(job.refused, [], job.summary())
             self.assertEqual(os.listdir(folder), ["R720101N.anc"])
             with open(job.files[0], "r", newline="") as handle:
@@ -175,6 +181,69 @@ class SessionGenerateTests(unittest.TestCase):
         session.settings.job_prefix = "7201"
         self.assertEqual(session.default_job_prefix(today="0803"), "7201")
 
+    # -- Milestone 6: the PDF cut-sheet report --------------------------
+
+    def test_the_report_lands_beside_the_anc_files_by_default(self):
+        session = session_with_layout()
+        with tempfile.TemporaryDirectory() as folder:
+            job = session.generate_nc(folder, prefix="7201", created=CREATED)
+            self.assertEqual(job.report_path, os.path.join(job.output_dir, "R7201_report.pdf"))
+            self.assertIsNone(job.report_problem)
+            names = sorted(os.listdir(folder))
+            self.assertIn("R7201_report.pdf", names)
+            self.assertEqual(
+                [name for name in names if name.endswith(".anc")],
+                sorted(o.filename for o in job.written),
+            )
+            with open(job.report_path, "rb") as handle:
+                data = handle.read()
+            self.assertTrue(data.startswith(b"%PDF-1.4"))
+            self.assertTrue(data.endswith(b"%%EOF\n"))
+
+    def test_the_report_name_follows_the_job_prefix(self):
+        self.assertEqual(Session.report_filename("7201"), "R7201_report.pdf")
+        self.assertEqual(Session.report_filename(" 62 "), "R62_report.pdf")
+
+    def test_a_report_failure_never_stops_the_anc_files_going_out(self):
+        """Paperwork is paperwork.  A folder with programs and no report is
+        a nuisance; a folder with a report and no programs is useless."""
+        import faceframe_cnc.report.cutsheet as report_module
+
+        session = session_with_layout()
+        original = report_module.write_report
+
+        def explode(*args, **kwargs):
+            raise RuntimeError("no disk space for paperwork")
+
+        report_module.write_report = explode
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                job = session.generate_nc(folder, prefix="7201", created=CREATED)
+                self.assertEqual(job.refused, [], job.summary())
+                self.assertTrue(job.written, "the programs still go out")
+                self.assertIsNone(job.report_path)
+                self.assertIn("no disk space for paperwork", job.report_problem)
+                self.assertEqual(
+                    sorted(os.listdir(folder)),
+                    sorted(o.filename for o in job.written),
+                )
+        finally:
+            report_module.write_report = original
+
+    def test_the_report_covers_the_sheets_the_job_wrote(self):
+        from tests.test_report import Pdf
+
+        session = session_with_layout()
+        with tempfile.TemporaryDirectory() as folder:
+            job = session.generate_nc(folder, prefix="7201", created=CREATED)
+            with open(job.report_path, "rb") as handle:
+                parsed = Pdf(handle.read())
+            self.assertEqual(parsed.problems, [])
+            self.assertEqual(parsed.page_count, session.unique_sheet_count + 1)
+            cover = parsed.text(0)
+            for outcome in job.outcomes:
+                self.assertIn(outcome.filename, cover)
+
     def test_a_too_tight_gap_is_reported_not_written(self):
         """The default 0.375 gap is 0.05 short of what the perimeter lead-in
         sweeps; the verifier catches it and the file is not written."""
@@ -221,6 +290,9 @@ class GenerateDialogSmokeTests(unittest.TestCase):
         self.assertRegex(self.dialog.prefix.text(), r"^\d+$")
         self.assertFalse(self.dialog.dry_run.isChecked())
         self.assertFalse(self.dialog.per_physical.isChecked())
+        self.assertTrue(
+            self.dialog.pdf_report.isChecked(), "the report is on by default"
+        )
         self.assertTrue(self.dialog.output_dir.text())
 
     def test_the_preview_shows_the_first_file_name(self):
@@ -244,6 +316,13 @@ class GenerateDialogSmokeTests(unittest.TestCase):
         self.assertEqual(choices.prefix, "7201")
         self.assertTrue(choices.dry_run)
         self.assertTrue(choices.per_physical_sheet)
+        self.assertTrue(choices.pdf_report)
+        self.dialog.pdf_report.setChecked(False)
+        self.assertFalse(self.dialog.choices().pdf_report)
+
+    def test_the_report_choice_defaults_on_when_it_is_not_stated(self):
+        """Callers built before Milestone 6 still get the paperwork."""
+        self.assertTrue(GenerateChoices("out", "7201", False, False).pdf_report)
 
 
 @unittest.skipUnless(HAVE_QT, "PySide6 is not installed")
@@ -296,9 +375,45 @@ class MainWindowGenerateTests(unittest.TestCase):
         self.assertIs(seen["session"], self.session)
         written = sorted(os.listdir(target))
         self.assertTrue(written)
+        self.assertIn("R7201_report.pdf", written, "the paperwork goes out too")
         for name in written:
+            if name.endswith(".pdf"):
+                continue
             self.assertRegex(name, r"^R7201\d{2}N\.anc$")
-        self.assertIn("written", self.window.statusBar().currentMessage())
+        message = self.window.statusBar().currentMessage()
+        self.assertIn("written", message)
+        self.assertIn("PDF report", message)
+
+    def test_the_report_can_be_turned_off_from_the_dialog(self):
+        import faceframe_cnc.gui.main_window as module
+
+        target = os.path.join(self._folder.name, "nc-no-pdf")
+
+        class FakeDialog:
+            DialogCode = QDialog.DialogCode
+
+            def __init__(self, session, parent=None):
+                pass
+
+            def exec(self):
+                return int(QDialog.DialogCode.Accepted)
+
+            def choices(self):
+                return GenerateChoices(target, "7201", False, False, False)
+
+        original_dialog = module.GenerateDialog
+        original_exec = QMessageBox.exec
+        module.GenerateDialog = FakeDialog
+        QMessageBox.exec = lambda self: 0
+        try:
+            self.window.generate_nc()
+        finally:
+            module.GenerateDialog = original_dialog
+            QMessageBox.exec = original_exec
+
+        written = sorted(os.listdir(target))
+        self.assertTrue(written)
+        self.assertFalse([name for name in written if name.endswith(".pdf")])
 
     def test_it_refuses_politely_with_no_layout(self):
         import faceframe_cnc.gui.main_window as module
