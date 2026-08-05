@@ -66,6 +66,15 @@ runs straight into the program footer)::
     G80
     G17 G91 G28 Z0 M95
     M92
+
+Text and motion come out together
+---------------------------------
+:func:`emit` is the one emission path: it walks the plan once and builds a
+stream of :class:`~.motion.Event` — each a rendered line plus, for the lines
+that command a move, the typed :class:`~.motion.Motion` built from the same
+coordinates at the same moment.  :func:`generate` is
+:func:`~.motion.render` over that stream and :func:`generate_motions` is the
+motions out of it, so neither can describe a program the other does not.
 """
 
 from __future__ import annotations
@@ -76,6 +85,7 @@ from .model import (
     SIDES,
     Box,
     CutPlan,
+    FeatureRef,
     PanelSpec,
     PartProgram,
     PassSpec,
@@ -90,9 +100,23 @@ from .model import (
     WdcSlotSpec,
     default_config,
 )
+from .motion import (
+    EmittedProgram,
+    Event,
+    Motion,
+    MotionKind,
+    classify,
+    render,
+)
 
 __all__ = [
     "generate",
+    "generate_motions",
+    "emit",
+    "EmittedProgram",
+    "Event",
+    "Motion",
+    "MotionKind",
     "fmt",
     "groove_segment",
     "wdc_slot_segment",
@@ -224,9 +248,10 @@ def wdc_slot_segment(
 
     ``overrun`` is how far past each part end the tool CENTRE runs, which
     the caller takes per pass from :meth:`~.model.PostConfig.wdc_slot_reach`:
-    a 45-degree V bit's effective radius is its depth of cut, so the deeper
-    pass overruns LESS than the shallower, wider one.  The segment always
-    runs low-to-high.
+    a 45-degree V bit's effective radius is its depth of cut, so the DEEPER
+    pass cuts wider and overruns further — ``RFK0101N.anc`` 22/27 run the
+    0.3438-deep pass to Y37.3438 and the 0.4375-deep one to Y37.4375, 0.0937
+    further out, on a part ending at Y37.  The segment always runs low-to-high.
     """
     box = part.box
     inset = spec.inset_from_outside_edge
@@ -375,46 +400,177 @@ def entry_side_for(
 
 
 class _Emitter:
-    """Accumulates lines while tracking the modal machine position."""
+    """Builds the event stream while tracking the modal machine state.
+
+    ``x``/``y``/``z`` are the position the machine has been commanded to, i.e.
+    what the next line's omitted axis words mean.  ``z`` is ``None`` until a
+    section's ``G43`` establishes work Z; ``section`` tags every event the
+    emitter appends while it is set.
+    """
 
     def __init__(self, config: PostConfig):
         self.config = config
-        self.lines: list[str] = []
+        self.events: list[Event] = []
         self.x = 0.0
         self.y = 0.0
+        self.z: float | None = None
+        self.section: str | None = None
 
     def line(self, text: str) -> None:
-        self.lines.append(text)
+        self.events.append(
+            Event(text=text, line_index=len(self.events), section=self.section)
+        )
 
     def blank(self) -> None:
-        self.lines.append("")
+        self.line("")
+
+    def begin_section(self, section: str) -> None:
+        """Enter ``section``, whose head has yet to be written.
+
+        Work Z goes unknown here because the previous section's tail homed it
+        (``G17 G91 G28 Z0 M95``) and the program footer's ``G91 G28 Z0`` does
+        the same for the last one.
+        """
+        self.section = section
+        self.z = None
 
     # -- motion helpers ----------------------------------------------------
 
     def _axis_words(self, x: float, y: float) -> str:
+        """The X/Y words a move needs, unchanged axes suppressed.
+
+        Reads the modal position and does not advance it: :meth:`_move` does
+        that, for the one line whose text this call is part of, so the words on
+        a line and the :class:`~.motion.Motion` beside it can never be
+        computed against different positions.
+        """
         words = []
         if abs(x - self.x) > 1e-9:
             words.append(f"X{fmt(x)}")
         if abs(y - self.y) > 1e-9:
             words.append(f"Y{fmt(y)}")
-        self.x, self.y = x, y
         return " ".join(words)
 
-    def preposition(self, x: float, y: float, tool: ToolSpec, first: bool) -> None:
+    def _move(
+        self,
+        text: str,
+        kind: MotionKind,
+        to_x: float,
+        to_y: float,
+        to_z: float | None,
+        tool: ToolSpec,
+        feed: float | None,
+        feature: FeatureRef | None,
+        pass_index: int | None,
+    ) -> None:
+        """Append one line and the motion it commands, then advance the state."""
+        motion = Motion(
+            kind=kind,
+            from_x=self.x,
+            from_y=self.y,
+            from_z=self.z,
+            to_x=to_x,
+            to_y=to_y,
+            to_z=to_z,
+            tool=tool,
+            feed=feed,
+            section=self.section,
+            feature=feature,
+            pass_index=pass_index,
+            line_index=len(self.events),
+        )
+        self.events.append(
+            Event(
+                text=text,
+                line_index=len(self.events),
+                section=self.section,
+                motion=motion,
+            )
+        )
+        self.x, self.y, self.z = to_x, to_y, to_z
+
+    def preposition(
+        self,
+        x: float,
+        y: float,
+        tool: ToolSpec,
+        first: bool,
+        feature: FeatureRef | None = None,
+        pass_index: int | None = None,
+    ) -> None:
         cfg = self.config
         if first:
-            self.line(
-                f"G0 G54 G90 X{fmt(x)} Y{fmt(y)} M13 S{tool.speed}"
+            self._move(
+                f"G0 G54 G90 X{fmt(x)} Y{fmt(y)} M13 S{tool.speed}",
+                # The spindle comes on and the tool traverses before the G43
+                # below states where Z is, so this move's Z is unknown at both
+                # ends -- it is the one move in the program that has no Z.
+                MotionKind.RAPID,
+                x,
+                y,
+                self.z,
+                tool,
+                None,
+                feature,
+                pass_index,
             )
-            self.line(f"G43 H{tool.number} Z{fmt(cfg.rapid_z)}")
-            self.line(f"G0 Z{fmt(cfg.approach_z)}")
+            self._move(
+                f"G43 H{tool.number} Z{fmt(cfg.rapid_z)}",
+                MotionKind.RAPID,
+                x,
+                y,
+                cfg.rapid_z,
+                tool,
+                None,
+                feature,
+                pass_index,
+            )
         else:
-            self.line(f"X{fmt(x)} Y{fmt(y)} Z{fmt(cfg.rapid_z)}")
-            self.line(f"Z{fmt(cfg.approach_z)}")
-        self.x, self.y = x, y
+            self._move(
+                f"X{fmt(x)} Y{fmt(y)} Z{fmt(cfg.rapid_z)}",
+                classify(True, self.z, cfg.rapid_z),
+                x,
+                y,
+                cfg.rapid_z,
+                tool,
+                None,
+                feature,
+                pass_index,
+            )
+        self._move(
+            f"G0 Z{fmt(cfg.approach_z)}" if first else f"Z{fmt(cfg.approach_z)}",
+            classify(True, self.z, cfg.approach_z),
+            x,
+            y,
+            cfg.approach_z,
+            tool,
+            None,
+            feature,
+            pass_index,
+        )
 
-    def retract(self) -> None:
-        self.line(f"G0 Z{fmt(self.config.rapid_z)}")
+    def retract(
+        self,
+        tool: ToolSpec,
+        feature: FeatureRef | None = None,
+        pass_index: int | None = None,
+    ) -> None:
+        cfg = self.config
+        self._move(
+            f"G0 Z{fmt(cfg.rapid_z)}",
+            # Named, not classified: after the perimeter marker's M59 the tool
+            # is ALREADY at the rapid plane (R710101N 230-232), so this move's
+            # dZ is zero and :func:`~.motion.classify` would call it a rapid.
+            # The command is a retract in both cases.
+            MotionKind.RETRACT,
+            self.x,
+            self.y,
+            cfg.rapid_z,
+            tool,
+            None,
+            feature,
+            pass_index,
+        )
 
     # -- features ----------------------------------------------------------
 
@@ -426,6 +582,7 @@ class _Emitter:
         tool: ToolSpec,
         panel: PanelSpec,
         first: bool,
+        ref: FeatureRef | None = None,
     ) -> None:
         across = part.box.height if part.rotated else part.box.width
         along = part.box.width if part.rotated else part.box.height
@@ -437,10 +594,10 @@ class _Emitter:
         start, end = groove_segment(part, index, panel)
         if reverse:
             start, end = end, start
-        self.preposition(start[0], start[1], tool, first)
-        self.line(f"G1 Z{fmt(panel.z_cut)} F{fmt(panel.entry_feed)}")
-        self.line(f"{self._axis_words(end[0], end[1])} F{fmt(panel.cut_feed)}")
-        self.retract()
+        self.preposition(start[0], start[1], tool, first, ref)
+        self._straight(
+            end, panel.z_cut, panel.entry_feed, panel.cut_feed, tool, ref, None
+        )
 
     def slot(
         self,
@@ -449,6 +606,7 @@ class _Emitter:
         tool: ToolSpec,
         spec: WdcSlotSpec,
         first: bool,
+        ref: FeatureRef | None = None,
     ) -> None:
         """Cut one WDC stile slot: every configured depth pass, in order,
         on the one centreline."""
@@ -457,10 +615,51 @@ class _Emitter:
             start, end = wdc_slot_segment(
                 part, index, spec, cfg.wdc_slot_reach(position)
             )
-            self.preposition(start[0], start[1], tool, first and position == 0)
-            self.line(f"G1 Z{fmt(z_cut)} F{fmt(spec.entry_feed)}")
-            self.line(f"{self._axis_words(end[0], end[1])} F{fmt(spec.cut_feed)}")
-            self.retract()
+            self.preposition(
+                start[0], start[1], tool, first and position == 0, ref, position
+            )
+            self._straight(
+                end, z_cut, spec.entry_feed, spec.cut_feed, tool, ref, position
+            )
+
+    def _straight(
+        self,
+        end: tuple[float, float],
+        z_cut: float,
+        entry_feed: float,
+        cut_feed: float,
+        tool: ToolSpec,
+        ref: FeatureRef | None,
+        pass_index: int | None,
+    ) -> None:
+        """Plunge, cut one straight line to ``end``, retract.
+
+        The T13 panel groove and the T17 stile slot are the same three lines at
+        their own feeds and depths (module docstring), so they are written once.
+        """
+        self._move(
+            f"G1 Z{fmt(z_cut)} F{fmt(entry_feed)}",
+            classify(False, self.z, z_cut),
+            self.x,
+            self.y,
+            z_cut,
+            tool,
+            entry_feed,
+            ref,
+            pass_index,
+        )
+        self._move(
+            f"{self._axis_words(end[0], end[1])} F{fmt(cut_feed)}",
+            classify(False, self.z, z_cut),
+            end[0],
+            end[1],
+            z_cut,
+            tool,
+            cut_feed,
+            ref,
+            pass_index,
+        )
+        self.retract(tool, ref, pass_index)
 
     def loop(
         self,
@@ -469,6 +668,8 @@ class _Emitter:
         tool: ToolSpec,
         spec: PassSpec,
         first: bool,
+        ref: FeatureRef | None = None,
+        pass_index: int | None = None,
     ) -> None:
         """Cut one closed rectangle counter-clockwise, leading in on the
         midpoint of ``side``.
@@ -482,18 +683,46 @@ class _Emitter:
         corners = points[2:6]
         close, overshoot, out = points[6], points[7], points[8]
 
-        self.preposition(pre[0], pre[1], tool, first)
-        self.line(
+        self.preposition(pre[0], pre[1], tool, first, ref, pass_index)
+        self._move(
             f"G1 {self._axis_words(entry[0], entry[1])} "
-            f"Z{fmt(spec.z_cut)} F{fmt(spec.entry_feed)}"
+            f"Z{fmt(spec.z_cut)} F{fmt(spec.entry_feed)}",
+            classify(False, self.z, spec.z_cut),
+            entry[0],
+            entry[1],
+            spec.z_cut,
+            tool,
+            spec.entry_feed,
+            ref,
+            pass_index,
         )
-        for i, corner in enumerate(corners):
-            words = self._axis_words(corner[0], corner[1])
-            self.line(f"{words} F{fmt(spec.cut_feed)}" if i == 0 else words)
-        self.line(self._axis_words(close[0], close[1]))
-        self.line(self._axis_words(overshoot[0], overshoot[1]))
-        self.line(f"{self._axis_words(out[0], out[1])} Z{fmt(self.config.approach_z)}")
-        self.retract()
+        # The cut feed is stated once and is modal for the rest of the loop, so
+        # every one of these moves runs at it whether its line says so or not.
+        for i, point in enumerate([*corners, close, overshoot]):
+            words = self._axis_words(point[0], point[1])
+            self._move(
+                f"{words} F{fmt(spec.cut_feed)}" if i == 0 else words,
+                classify(False, self.z, spec.z_cut),
+                point[0],
+                point[1],
+                spec.z_cut,
+                tool,
+                spec.cut_feed,
+                ref,
+                pass_index,
+            )
+        self._move(
+            f"{self._axis_words(out[0], out[1])} Z{fmt(self.config.approach_z)}",
+            classify(False, self.z, self.config.approach_z),
+            out[0],
+            out[1],
+            self.config.approach_z,
+            tool,
+            spec.cut_feed,
+            ref,
+            pass_index,
+        )
+        self.retract(tool, ref, pass_index)
 
 
 def _check_config(cfg: PostConfig, program: SheetProgram) -> None:
@@ -614,12 +843,15 @@ def _section_features(plan: CutPlan, section: str) -> list:
     raise ValueError(f"unknown section {section!r}")
 
 
-def generate(
+def emit(
     program: SheetProgram,
     plan: CutPlan,
     config: PostConfig | None = None,
-) -> str:
-    """Render ``program`` as ``.anc`` text (CRLF, ``%``-wrapped).
+) -> EmittedProgram:
+    """Walk ``plan`` once and return the text together with its event stream.
+
+    The single emission path (see the module docstring): :func:`generate` and
+    :func:`generate_motions` are both views of what this returns.
 
     Raises ``ValueError`` on a plan that references a part, opening or
     groove that does not exist — a plan is never allowed to fall through to
@@ -660,6 +892,7 @@ def generate(
                 f"for that section"
             )
         tool = cfg.tool(section)
+        emitter.begin_section(section)
         emitter.blank()
         emitter.line(tool.header_comment)
         emitter.line(tool.diameter_comment)
@@ -672,7 +905,9 @@ def generate(
                 part = part_of(ref, "groove")
                 if not 0 <= ref.index <= 3:
                     raise ValueError(f"groove index {ref.index} out of range 0..3")
-                emitter.groove(part, ref.index, ref.reverse, tool, cfg.panel, i == 0)
+                emitter.groove(
+                    part, ref.index, ref.reverse, tool, cfg.panel, i == 0, ref
+                )
 
         elif section == SECTION_WDC_SLOT:
             for i, ref in enumerate(plan.wdc_slot):
@@ -682,7 +917,7 @@ def generate(
                         f"WDC slot index {ref.index} out of range 0..1 (a frame "
                         f"has two stiles)"
                     )
-                emitter.slot(part, ref.index, tool, cfg.wdc_slot, i == 0)
+                emitter.slot(part, ref.index, tool, cfg.wdc_slot, i == 0, ref)
 
         elif section in (SECTION_OPENINGS, SECTION_DETAIL):
             spec = cfg.openings_pass if section == SECTION_OPENINGS else cfg.detail_pass
@@ -709,7 +944,7 @@ def generate(
                         f"({part.box.x0:.4f},{part.box.y0:.4f}) cannot be cut on this "
                         f"sheet: {exc}"
                     ) from exc
-                emitter.loop(cut, side, tool, spec, i == 0)
+                emitter.loop(cut, side, tool, spec, i == 0, ref)
 
         elif section == SECTION_PERIMETER:
             if len(plan.perimeter) != len(cfg.perimeter_passes):
@@ -718,7 +953,9 @@ def generate(
                     f"post is configured for {len(cfg.perimeter_passes)} depth pass(es)"
                 )
             index = 0
-            for spec, refs in zip(cfg.perimeter_passes, plan.perimeter):
+            for pass_index, (spec, refs) in enumerate(
+                zip(cfg.perimeter_passes, plan.perimeter)
+            ):
                 for ref in refs:
                     part = part_of(ref, "perimeter")
                     cut = part.box.grow(spec.offset)
@@ -732,17 +969,49 @@ def generate(
                             f"{part.part_number} @({part.box.x0:.4f},"
                             f"{part.box.y0:.4f}) cannot be cut on this sheet: {exc}"
                         ) from exc
-                    emitter.loop(cut, side, tool, spec, index == 0)
+                    emitter.loop(cut, side, tool, spec, index == 0, ref, pass_index)
                     index += 1
                     if index == 1 and cfg.perimeter_marker_after_first_loop:
                         emitter.line("M59")
-                        emitter.retract()
+                        # Tagged with the loop it follows: the tool has not moved
+                        # since, and this retract is that loop's second one.
+                        emitter.retract(tool, ref, pass_index)
 
         # The last section stops after M59/G80 and runs into the epilogue.
         for text in SECTION_TAIL if not last_section else SECTION_TAIL[:2]:
             emitter.line(text)
 
+    emitter.section = None
     for text in EPILOGUE:
         emitter.line(text)
 
-    return NEWLINE.join(emitter.lines) + NEWLINE
+    events = tuple(emitter.events)
+    return EmittedProgram(text=render(events, NEWLINE), events=events)
+
+
+def generate(
+    program: SheetProgram,
+    plan: CutPlan,
+    config: PostConfig | None = None,
+) -> str:
+    """Render ``program`` as ``.anc`` text (CRLF, ``%``-wrapped).
+
+    Raises ``ValueError`` on a plan that references a part, opening or
+    groove that does not exist — a plan is never allowed to fall through to
+    a silently skipped cut.
+    """
+    return emit(program, plan, config).text
+
+
+def generate_motions(
+    program: SheetProgram,
+    plan: CutPlan,
+    config: PostConfig | None = None,
+) -> list[Motion]:
+    """Every move ``program`` commands, tagged with section, feature and pass.
+
+    The same walk that writes the text (:func:`emit`), so
+    :attr:`~.motion.Motion.line_index` indexes the lines of
+    :func:`generate`'s output for the same three arguments.
+    """
+    return list(emit(program, plan, config).motions)

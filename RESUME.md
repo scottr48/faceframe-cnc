@@ -253,6 +253,79 @@ swept-width waiver stays (mirrors the reference files / current
 production); Codex's packaging complaints (installer, README, settings
 location); instant re-optimize on checkbox toggle; T2 support.
 
+## 2026-08-05 session: 3D machine-cut simulation (all 5 milestones)
+
+Spec: `CLAUDE_CODE_PROMPT_Machine_Simulation.md` (in the repo root) — a
+Cabinet-Vision-style animated playback of the sheet on screen, tuned to cut
+order and error legibility.  Scott's decisions, made up front: motion source
+is an **emitter refactor** (structured records, text rendered FROM them —
+byte-exactness guardrail held throughout), the sim opens in a **separate
+non-modal window**, and three owner must-haves: a prominent current-tool
+field, free orbit/pan/zoom camera, and a playback speed control.  Qt3D
+verified present in PySide6 6.11.1 on Py 3.14 — no new dependency.
+**Tests 766 → 1046, all green; reference .anc round-trips still byte-exact.**
+Five milestones, each written by an Opus subagent and reviewed:
+
+- **M1 `post/motion.py` + generator refactor (+25 tests)**: `_Emitter` now
+  appends `Event`s — each one rendered line PAIRED with the `Motion` it
+  commands (kind rapid/plunge/feed/retract, from/to XYZ, tool, feed, section,
+  FeatureRef, depth pass, `line_index`), built from the same numbers at the
+  same moment.  `generate()` is a join over the stream; `emit()` /
+  `generate_motions()` are the new API.  Old-vs-new output byte-compared on
+  reference AND optimizer sheets: identical.  Bonus: fixed a backwards
+  docstring sentence (the DEEPER T17 pass overruns FURTHER — RFK0101N
+  Y37.3438 shallow / Y37.4375 deep); code was always right, prose wasn't.
+- **M2 `sim/` package (+49)**: headless timeline (steps + *cut occurrences* —
+  a perimeter ref is two, onion-skin and through; a WDC slot is its two
+  bites; labels derived live from the post table, e.g. "T11 perimeter pass 1
+  of 2 (onion skin 0.06 thick) — WDC2436"), material state (grooves /
+  openings / slot bites cut, *skinned* vs *freed*), `SimController` cursor
+  (step/cut/section, reversible, clamped), `step_for_line()` for M4.  AST
+  test bans Qt and wall-clock from the package.
+- **M3 `gui/sim3d/` (+70)**: pure `viewmodel.py` (tool field text from
+  `header_comment`, reveal geometry via the generator's own
+  `groove_segment`/`wdc_slot_segment`, feed-true animation maths), GL-free
+  `scene.py` (spoilboard/stock slabs, tinted part faces in sheet_canvas's
+  colours, V-slot as two angled flanks, freed part LIFTS 0.30 with edge
+  highlight, per-tool bit meshes — cone for T17), thin `window.py` (cut list,
+  transport, scrub, speed 0.25x–20x default 4x, the big bold tool field).
+  Viewport injection seam so every test runs without GL.  Demo:
+  `python -m faceframe_cnc.gui.sim3d --demo wdc|nested [--play]`.
+- **M4 findings (+101)**: `sim/findings.py` maps `verify()`'s violations onto
+  the timeline (line → step → cut → part; unmappable → global) — total,
+  faithful, verbatim.  Red = a Violation, nothing else: tinted features, red
+  bars on flagged moves, red bit while executing one; clean sheet renders
+  pixel-identical to M3.  Informational overlays (default OFF): WDC cone
+  reach (drawn from `wdc_slot_sweep`, the enforcement function itself),
+  lead-in envelopes, sheet+overhang fence.  `SheetPlanError` gained optional
+  `part_number`/`box` attributes (messages byte-identical) so `RefusalView`
+  shows a refused sheet in 3D with the part outlined.  Four crafted bad
+  sheets prove marks correspond 1:1 with the authority.
+- **M5 integration (+35)**: `Session.simulation_inputs(i)` — same
+  `plan_sheet` wiring, same post table, and the SAME `expected_work` manifest
+  as `build_job`, so the sim's verdict is Generate's verdict; gated by
+  `generate_blocker()` reused verbatim (one notion of stale).  "Simulate cut"
+  button + toolbar action beside Prev/Next, state recomputed only in
+  `refresh()`.  One sim window at a time, parentless non-modal, reference
+  held, closed with the main window.  Refusals open `RefusalView`; every
+  handler guarded.  `--self-test-sim` runs the whole path offscreen
+  (viewport hook → None).
+
+### Simulation follow-ups (recorded, non-blocking)
+
+- **Nobody has eyeballed the render aesthetics** — tests prove structure, not
+  taste.  Ten seconds: `--demo wdc --play`, or Simulate cut on a real order.
+- **Shop-PC smoke test**: Qt3D needs working GL drivers; the dev box renders
+  fine, the shop PC is unproven.  Failure is graceful (a message box; the
+  sheet still plans/verifies) but should be checked before relying on it.
+- The reveal list is recomputed every 16 ms tick — fine at demo size; cache
+  per completed-cut count if a busy 7-21 sheet ever feels sluggish.
+- The sim window is a deliberate snapshot: a later order edit does not close
+  it (title names the program).  No keyboard shortcuts on Simulate (every
+  existing shortcut is whole-job; a per-sheet one would fire on whatever is
+  showing).  Cut-list labels carry an em dash — Qt renders it; a cp1252
+  console print shows a replacement char (cosmetic, demo/self-test only).
+
 ## Where the previous session left off (2026-08-03/04)
 
 Session log, in order — commits `91757dd` (Milestone 5 complete),
@@ -318,10 +391,11 @@ auto-resolution), then row editing (committed at wrap-up; see git log):
 
 ## Next
 
-No milestone is open — the spec is fully delivered, and BOTH 2026-08-04
-review passes (the six-fix morning session and the later full-tree
-double review) are fixed and verified. 766 tests green. Remaining
-candidates, Scott's call: a printed-page check of the PDF report,
-implementing the 2DB/4DB/MICRO3DB drawer-base layouts if the shop ever
-orders one, Codex's packaging/deployment wishlist (installer, README,
+No milestone is open — the original spec AND the 3D simulation spec are
+fully delivered. **1046 tests green**, everything uncommitted as of the
+2026-08-05 session wrap (Scott commits when he says so). Remaining
+candidates, Scott's call: eyeball the 3D render + smoke-test Qt3D on the
+shop PC (see simulation follow-ups above), a printed-page check of the PDF
+report, implementing the 2DB/4DB/MICRO3DB drawer-base layouts if the shop
+ever orders one, Codex's packaging/deployment wishlist (installer, README,
 settings location), or whatever the shop floor turns up next.

@@ -8,7 +8,7 @@ legal, what a sheet contains -- comes from
 from __future__ import annotations
 
 import os
-from typing import Optional
+from typing import Callable, Optional
 
 from PySide6.QtCore import QPoint, Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence
@@ -31,6 +31,7 @@ from .session import (
     AppSettings,
     Session,
     SessionError,
+    SimulationRefused,
     default_settings_path,
     load_settings,
     save_settings,
@@ -42,6 +43,18 @@ from .summary_panel import SummaryPanel
 #: Shown when the Generate button is live.  The PDF report is Milestone 6;
 #: the button writes NC today.
 GENERATE_TOOLTIP = "Write one verified .anc program per sheet"
+
+#: The Simulate button's tooltip.  It names THE SHEET ON SCREEN on purpose:
+#: the button simulates what the preview is showing, not the whole job, and
+#: which sheet he is watching is the one thing an operator must not have to
+#: guess.
+SIMULATE_TOOLTIP = (
+    "Watch the sheet on screen being cut in 3D, move by move, with the "
+    "verifier's findings marked on it"
+)
+
+#: Title on the message box a refused simulation request gets.
+SIMULATE_ERROR_TITLE = "Cannot simulate"
 
 #: File-dialog filter for orders.  .xls ONLY, on purpose: the parser is
 #: pandas + xlrd, which cannot open a modern .xlsx at all, so listing one
@@ -80,6 +93,30 @@ class MainWindow(QMainWindow):
         self.next_button.setToolTip(
             "Next unique sheet (drop a part here to move it there)"
         )
+        # Beside the sheet navigation, because it acts on the sheet those
+        # buttons choose.  Disabled until there is a layout, and its state is
+        # recomputed in refresh() with every other button's.
+        self.simulate_button = QPushButton("Simulate cut")
+        self.simulate_button.setEnabled(False)
+        self.simulate_button.setToolTip(SIMULATE_TOOLTIP)
+        self.simulate_button.clicked.connect(self.simulate_cut)
+
+        #: Viewport hook handed to the simulation windows.  ``None`` means
+        #: "use their own default", which is the real Qt3D viewport — that is
+        #: the production path and this attribute exists so an offscreen run
+        #: (``--self-test-sim``, the tests) can inject a hook returning
+        #: ``None`` instead of asking a headless machine for a GL surface.
+        self.sim_viewport_hook: Optional[Callable] = None
+        #: The one simulation window there may be at a time (see
+        #: :meth:`show_simulation`).
+        self.sim_window: Optional[QWidget] = None
+        #: True while nobody is sitting in front of the app (``--self-test-sim``):
+        #: simulation refusals are then recorded and shown in the status bar
+        #: instead of in a modal box no one would dismiss.
+        self.unattended = False
+        #: The last ``(title, message)`` a simulation refusal produced, shown
+        #: or recorded.  Kept for the unattended run and for the tests.
+        self.last_warning: Optional[tuple[str, str]] = None
 
         self.canvas = SheetCanvas(self.session)
         self.canvas.editApplied.connect(self._on_edit_applied)
@@ -91,6 +128,7 @@ class MainWindow(QMainWindow):
         header_row.addWidget(self.sheet_header, 1)
         header_row.addWidget(self.prev_button)
         header_row.addWidget(self.next_button)
+        header_row.addWidget(self.simulate_button)
 
         self.hint_label = QLabel(
             "Drag a part to move it. R rotates. Drop it into a host's opening to "
@@ -158,6 +196,16 @@ class MainWindow(QMainWindow):
         self.settings_action = QAction("Settings...", self)
         self.settings_action.triggered.connect(self.edit_settings)
         bar.addAction(self.settings_action)
+
+        # The same gesture as the button beside the sheet navigation, on the
+        # toolbar with the other actions.  No shortcut: every existing one is
+        # a whole-job action (Open, Optimize), and a key that fires on
+        # whichever sheet happens to be showing is not one to add silently.
+        self.simulate_action = QAction("Simulate cut", self)
+        self.simulate_action.setToolTip(SIMULATE_TOOLTIP)
+        self.simulate_action.setEnabled(False)
+        self.simulate_action.triggered.connect(self.simulate_cut)
+        bar.addAction(self.simulate_action)
 
         bar.addSeparator()
         self.generate_button = QPushButton("Generate NC")
@@ -340,6 +388,140 @@ class MainWindow(QMainWindow):
             + (" [dry run]" if job.dry_run else "")
         )
 
+    # -- 3D cut simulation -----------------------------------------------
+
+    def simulate_cut(self) -> None:
+        """Open the 3D simulation for the sheet on screen.
+
+        Guarded like every other handler here: three outcomes, no fourth, and
+        no traceback in front of an operator.
+
+        *   the session hands back inputs — the playback window opens on them,
+            findings and all;
+        *   the post REFUSES the sheet
+            (:class:`~faceframe_cnc.gui.session.SimulationRefused`) — the
+            refusal view opens instead, with the planner's own message and the
+            named part outlined.  A refusal is the point of that view, not an
+            error to hide behind a message box;
+        *   the session refuses the REQUEST (no layout, a layout that does not
+            pass its own validator, an index that is not on screen) — the
+            message the session gave, in a box, the way Generate's refusals
+            are shown.
+
+        Anything else at all is caught too and shown the same way: this is the
+        one entry point into a package the operator would otherwise meet
+        through a crash.
+        """
+        try:
+            inputs = self.session.simulation_inputs(self.canvas.sheet_index)
+        except SimulationRefused as exc:
+            self._show_refusal(exc)
+            return
+        except SessionError as exc:
+            self._warn(SIMULATE_ERROR_TITLE, str(exc))
+            return
+        except Exception as exc:  # noqa: BLE001 - see the docstring
+            self._warn(
+                SIMULATE_ERROR_TITLE,
+                f"the simulation could not be built for this sheet: {exc}",
+            )
+            return
+
+        try:
+            from .sim3d.window import Sim3DWindow
+
+            window = Sim3DWindow(
+                inputs.timeline,
+                findings=inputs.findings,
+                create_viewport=self.sim_viewport_hook,
+            )
+        except Exception as exc:  # noqa: BLE001 - a driver without a surface
+            self._warn(
+                SIMULATE_ERROR_TITLE,
+                f"the 3D window could not be opened ({exc}). The sheet itself "
+                f"is fine: it plans, emits and verifies.",
+            )
+            return
+        window.resize(1400, 900)
+        self.show_simulation(window)
+        count = inputs.findings.count
+        self.statusBar().showMessage(
+            f"Simulating sheet {inputs.sheet_index + 1} of "
+            f"{self.session.unique_sheet_count} ({inputs.program_name}): "
+            f"{inputs.timeline.cut_total} cuts, {inputs.timeline.step_total} moves"
+            + (f", {count} verifier finding(s)" if count else ", nothing flagged")
+        )
+
+    def _show_refusal(self, refused: SimulationRefused) -> None:
+        """Show a refused sheet in 3D, or say why even that is impossible."""
+        try:
+            from .sim3d.refusal import RefusalView
+
+            view = RefusalView(
+                refused.error,
+                refused.program,
+                refused.post_config,
+                create_viewport=self.sim_viewport_hook,
+            )
+        except Exception as exc:  # noqa: BLE001 - never lose the refusal itself
+            self._warn(
+                SIMULATE_ERROR_TITLE,
+                f"{refused}\n\n(the 3D view of the refusal could not be opened: "
+                f"{exc})",
+            )
+            return
+        view.resize(1100, 800)
+        self.show_simulation(view)
+        self.statusBar().showMessage(
+            f"Sheet {self.canvas.sheet_index + 1} is REFUSED - see the "
+            f"simulation window for what the post will not cut"
+        )
+
+    def show_simulation(self, window: QWidget) -> None:
+        """Own ``window`` as THE simulation window and show it.
+
+        One at a time, deliberately: two playbacks of two sheets side by side
+        would leave the operator asking which sheet he is looking at, and the
+        window title is the only thing that says.  So opening a simulation
+        closes and replaces whatever was open.
+
+        The reference is kept on the window because the sim window is a
+        SEPARATE, NON-MODAL top level (parentless: the operator watches the
+        cut and works the order at the same time), and a parentless widget
+        nobody holds is garbage collected the moment this method returns.
+        :meth:`closeEvent` takes it down with the main window.
+        """
+        previous = self.sim_window
+        self.sim_window = window
+        if previous is not None and previous is not window:
+            previous.close()
+            previous.deleteLater()
+        window.show()
+        window.raise_()
+
+    def close_simulation(self) -> None:
+        """Close the simulation window, if one is open."""
+        window = self.sim_window
+        self.sim_window = None
+        if window is not None:
+            window.close()
+            window.deleteLater()
+
+    def _warn(self, title: str, message: str) -> None:
+        """Tell the user something went wrong — or record it, unattended.
+
+        The simulation is the one path with an unattended mode
+        (``--self-test-sim``), and a modal box in a run with nobody in front
+        of it does not fail, it HANGS.  So the message goes through here: kept
+        on :attr:`last_warning` either way, in a box when there is a user, in
+        the status bar when there is not.
+        """
+        self.last_warning = (title, message)
+        if self.unattended:
+            self.statusBar().showMessage(f"{title}: {message}")
+            return
+        QMessageBox.warning(self, title, message)
+
     def edit_settings(self) -> None:
         """Change the optimizer settings — all of it, or none of it.
 
@@ -481,6 +663,29 @@ class MainWindow(QMainWindow):
         self.optimize_action.setEnabled(bool(self.session.included_rows()))
         self.generate_button.setEnabled(self.session.can_generate())
         self.generate_button.setToolTip(GENERATE_TOOLTIP)
+        # Structurally possible, not necessarily clean: a sheet the post
+        # refuses is exactly what the refusal view is for, so the session's
+        # can_simulate() asks only "is there a current layout, and is this one
+        # of its sheets" (a stale layout has none).  Recomputed HERE with
+        # every other button state, which is the only place any of them is
+        # recomputed -- the 2026-08-04 grayed-Optimize lesson.
+        can_simulate = self.session.can_simulate(self.canvas.sheet_index)
+        self.simulate_button.setEnabled(can_simulate)
+        self.simulate_button.setToolTip(SIMULATE_TOOLTIP)
+        self.simulate_action.setEnabled(can_simulate)
+
+    # -- lifecycle -------------------------------------------------------
+
+    def closeEvent(self, event):  # noqa: N802 - Qt naming
+        """Take the simulation window with us.
+
+        It is a parentless top level (see :meth:`show_simulation`), so Qt will
+        not close it for us, and a 3D window left running after the app it
+        belongs to has gone is the kind of thing that gets a machine switched
+        off at the wall.
+        """
+        self.close_simulation()
+        super().closeEvent(event)
 
     # -- self test -------------------------------------------------------
 

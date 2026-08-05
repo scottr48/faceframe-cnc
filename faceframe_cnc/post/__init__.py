@@ -16,6 +16,10 @@ Modules
 ``generator``
     Emits ``.anc`` text from a ``SheetProgram`` + ``CutPlan``.  Purely
     table-driven: every line comes from the templates in ``model``.
+``motion``
+    The same emission as a typed event stream — :class:`~.motion.Motion`
+    records tagged with section, feature and depth pass, paired with the
+    lines they render to.  What a cut simulation reads.
 ``reconstruct``
     Reads an existing ``.anc`` back into a ``SheetProgram`` + ``CutPlan``
     (part footprints, rotations, openings, nesting, cut order).  This is
@@ -47,7 +51,8 @@ from .model import (
     default_config,
     program_from_placements,
 )
-from .generator import generate
+from .generator import emit, generate, generate_motions
+from .motion import EmittedProgram, Event, Motion, MotionKind
 from .reconstruct import ReconstructionError, reconstruct
 from .verifier import Violation, verify, verify_file
 from .from_layout import (
@@ -80,6 +85,12 @@ __all__ = [
     "default_config",
     "program_from_placements",
     "generate",
+    "generate_motions",
+    "emit",
+    "EmittedProgram",
+    "Event",
+    "Motion",
+    "MotionKind",
     "reconstruct",
     "ReconstructionError",
     "verify",

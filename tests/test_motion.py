@@ -1,0 +1,850 @@
+"""Milestone 1 of the 3D cut simulation: the emitter's typed motion stream.
+
+The post now emits a stream of events -- a rendered line plus, when the line
+commands a move, the :class:`~faceframe_cnc.post.motion.Motion` built from the
+same coordinates at the same moment -- and the ``.anc`` text is the join of
+that stream.  Nothing about the text may change: the byte-for-byte round trip
+of ``R710101N.anc`` / ``R720101N.anc`` / ``R730101N.anc`` in
+``tests/test_post.py`` is the acceptance test of the post itself, so it is
+asserted here again from the other side (the text is the render of the stream,
+and the stream is what a simulation will read).
+
+Covered here:
+  (a) one emission path: ``generate`` is the render of ``emit``'s events, and
+      every event is exactly one line, so a motion's ``line_index`` indexes
+      the finished file the way a verifier finding cites it;
+  (b) the drift guard: every motion is held to the X/Y/Z/F words on its OWN
+      line, modal suppression included, and every line that moves the tool
+      must carry a motion -- neither half can describe a program the other
+      does not;
+  (c) order, tools and counts: section order against the plan, one tool per
+      section, perimeter pass 1 entirely before pass 2, pass 2 cutting nested
+      inners before their hosts, openings in plan order (deepest nesting
+      first for a planner-built sheet), and a WDC stile slot as two passes on
+      one centreline whose deeper bite reaches further;
+  (d) tagging: section, feature, depth pass and feed on every motion, with a
+      preposition belonging to the feature it is positioning FOR;
+  (e) determinism: two calls, equal streams.
+
+Every fixture is either a reconstruction of a real reference file or a sheet
+the optimizer route (:func:`~faceframe_cnc.post.from_layout.plan_sheet`)
+built; no tool, feed or Z is written down in this module.
+
+Run with: python -m unittest discover tests
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import unittest
+from dataclasses import dataclass
+from itertools import groupby
+
+from faceframe_cnc.nesting import NestingConfig, PartSpec, Placement, SheetLayout
+from faceframe_cnc.post import (
+    CutPlan,
+    MotionKind,
+    PostConfig,
+    ProgramHeader,
+    SheetProgram,
+    default_config,
+    emit,
+    generate,
+    generate_motions,
+    plan_sheet,
+    reconstruct,
+)
+from faceframe_cnc.post.generator import EPILOGUE, PROLOGUE, SECTION_TAIL, fmt
+from faceframe_cnc.post.model import (
+    SECTION_DETAIL,
+    SECTION_OPENINGS,
+    SECTION_PANEL,
+    SECTION_PERIMETER,
+    SECTION_WDC_SLOT,
+)
+
+NC_DIR = os.path.join(os.path.dirname(__file__), "..", "reference", "nc_files")
+
+CREATED = "01 JAN 27 - 08:00"
+
+REFERENCES = ("R710101N", "R720101N", "R730101N")
+
+TOL = 1e-9
+
+#: Every word on a line, trailing decimal point KEPT: the post prints ``F490.``
+#: and ``Z2.``, and this module compares against :func:`fmt`, which prints them
+#: the same way.
+_WORD_RE = re.compile(r"([A-Za-z])(-?[0-9.]+)")
+
+#: The section head restates the position the previous section left the machine
+#: in and commands no move, so it carries no motion (see :class:`~.motion.Event`).
+_RESTATE_RE = re.compile(r"^G0 G54 G90 X(-?[0-9.]+) Y(-?[0-9.]+)$")
+
+#: Lines that are fixed blocks rather than cut motion: the program prologue and
+#: epilogue and the section tail.  Their ``G91 G28 Z0`` homing moves and the
+#: ``G90 X24. Y96.`` park are machine housekeeping in INCREMENTAL/machine terms,
+#: which is why the emitter keeps them literal (:mod:`~.motion` docstring).
+_FIXED_LINES = set(PROLOGUE) | set(EPILOGUE) | set(SECTION_TAIL)
+
+
+def path_of(name: str) -> str:
+    return os.path.join(NC_DIR, f"{name}.anc")
+
+
+def read(name: str) -> str:
+    with open(path_of(name), "r", newline="") as handle:
+        return handle.read()
+
+
+def words_of(line: str) -> dict[str, str]:
+    """``{letter: value}`` for one command line, as printed."""
+    return {letter.upper(): value for letter, value in _WORD_RE.findall(line)}
+
+
+def g_words(line: str) -> list[str]:
+    return [value for letter, value in _WORD_RE.findall(line) if letter.upper() == "G"]
+
+
+# --------------------------------------------------------------------------
+# Fixtures
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class Case:
+    """One (program, plan, config) triple and what it emits."""
+
+    label: str
+    program: SheetProgram
+    plan: CutPlan
+    config: PostConfig
+
+    @property
+    def emitted(self):
+        return emit(self.program, self.plan, self.config)
+
+    @property
+    def motions(self):
+        return generate_motions(self.program, self.plan, self.config)
+
+    def parents(self) -> list[int | None]:
+        """Flat-part index of each part's HOST, or ``None`` (spec 4b nesting)."""
+        flat = self.program.flat_parts()
+        index_of = {id(part): i for i, part in enumerate(flat)}
+        parent: dict[int, int | None] = {id(p): None for p in flat}
+
+        def walk(items, host):
+            for part in items:
+                parent[id(part)] = host
+                walk(part.children, index_of[id(part)])
+
+        walk(self.program.parts, None)
+        return [parent[id(part)] for part in flat]
+
+
+def wdc_case() -> Case:
+    """A planner-built sheet with a WDC frame on it, so a T17 section exists.
+
+    The layout is the one ``tests/test_nc_job.py`` uses for the T17 section: a
+    WDC2436 clear of the sheet edge by more than the slot's end reach, with an
+    ordinary frame beside it.  Built through
+    :func:`~faceframe_cnc.post.from_layout.plan_sheet` so the ORDER under test
+    is the planner's, not this module's.
+    """
+    layout = SheetLayout(
+        [
+            Placement("WDC2436", 4.0, 4.0, 18.0, 36.0),
+            Placement("W2436", 4.0, 44.0, 24.0, 36.0),
+        ]
+    )
+    demand = [PartSpec("WDC2436", 18.0, 36.0, 1), PartSpec("W2436", 24.0, 36.0, 1)]
+    program, plan = plan_sheet(
+        layout,
+        ProgramHeader(name="R990102N", created=CREATED),
+        demand,
+        NestingConfig(),
+    )
+    return Case("WDC", program, plan, default_config())
+
+
+def nested_case() -> Case:
+    """A planner-built sheet with a frame nested in another frame's opening.
+
+    Same placements as ``tests/test_post.py``'s ``sample_program`` -- a W3012
+    turned 90 degrees inside a W2742's opening, and a second W3012 beside it --
+    but planned by :func:`~faceframe_cnc.post.from_layout.plan_sheet`, which is
+    what applies the 2026-08-03 onion-skin order.
+    """
+    layout = SheetLayout(
+        [
+            Placement(
+                "W2742",
+                0.0,
+                0.0,
+                27.0,
+                42.0,
+                False,
+                [Placement("W3012", 5.0, 6.0, 12.0, 30.0, True, [])],
+            ),
+            Placement("W3012", 30.0, 0.0, 12.0, 30.0, True, []),
+        ]
+    )
+    demand = [PartSpec("W2742", 27.0, 42.0, 1), PartSpec("W3012", 30.0, 12.0, 2)]
+    program, plan = plan_sheet(
+        layout,
+        ProgramHeader(name="R990103N", created=CREATED),
+        demand,
+        NestingConfig(),
+    )
+    return Case("NESTED", program, plan, default_config())
+
+
+_CASES: dict[str, Case] = {}
+
+
+def cases() -> dict[str, Case]:
+    """Every fixture, built once: reconstructing three files is not free."""
+    if not _CASES:
+        for name in REFERENCES:
+            program, plan = reconstruct(path_of(name))
+            _CASES[name] = Case(name, program, plan, default_config())
+        _CASES["WDC"] = wdc_case()
+        _CASES["NESTED"] = nested_case()
+    return _CASES
+
+
+def case(label: str) -> Case:
+    return cases()[label]
+
+
+def planned_features(plan: CutPlan) -> dict[str, list]:
+    """The features each section cuts, in plan order."""
+    return {
+        SECTION_PANEL: list(plan.panel),
+        SECTION_WDC_SLOT: list(plan.wdc_slot),
+        SECTION_OPENINGS: list(plan.openings),
+        SECTION_DETAIL: list(plan.detail_order()),
+        SECTION_PERIMETER: [ref for refs in plan.perimeter for ref in refs],
+    }
+
+
+def planned_sections(plan: CutPlan) -> list[str]:
+    """The sections that will be emitted: the plan's order, empties dropped."""
+    features = planned_features(plan)
+    return [section for section in plan.sections if features[section]]
+
+
+def spec_for(config: PostConfig, section: str, pass_index: int | None):
+    """The pass table a section's motions are driven by."""
+    if section == SECTION_PANEL:
+        return config.panel
+    if section == SECTION_WDC_SLOT:
+        return config.wdc_slot
+    if section == SECTION_OPENINGS:
+        return config.openings_pass
+    if section == SECTION_DETAIL:
+        return config.detail_pass
+    return config.perimeter_passes[pass_index]
+
+
+def z_cut_for(config: PostConfig, section: str, pass_index: int | None) -> float:
+    if section == SECTION_WDC_SLOT:
+        return config.wdc_slot.z_cuts[pass_index]
+    return spec_for(config, section, pass_index).z_cut
+
+
+def runs(values) -> list:
+    """Consecutive duplicates collapsed: the order things were cut IN."""
+    return [key for key, _ in groupby(values)]
+
+
+# --------------------------------------------------------------------------
+# (a) one emission path
+# --------------------------------------------------------------------------
+
+
+class OneEmissionPathTest(unittest.TestCase):
+    """The text is the render of the stream, and nothing else is."""
+
+    def test_generate_is_the_render_of_the_event_stream(self):
+        for label, item in cases().items():
+            with self.subTest(case=label):
+                emitted = item.emitted
+                self.assertEqual(
+                    emitted.text,
+                    "\r\n".join(emitted.lines) + "\r\n",
+                    "the renderer is a join over the events, nothing more",
+                )
+                self.assertEqual(
+                    generate(item.program, item.plan, item.config), emitted.text
+                )
+
+    def test_the_reference_files_still_come_back_byte_for_byte(self):
+        """The guardrail, restated from the motion side.
+
+        ``tests/test_post.py`` owns this proof; it is repeated here because
+        every assertion below reads coordinates off the SAME stream that
+        produced these bytes, and a stream that had drifted would still pass
+        the rest of this file if the text were free to drift with it.
+        """
+        for name in REFERENCES:
+            with self.subTest(case=name):
+                item = case(name)
+                self.assertEqual(
+                    generate(item.program, item.plan, item.config), read(name)
+                )
+
+    def test_every_event_is_exactly_one_line(self):
+        for label, item in cases().items():
+            with self.subTest(case=label):
+                emitted = item.emitted
+                lines = emitted.text.split("\r\n")
+                # split() leaves the empty string after the trailing CRLF
+                self.assertEqual(lines[:-1], list(emitted.lines))
+                for position, event in enumerate(emitted.events):
+                    self.assertEqual(event.line_index, position)
+
+    def test_a_motion_line_index_names_its_own_line(self):
+        for label, item in cases().items():
+            with self.subTest(case=label):
+                emitted = item.emitted
+                claimed = [m.line_index for m in emitted.motions]
+                self.assertEqual(
+                    len(claimed), len(set(claimed)), "two motions on one line"
+                )
+                for motion in emitted.motions:
+                    self.assertIs(
+                        emitted.events[motion.line_index].motion,
+                        motion,
+                        "a motion's line_index must index the event it came from",
+                    )
+
+    def test_generate_motions_is_the_streams_motions(self):
+        for label, item in cases().items():
+            with self.subTest(case=label):
+                self.assertEqual(item.motions, list(item.emitted.motions))
+
+
+# --------------------------------------------------------------------------
+# (b) the drift guard: text against motions
+# --------------------------------------------------------------------------
+
+
+class TextVersusMotionTest(unittest.TestCase):
+    """Every motion is held to the words on its own line, and vice versa."""
+
+    def assert_words_agree(self, item: Case) -> None:
+        emitted = item.emitted
+        lines = list(emitted.lines)
+        stated_feed: str | None = None
+        modal_g = None
+
+        for event in emitted.events:
+            line = lines[event.line_index]
+            for value in g_words(line):
+                if value in ("0", "1"):
+                    modal_g = value
+            motion = event.motion
+            if motion is None:
+                continue
+            words = words_of(line)
+            where = f"{item.label} line {event.line_index + 1}: {line!r}"
+
+            # X/Y/Z: a word may be absent only when the axis does not move.
+            for letter, start, end in (
+                ("X", motion.from_x, motion.to_x),
+                ("Y", motion.from_y, motion.to_y),
+                ("Z", motion.from_z, motion.to_z),
+            ):
+                if letter in words:
+                    self.assertIsNotNone(
+                        end, f"{where}: {letter} word with no target"
+                    )
+                    self.assertEqual(words[letter], fmt(end), f"{where}: {letter}")
+                elif start is None or end is None:
+                    self.assertIs(start, end, f"{where}: {letter} appeared from None")
+                else:
+                    self.assertAlmostEqual(
+                        start,
+                        end,
+                        delta=TOL,
+                        msg=f"{where}: {letter} moved with no {letter} word",
+                    )
+
+            # F is modal too: a cutting move with no F word runs at the last
+            # feed the program stated.
+            if "F" in words:
+                self.assertIsNotNone(motion.feed, f"{where}: F word on a rapid")
+                self.assertEqual(words["F"], fmt(motion.feed), f"{where}: F")
+                stated_feed = words["F"]
+            elif motion.feed is not None:
+                self.assertEqual(
+                    fmt(motion.feed),
+                    stated_feed,
+                    f"{where}: claims a feed the program never stated",
+                )
+
+            # The kind has to agree with the G word in force.
+            if motion.kind in (MotionKind.PLUNGE, MotionKind.FEED):
+                self.assertEqual(modal_g, "1", f"{where}: cutting under G{modal_g}")
+            elif motion.kind is MotionKind.RAPID:
+                self.assertEqual(modal_g, "0", f"{where}: rapid under G{modal_g}")
+            if motion.from_z is not None and motion.to_z is not None:
+                if motion.kind is MotionKind.PLUNGE:
+                    self.assertLess(motion.to_z, motion.from_z, where)
+                elif motion.kind is MotionKind.FEED:
+                    self.assertAlmostEqual(
+                        motion.to_z, motion.from_z, delta=TOL, msg=where
+                    )
+                elif motion.kind is MotionKind.RETRACT:
+                    self.assertGreaterEqual(motion.to_z, motion.from_z - TOL, where)
+                else:
+                    self.assertLessEqual(motion.to_z, motion.from_z + TOL, where)
+
+    def test_every_motion_matches_the_words_on_its_line(self):
+        for label, item in cases().items():
+            with self.subTest(case=label):
+                self.assert_words_agree(item)
+
+    def test_no_line_moves_the_tool_without_a_motion(self):
+        """The other direction: the stream may not be missing a move.
+
+        A line with an X, Y or Z word and no :class:`Motion` beside it would be
+        a cut a simulation never sees.  The only ones allowed are the fixed
+        header/footer/tail blocks and the section head's restate, which is
+        held to the position the emitter says the machine is already in.
+        """
+        for label, item in cases().items():
+            with self.subTest(case=label):
+                emitted = item.emitted
+                x, y = 0.0, 0.0
+                for event in emitted.events:
+                    if event.motion is not None:
+                        x, y = event.motion.to_x, event.motion.to_y
+                        continue
+                    text = event.text
+                    where = f"{label} line {event.line_index + 1}: {text!r}"
+                    if text in ("", "%") or text.startswith("("):
+                        continue
+                    if text in _FIXED_LINES:
+                        continue
+                    if re.fullmatch(r"O\d{4} \(.*\)", text):
+                        continue
+                    if re.fullmatch(r"[MT]\d+", text) or text == "G80":
+                        continue
+                    restate = _RESTATE_RE.match(text)
+                    self.assertTrue(restate, f"{where}: unclassified literal")
+                    self.assertEqual(
+                        (restate.group(1), restate.group(2)),
+                        (fmt(x), fmt(y)),
+                        f"{where}: restates a position the tool is not in",
+                    )
+
+
+# --------------------------------------------------------------------------
+# (c) order, tools and counts
+# --------------------------------------------------------------------------
+
+
+class OrderAndCountTest(unittest.TestCase):
+    """What was cut, in what order, with what tool."""
+
+    def test_section_order_follows_the_plan(self):
+        for label, item in cases().items():
+            with self.subTest(case=label):
+                self.assertEqual(
+                    runs(m.section for m in item.motions),
+                    planned_sections(item.plan),
+                    "each section's motions are contiguous and in plan order",
+                )
+
+    def test_the_wdc_sheet_emits_the_measured_section_sequence(self):
+        """T13 -> T17 -> T11 openings -> T12 detail -> T11 perimeter."""
+        item = case("WDC")
+        self.assertEqual(
+            runs(m.section for m in item.motions),
+            [
+                SECTION_PANEL,
+                SECTION_WDC_SLOT,
+                SECTION_OPENINGS,
+                SECTION_DETAIL,
+                SECTION_PERIMETER,
+            ],
+        )
+
+    def test_every_motion_of_a_section_carries_that_sections_tool(self):
+        for label, item in cases().items():
+            with self.subTest(case=label):
+                seen = {}
+                for motion in item.motions:
+                    seen.setdefault(motion.section, set()).add(motion.tool)
+                for section, tools in seen.items():
+                    self.assertEqual(
+                        tools,
+                        {item.config.tool(section)},
+                        f"{label}: {section} used more than its own tool",
+                    )
+                self.assertEqual(
+                    runs(item.config.tool(m.section).number for m in item.motions),
+                    [
+                        item.config.tool(section).number
+                        for section in planned_sections(item.plan)
+                    ],
+                )
+
+    def test_the_features_cut_per_section_are_the_planned_ones(self):
+        """Order AND count, section by section.
+
+        A perimeter feature is named by (depth pass, part) because the same
+        :class:`~.model.FeatureRef` value is cut once per pass; every other
+        section names a feature once, and a WDC slot's two depth passes belong
+        to the one plan entry that asked for them.
+        """
+        for label, item in cases().items():
+            with self.subTest(case=label):
+                features = planned_features(item.plan)
+                for section in planned_sections(item.plan):
+                    section_motions = [
+                        m for m in item.motions if m.section == section
+                    ]
+                    if section == SECTION_PERIMETER:
+                        keys = runs(
+                            (m.pass_index, m.feature) for m in section_motions
+                        )
+                        self.assertEqual(
+                            [feature for _, feature in keys],
+                            features[section],
+                            f"{label}: {section}",
+                        )
+                    else:
+                        self.assertEqual(
+                            runs(m.feature for m in section_motions),
+                            features[section],
+                            f"{label}: {section}",
+                        )
+
+    def test_perimeter_pass_one_finishes_before_pass_two_starts(self):
+        for label, item in cases().items():
+            with self.subTest(case=label):
+                order = runs(
+                    m.pass_index
+                    for m in item.motions
+                    if m.section == SECTION_PERIMETER
+                )
+                self.assertEqual(
+                    order,
+                    list(range(len(item.plan.perimeter))),
+                    "the onion skin is only a skin if every pass 1 cut precedes "
+                    "every pass 2 cut",
+                )
+
+    def test_pass_two_frees_nested_inners_before_their_hosts(self):
+        """The 2026-08-03 onion-skin order, on the two sheets that nest.
+
+        R720101N is the reference the rule was read off; the NESTED case is
+        the planner producing it for a sheet nobody measured.
+        """
+        for label in ("R720101N", "NESTED"):
+            with self.subTest(case=label):
+                item = case(label)
+                parents = item.parents()
+                self.assertTrue(
+                    any(p is not None for p in parents),
+                    "fixture must actually nest something",
+                )
+                order = runs(
+                    m.feature.part
+                    for m in item.motions
+                    if m.section == SECTION_PERIMETER and m.pass_index == 1
+                )
+                for child, host in enumerate(parents):
+                    if host is None:
+                        continue
+                    self.assertLess(
+                        order.index(child),
+                        order.index(host),
+                        f"{label}: part {child} sits in part {host}'s opening and "
+                        f"must be cut free first",
+                    )
+
+    def test_openings_are_cut_in_plan_order(self):
+        for label, item in cases().items():
+            with self.subTest(case=label):
+                self.assertEqual(
+                    runs(
+                        m.feature
+                        for m in item.motions
+                        if m.section == SECTION_OPENINGS
+                    ),
+                    list(item.plan.openings),
+                )
+
+    def test_the_planner_routes_the_deepest_nested_openings_first(self):
+        """On a planner-built nested sheet the openings run inners-first.
+
+        The references' opening order is the shop CAM's and is replayed as
+        recovered, so this is asserted where the post is the one choosing.
+        """
+        from faceframe_cnc.post.from_layout import part_depths
+
+        item = case("NESTED")
+        depths = part_depths(item.program)
+        cut = [
+            m.feature.part
+            for m in item.motions
+            if m.section == SECTION_OPENINGS
+        ]
+        seen = runs(cut)
+        self.assertEqual(
+            [depths[i] for i in seen],
+            sorted((depths[i] for i in seen), reverse=True),
+            "a host's opening may not be routed before its passenger's",
+        )
+
+    def test_a_wdc_slot_is_two_passes_on_one_centreline(self):
+        """One straight plunge-and-cut per depth pass, both on the same X.
+
+        The part is upright, so its stiles are its left and right edges and
+        the slots run in Y (:func:`~.generator.wdc_slot_segment`).  The deeper
+        pass reaches further past each end, because a 45-degree cone's surface
+        radius IS its depth of cut -- the reach comes from
+        :meth:`~.model.PostConfig.wdc_slot_reach`, never from a number here.
+        """
+        item = case("WDC")
+        cfg = item.config
+        part = item.program.flat_parts()[0]
+        self.assertFalse(part.rotated)
+        refs = list(item.plan.wdc_slot)
+        self.assertEqual(len(refs), 2, "a frame has two stiles")
+
+        spans = {}
+        centrelines = set()
+        for ref in refs:
+            cuts = [
+                m
+                for m in item.motions
+                if m.section == SECTION_WDC_SLOT and m.feature == ref and m.is_cut
+            ]
+            self.assertEqual(
+                [m.kind for m in cuts],
+                [
+                    MotionKind.PLUNGE,
+                    MotionKind.FEED,
+                    MotionKind.PLUNGE,
+                    MotionKind.FEED,
+                ],
+                f"stile {ref.index}: two plunge/cut pairs, nothing else",
+            )
+            self.assertEqual([m.pass_index for m in cuts], [0, 0, 1, 1])
+            centreline = {round(v, 4) for m in cuts for v in (m.from_x, m.to_x)}
+            self.assertEqual(
+                len(centreline), 1, f"stile {ref.index}: both passes on one X"
+            )
+            centrelines |= centreline
+            for position in (0, 1):
+                plunge, feed = cuts[2 * position], cuts[2 * position + 1]
+                self.assertAlmostEqual(
+                    plunge.to_z,
+                    cfg.wdc_slot.z_cuts[position],
+                    delta=TOL,
+                )
+                span = feed.to_y - plunge.from_y
+                self.assertAlmostEqual(
+                    span,
+                    part.box.height + 2 * cfg.wdc_slot_reach(position),
+                    delta=1e-9,
+                    msg="the slot runs the stile plus that pass's reach at each end",
+                )
+                spans[(ref.index, position)] = span
+            self.assertGreater(
+                spans[(ref.index, 1)],
+                spans[(ref.index, 0)],
+                "the deeper pass cuts wider, so it overruns further",
+            )
+        self.assertEqual(
+            sorted(centrelines),
+            [
+                round(part.box.x0 + cfg.wdc_slot.inset_from_outside_edge, 4),
+                round(part.box.x1 - cfg.wdc_slot.inset_from_outside_edge, 4),
+            ],
+            "the two slots sit one per stile, not both on one",
+        )
+
+
+# --------------------------------------------------------------------------
+# (d) tagging
+# --------------------------------------------------------------------------
+
+
+class TaggingTest(unittest.TestCase):
+    """What each motion says it is FOR."""
+
+    def test_every_motion_names_its_section(self):
+        for label, item in cases().items():
+            with self.subTest(case=label):
+                planned = set(planned_sections(item.plan))
+                for motion in item.motions:
+                    self.assertIn(motion.section, planned)
+
+    def test_every_cutting_move_names_a_feature(self):
+        for label, item in cases().items():
+            with self.subTest(case=label):
+                for motion in item.motions:
+                    self.assertIsNotNone(
+                        motion.feature,
+                        f"{label} line {motion.line_index + 1}: an untagged move",
+                    )
+
+    def test_a_preposition_belongs_to_the_feature_it_positions_for(self):
+        for label, item in cases().items():
+            with self.subTest(case=label):
+                motions = item.motions
+                for index, motion in enumerate(motions):
+                    if motion.kind is not MotionKind.RAPID:
+                        continue
+                    upcoming = next(
+                        (m for m in motions[index:] if m.is_cut), None
+                    )
+                    self.assertIsNotNone(upcoming)
+                    self.assertEqual(
+                        motion.feature,
+                        upcoming.feature,
+                        f"{label} line {motion.line_index + 1}: rapid tagged with a "
+                        f"feature it is not approaching",
+                    )
+                    self.assertEqual(motion.pass_index, upcoming.pass_index)
+
+    def test_a_retract_belongs_to_the_feature_it_leaves(self):
+        for label, item in cases().items():
+            with self.subTest(case=label):
+                motions = item.motions
+                for index, motion in enumerate(motions):
+                    if motion.kind is not MotionKind.RETRACT:
+                        continue
+                    cut = next(
+                        (m for m in reversed(motions[:index]) if m.is_cut), None
+                    )
+                    self.assertIsNotNone(cut)
+                    self.assertEqual(motion.feature, cut.feature)
+
+    def test_the_pass_index_is_set_where_and_only_where_passes_exist(self):
+        for label, item in cases().items():
+            with self.subTest(case=label):
+                for motion in item.motions:
+                    if motion.section == SECTION_PERIMETER:
+                        self.assertIn(
+                            motion.pass_index, range(len(item.config.perimeter_passes))
+                        )
+                    elif motion.section == SECTION_WDC_SLOT:
+                        self.assertIn(
+                            motion.pass_index,
+                            range(len(item.config.wdc_slot.z_cuts)),
+                        )
+                    else:
+                        self.assertIsNone(motion.pass_index)
+
+    def test_feeds_and_depths_come_from_the_pass_table(self):
+        for label, item in cases().items():
+            with self.subTest(case=label):
+                for motion in item.motions:
+                    spec = spec_for(item.config, motion.section, motion.pass_index)
+                    where = f"{label} line {motion.line_index + 1}"
+                    if motion.kind is MotionKind.PLUNGE:
+                        self.assertAlmostEqual(
+                            motion.feed, spec.entry_feed, delta=TOL, msg=where
+                        )
+                        self.assertAlmostEqual(
+                            motion.to_z,
+                            z_cut_for(
+                                item.config, motion.section, motion.pass_index
+                            ),
+                            delta=TOL,
+                            msg=where,
+                        )
+                    elif motion.kind is MotionKind.FEED:
+                        self.assertAlmostEqual(
+                            motion.feed, spec.cut_feed, delta=TOL, msg=where
+                        )
+                    elif motion.kind is MotionKind.RAPID:
+                        self.assertIsNone(motion.feed, where)
+
+    def test_the_only_unknown_z_is_a_sections_first_spindle_on_rapid(self):
+        """Z is a machine position until each section's ``G43`` states it.
+
+        Every section is entered straight off a ``G28 Z0`` homing move, so the
+        first rapid of a section genuinely has no work Z to report -- and every
+        other move in the program does.
+        """
+        for label, item in cases().items():
+            with self.subTest(case=label):
+                unknown = [
+                    m
+                    for m in item.motions
+                    if m.from_z is None or m.to_z is None
+                ]
+                self.assertEqual(
+                    len(unknown),
+                    2 * len(planned_sections(item.plan)),
+                    "two per section: the spindle-on rapid and the G43 after it",
+                )
+                for motion in unknown:
+                    self.assertIs(motion.kind, MotionKind.RAPID)
+                    self.assertIsNone(motion.from_z)
+                self.assertEqual(
+                    runs(m.section for m in unknown),
+                    planned_sections(item.plan),
+                )
+
+    def test_the_marker_retract_moves_nothing(self):
+        """The bare ``M59`` + ``G0 Z2.5`` after the first perimeter loop.
+
+        The tool is already at the rapid plane there (R710101N 230-232), so the
+        motion is a zero-displacement retract: the text renders and a
+        simulation sees a no-op.
+        """
+        for label, item in cases().items():
+            with self.subTest(case=label):
+                self.assertTrue(item.config.perimeter_marker_after_first_loop)
+                emitted = item.emitted
+                markers = [
+                    event
+                    for event in emitted.events
+                    if event.text == "M59"
+                    and event.section == SECTION_PERIMETER
+                    and event.motion is None
+                    and emitted.events[event.line_index + 1].motion is not None
+                ]
+                self.assertEqual(len(markers), 1, "one marker, after loop one")
+                motion = emitted.events[markers[0].line_index + 1].motion
+                self.assertIs(motion.kind, MotionKind.RETRACT)
+                self.assertEqual(
+                    (motion.from_x, motion.from_y, motion.from_z),
+                    (motion.to_x, motion.to_y, motion.to_z),
+                )
+                self.assertEqual(motion.pass_index, 0)
+
+
+# --------------------------------------------------------------------------
+# (e) determinism
+# --------------------------------------------------------------------------
+
+
+class DeterminismTest(unittest.TestCase):
+    """A post that is not reproducible cannot be diffed against the shop's."""
+
+    def test_two_calls_produce_equal_streams(self):
+        for label, item in cases().items():
+            with self.subTest(case=label):
+                first = generate_motions(item.program, item.plan, item.config)
+                second = generate_motions(item.program, item.plan, item.config)
+                self.assertEqual(first, second)
+                self.assertIsNot(first, second)
+                self.assertEqual(
+                    emit(item.program, item.plan, item.config).events,
+                    emit(item.program, item.plan, item.config).events,
+                )
+
+
+if __name__ == "__main__":  # pragma: no cover
+    unittest.main()

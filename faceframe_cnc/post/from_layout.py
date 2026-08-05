@@ -142,7 +142,33 @@ EPS = 1e-9
 
 
 class SheetPlanError(ValueError):
-    """This sheet cannot be turned into a program, with a reason fit for the UI."""
+    """This sheet cannot be turned into a program, with a reason fit for the UI.
+
+    The message is the whole reason and is what a UI shows; the two optional
+    attributes say WHICH part the refusal is about, so a view can point at it
+    on the sheet instead of leaving the operator to find it in the prose:
+
+    ``part_number``
+        the part this post is refusing to cut, or ``None``;
+    ``box``
+        that part's footprint in sheet coordinates, or ``None``.
+
+    Both default to ``None`` and both are keyword-only, so every existing
+    ``raise SheetPlanError(message)`` keeps working unchanged and the message
+    text is untouched — the raise sites that happen to know a part fill them
+    in, and the ones that do not (an empty sheet, a mis-sized post table) do
+    not have to pretend.
+    """
+
+    def __init__(
+        self,
+        *args,
+        part_number: str | None = None,
+        box: Box | None = None,
+    ):
+        super().__init__(*args)
+        self.part_number = part_number
+        self.box = box
 
 
 class WdcNotSupportedError(SheetPlanError):
@@ -261,14 +287,24 @@ def _check_wdc_clearance(program: SheetProgram, config: PostConfig) -> None:
             for position in range(len(config.wdc_slot.z_cuts)):
                 swept = wdc_slot_sweep(part, index, position, config)
                 if not sheet.contains(swept, EPS):
-                    raise WdcNotSupportedError(_wdc_edge_refusal(part, swept, program))
+                    raise WdcNotSupportedError(
+                        _wdc_edge_refusal(part, swept, program),
+                        part_number=part.part_number,
+                        box=part.box,
+                    )
                 for other, bands in solids:
                     if other is part:
                         continue
                     for band in bands:
                         if band.overlaps(swept, EPS):
+                            # The part named is the one whose CUT is refused:
+                            # the slot belongs to the WDC frame, and it is the
+                            # frame a view has to point at.  The neighbour it
+                            # would have carved is in the message.
                             raise WdcNotSupportedError(
-                                _wdc_neighbour_refusal(part, other)
+                                _wdc_neighbour_refusal(part, other),
+                                part_number=part.part_number,
+                                box=part.box,
                             )
 
 
@@ -329,11 +365,18 @@ def _check_against_order(placements, specs) -> None:
         return
     ordered = {spec.part_number: spec for spec in specs}
     for placement in _walk(placements):
+        # Placement dimensions are AS PLACED (already swapped when rotated),
+        # so this is the footprint without any further reasoning.
+        where = Box.from_size(
+            placement.x, placement.y, placement.width, placement.height
+        )
         spec = ordered.get(placement.part_number)
         if spec is None:
             raise SheetPlanError(
                 f"{placement.part_number} is on the sheet but not in the order — "
-                f"refusing to cut a part with no order line"
+                f"refusing to cut a part with no order line",
+                part_number=placement.part_number,
+                box=where,
             )
         same = (
             abs(placement.width - spec.width) <= 1e-6
@@ -347,7 +390,9 @@ def _check_against_order(placements, specs) -> None:
             raise SheetPlanError(
                 f"{placement.part_number} is placed {placement.width:g}x"
                 f"{placement.height:g} but ordered {spec.width:g}x{spec.height:g} — "
-                f"frame dimensions must never be altered"
+                f"frame dimensions must never be altered",
+                part_number=placement.part_number,
+                box=where,
             )
 
 
@@ -475,7 +520,9 @@ def _check_groove_fit(part: PartProgram, panel: PanelSpec) -> None:
         raise SheetPlanError(
             f"{part.part_number} is {part.box.width:g}x{part.box.height:g}, too "
             f"small for the measured {panel.stile_inset:g}/{panel.rail_inset:g} "
-            f"panel-groove pattern"
+            f"panel-groove pattern",
+            part_number=part.part_number,
+            box=part.box,
         )
 
 
@@ -493,7 +540,9 @@ def _check_slot_fit(part: PartProgram, config: PostConfig) -> None:
         raise SheetPlanError(
             f"{part.part_number} is {part.box.width:g}x{part.box.height:g}: its "
             f"two {spec.stile_width:g}\" stiles leave no frame between them, so "
-            f"the T17 slot centrelines are not on stiles"
+            f"the T17 slot centrelines are not on stiles",
+            part_number=part.part_number,
+            box=part.box,
         )
 
 

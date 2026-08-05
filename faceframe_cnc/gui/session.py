@@ -43,7 +43,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Iterable, Optional, Sequence
+from typing import TYPE_CHECKING, Iterable, Optional, Sequence
 
 from ..geometry import (
     MEMBER,
@@ -71,8 +71,20 @@ from ..nesting import (
     validate_layouts,
 )
 
+if TYPE_CHECKING:  # names used only in annotations, so no import cost at run
+    # Everything the 3D simulation needs comes out of the post and sim
+    # packages, and both are imported LAZILY inside
+    # :meth:`Session.simulation_inputs` -- the same rule the rest of this
+    # module follows (see :func:`opening_tool_inset`), so a machine that only
+    # ever loads an order still pays for nothing it does not use.
+    from ..post.model import CutPlan, PostConfig, ProgramHeader, SheetProgram
+    from ..post.verifier import ExpectedWork
+    from ..sim import FindingSet, SimTimeline
+
 __all__ = [
     "SETTINGS_FILENAME",
+    "SIM_CREATED",
+    "SIM_JOB_PREFIX",
     "AppSettings",
     "SessionError",
     "RowStatus",
@@ -80,6 +92,8 @@ __all__ = [
     "EditResult",
     "OpeningRect",
     "Session",
+    "SimulationInputs",
+    "SimulationRefused",
     "default_settings_path",
     "frame_problem",
     "load_settings",
@@ -1022,6 +1036,122 @@ class EditResult:
 def _strip_sheet_number(problem: str) -> str:
     """Drop the "sheet N: " prefix so problems compare across a re-numbering."""
     return re.sub(r"^sheet \d+: ", "", problem)
+
+
+# --------------------------------------------------------------------------
+# 3D cut simulation (Milestone 5 of the simulation work)
+# --------------------------------------------------------------------------
+#
+# The simulation judges a sheet with the SAME inputs the Generate path judges
+# it with: the same :func:`~faceframe_cnc.post.from_layout.plan_sheet` call,
+# the same post table, and the same expected-work manifest
+# (:func:`~faceframe_cnc.post.verifier.expected_work`) that
+# :func:`faceframe_cnc.post.job.build_job` hands the verifier.  So a missing
+# cut shows up in 3D exactly as it would refuse at Generate, and the operator
+# is never shown a sheet running clean that Generate will then refuse.
+#
+# Nothing here writes a file and nothing here is a second opinion: the
+# planner refuses, the verifier judges, this only assembles their inputs.
+
+#: ``(CREATED ON ...)`` text the simulated program carries.  FIXED, not a
+#: clock reading: simulating one sheet twice must judge the same bytes, and
+#: the created line is the one header line a clock would move.  It says what
+#: it is, because this program is NOT the one the operator carries to the
+#: machine — that one is named, dated and written by
+#: :mod:`faceframe_cnc.post.job` at Generate time.
+SIM_CREATED = "SIMULATION - NO FILE IS WRITTEN"
+
+#: Job prefix the simulated program's NAME is built from when the settings
+#: hold none yet.  The name is only read back by the verifier's header rule
+#: and shown in the window title, so the convention is the real one (spec
+#: section 6, :func:`faceframe_cnc.post.job.sheet_filename`) with a prefix
+#: that cannot be mistaken for a job somebody generated.
+SIM_JOB_PREFIX = "0000"
+
+
+class SimulationRefused(SessionError):
+    """The post refuses to cut the sheet the user asked to simulate.
+
+    A :class:`SessionError`, so every ``except SessionError`` in the Qt layer
+    still catches it, and its ``str()`` is the refusal's own words verbatim.
+    What it adds is the STRUCTURE the 3D refusal view needs and a message
+    cannot carry:
+
+    :attr:`error`
+        the original exception, preserved whole (and as ``__cause__``): a
+        :class:`~faceframe_cnc.post.from_layout.SheetPlanError`, which carries
+        ``part_number`` and ``box``, or the ``ValueError`` a later gate raised;
+    :attr:`part_number` / :attr:`box`
+        mirrored off it, so this object can go straight to
+        :class:`~faceframe_cnc.gui.sim3d.refusal.RefusalView`, which reads
+        both with ``getattr``;
+    :attr:`program`
+        the :class:`~faceframe_cnc.post.model.SheetProgram` when one could be
+        built — the refusal view draws the sheet from it and outlines the part
+        the refusal names.  ``None`` when the refusal came before there was a
+        program (an empty sheet, a frame the geometry engine rejects), which is
+        that view's banner-only case;
+    :attr:`post_config`
+        the post table the sheet was planned against, so the view's envelopes
+        are the machine's real reach rather than a default.
+
+    Wrapping instead of propagating follows this module's own convention —
+    everything the Qt layer catches is a :class:`SessionError` carrying a
+    message fit for a message box — and nothing is lost, because the original
+    exception is right here on the object.
+    """
+
+    def __init__(
+        self,
+        error: BaseException,
+        program: "SheetProgram | None" = None,
+        post_config: "PostConfig | None" = None,
+        sheet_index: int = -1,
+    ):
+        super().__init__(str(error))
+        self.error = error
+        self.program = program
+        self.post_config = post_config
+        self.sheet_index = int(sheet_index)
+        self.part_number: Optional[str] = getattr(error, "part_number", None)
+        self.box = getattr(error, "box", None)
+
+
+@dataclass(frozen=True)
+class SimulationInputs:
+    """One unique sheet, planned, emitted and judged, ready for the 3D window.
+
+    Everything :class:`~faceframe_cnc.gui.sim3d.window.Sim3DWindow` needs and
+    nothing it has to derive: :attr:`timeline` is the emitted program indexed
+    for playback and :attr:`findings` the verifier's verdict on that same
+    text, located on it.  The rest is kept because a caller (and a test) has
+    to be able to see WHAT was judged: the sheet it came from, the header and
+    post table it was emitted with, and the manifest of cuts the sheet owed.
+    """
+
+    #: Index into :attr:`Session.sheets` — the sheet the user was looking at.
+    sheet_index: int
+    layout: SheetLayout
+    #: Physical sheets cut from this picture (banner information only here).
+    run_quantity: int
+    header: "ProgramHeader"
+    post_config: "PostConfig"
+    program: "SheetProgram"
+    plan: "CutPlan"
+    timeline: "SimTimeline"
+    #: The manifest :func:`faceframe_cnc.post.job.build_job` would hand
+    #: :func:`~faceframe_cnc.post.verifier.verify` for this sheet.
+    expected: "ExpectedWork"
+    findings: "FindingSet"
+
+    @property
+    def clean(self) -> bool:
+        """True when the verifier found nothing wrong with this program."""
+        return not self.findings
+
+    @property
+    def program_name(self) -> str:
+        return self.header.name
 
 
 # --------------------------------------------------------------------------
@@ -2332,6 +2462,178 @@ class Session:
         from ..report.cutsheet import report_filename
 
         return report_filename(str(prefix).strip())
+
+    # -- 3D cut simulation -----------------------------------------------
+
+    def can_simulate(self, sheet_index: int) -> bool:
+        """True when :meth:`simulation_inputs` has a sheet to work on.
+
+        STRUCTURAL only — is there a current layout, and is this one of its
+        unique sheets.  Deliberately NOT ``can_generate``: a sheet the post
+        REFUSES is precisely the sheet the 3D refusal view exists for, so
+        gating on cleanliness would hide the one picture that explains the
+        refusal.  Staleness is not cleanliness, and staleness is covered
+        anyway — every path that invalidates a layout clears :attr:`result`
+        (:meth:`edit_row`, :meth:`resolve_row`, :meth:`set_included`,
+        :meth:`set_all_included`, :meth:`set_settings`, :meth:`load_order`),
+        so a stale layout offers no sheets here either.
+        :meth:`simulation_inputs` still has the last word and gives the reason
+        in words.
+        """
+        return self.result is not None and 0 <= sheet_index < self.unique_sheet_count
+
+    def simulation_inputs(self, sheet_index: int) -> SimulationInputs:
+        """Plan, emit and judge ONE unique sheet for the 3D simulation.
+
+        The same steps :func:`faceframe_cnc.post.job.build_job` takes for the
+        sheet it is about to write, in the same order and against the same
+        tables:
+
+        1.  the gate first.  :meth:`generate_blocker` — no layout, or a layout
+            that does not pass its own validator — is reused verbatim rather
+            than re-derived, so there is exactly ONE notion in this app of
+            whether the layout on screen may be worked with (the 2026-08-04
+            rule: a stale layout must never reach Generate, and it must not
+            reach the simulation either).  Then :meth:`sheet`, which is what
+            refuses an index that is not on the screen's layout;
+        2.  ``post_config_for(result.config, None)`` — the same post table
+            Generate uses, with the optimizer's sheet size in it;
+        3.  :func:`~faceframe_cnc.post.from_layout.plan_sheet` on the sheet's
+            layout, ``result.demand`` and ``result.config`` — the same call
+            with the same arguments;
+        4.  :meth:`~faceframe_cnc.sim.SimTimeline.build`, then
+            :func:`~faceframe_cnc.post.verifier.expected_work` on the LAYOUT
+            (not on the plan) and :func:`~faceframe_cnc.sim.run_verifier` with
+            that manifest, located by
+            :meth:`~faceframe_cnc.sim.FindingSet.build`.  Judging with the
+            manifest is the whole point: without it the verifier can only see
+            what the file says, never what the sheet owed, so a dropped
+            through-cut or an unrouted opening would play back looking fine
+            and refuse at Generate.
+
+        Two deliberate differences from the job builder, neither of which can
+        change the verdict:
+
+        *   the header is a fixed simulation identity (:data:`SIM_CREATED`,
+            :data:`SIM_JOB_PREFIX` when the settings hold no prefix yet), so
+            simulating one sheet twice judges the same bytes.  The real
+            O-number, file name and date belong to the run the operator
+            starts in the Generate dialog, and they do not exist yet;
+        *   no ``banner_lines``.  The banner states the job's sheet numbering
+            and run quantity, which likewise do not exist yet; the verifier
+            skips header comments, and
+            :func:`~faceframe_cnc.post.verifier.expected_work` never looks at
+            them, so their absence is invisible to every rule that judges a
+            cut.
+
+        Raises :class:`SessionError` for a state with nothing to simulate
+        (gate 1) and :class:`SimulationRefused` — a ``SessionError`` carrying
+        the planner's own exception, the part it named and the program when
+        there is one — when the post refuses the sheet.  A refusal is a
+        RESULT here, not a bug: the caller shows it in 3D.
+        """
+        blocker = self.generate_blocker()
+        if blocker is not None:
+            raise SessionError(blocker)
+        layout, run = self.sheet(sheet_index)
+
+        from ..post.from_layout import plan_sheet, post_config_for
+        from ..post.model import ProgramHeader
+        from ..post.verifier import expected_work
+        from ..sim import FindingSet, SimTimeline, run_verifier
+
+        result = self.result
+        assert result is not None  # generate_blocker has already refused None
+        post_config = post_config_for(result.config, None)
+        header = ProgramHeader(
+            name=self._sim_program_name(sheet_index),
+            o_number=sheet_index + 1,
+            created=SIM_CREATED,
+        )
+
+        try:
+            program, plan = plan_sheet(
+                layout, header, result.demand, result.config, post_config
+            )
+        except ValueError as exc:
+            # SheetPlanError is a ValueError; so is anything the geometry
+            # engine raises on the way through.  Both are refusals, and both
+            # keep whatever structure they came with (SheetPlanError.part_number
+            # / .box).  The program is rebuilt best-effort so the refusal view
+            # can still draw the sheet the refusal is about.
+            raise SimulationRefused(
+                exc,
+                program=self._sim_program_only(layout, header, result),
+                post_config=post_config,
+                sheet_index=sheet_index,
+            ) from exc
+
+        try:
+            timeline = SimTimeline.build(program, plan, post_config)
+            expected = expected_work(layout, timeline.config)
+        except ValueError as exc:
+            # The emitter refusing the program (a sheet size that does not
+            # match its table) or the manifest refusing to be stated at all
+            # (job.py's "no honest statement of the work is possible").  Both
+            # are the same kind of refusal as above, and there IS a program to
+            # draw this time.
+            raise SimulationRefused(
+                exc,
+                program=program,
+                post_config=post_config,
+                sheet_index=sheet_index,
+            ) from exc
+
+        findings = FindingSet.build(timeline, run_verifier(timeline, expected))
+        return SimulationInputs(
+            sheet_index=sheet_index,
+            layout=layout,
+            run_quantity=int(run),
+            header=header,
+            post_config=post_config,
+            program=program,
+            plan=plan,
+            timeline=timeline,
+            expected=expected,
+            findings=findings,
+        )
+
+    def _sim_program_name(self, sheet_index: int) -> str:
+        """``R<prefix><NN>N`` for the sheet being simulated (spec section 6).
+
+        The naming convention is :func:`faceframe_cnc.post.job.sheet_filename`
+        itself, not a copy of it, so the simulated program cannot come to be
+        called something a generated one never would.  The sheet index is
+        1-based to match :attr:`~faceframe_cnc.post.job.JobOptions.first_sheet_index`.
+        """
+        from ..post.job import sheet_filename
+
+        prefix = str(self.settings.job_prefix or "")
+        if not prefix.isdigit():
+            prefix = SIM_JOB_PREFIX
+        return sheet_filename(prefix, sheet_index + 1)[: -len(".anc")]
+
+    @staticmethod
+    def _sim_program_only(layout, header, result) -> "SheetProgram | None":
+        """The sheet's program alone, for a refusal that has no plan.
+
+        A refusal from :func:`~faceframe_cnc.post.from_layout.plan_sheet` is
+        either about the PROGRAM (an empty sheet, a part that is not in the
+        order, a frame the geometry engine rejects — there is nothing to draw)
+        or about the PLAN (a WDC slot with a neighbour inside its reach — the
+        program built fine and is exactly what the operator needs to look at).
+        Rebuilding just the program says which, without the caller having to
+        know how :func:`plan_sheet` is put together.  Any failure means "no
+        program", never an exception on top of an exception.
+        """
+        from ..post.from_layout import sheet_program_from_layout
+
+        try:
+            return sheet_program_from_layout(
+                layout, header, result.demand, result.config
+            )
+        except ValueError:  # SheetPlanError included: it is a ValueError
+            return None
 
     # -- summary ---------------------------------------------------------
 
