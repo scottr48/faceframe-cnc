@@ -22,7 +22,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QMenu, QSizePolicy, QToolTip, QWidget
 
-from .session import EditResult, PartPath, Session
+from .session import EditResult, PartPath, Session, SessionError
 
 #: Palette.  Muted enough to read at a glance on a shop-floor monitor, with
 #: hosts and their passengers clearly different (spec 5: "distinguish
@@ -91,6 +91,16 @@ class SheetCanvas(QWidget):
         sheets = self.session.unique_sheet_count
         if self.sheet_index >= sheets:
             self.sheet_index = max(0, sheets - 1)
+        # A selection outlives the layout it was made in: ticking a row in or
+        # out (or changing the settings) invalidates the result, and the
+        # remembered path then points at nothing.  Dropping it here is what
+        # keeps the keyboard and the context menu from operating on a part
+        # that no longer exists (2026-08-04 review: R or an arrow key after
+        # an invalidation raised SessionError straight out of the Qt handler).
+        if self.selected_path is not None and self._placement(self.selected_path) is None:
+            self.selected_path = None
+            self._cancel_drag()
+            self.selectionChanged.emit(self.sheet_index, None)
         self.update()
 
     # -- coordinate transform -------------------------------------------
@@ -317,8 +327,9 @@ class SheetCanvas(QWidget):
             return
         path = self._drag_path
         ghost = self._ghost
+        placement = self._placement(path)
         self._cancel_drag()
-        if ghost is None:
+        if ghost is None or placement is None:
             self.update()
             return
         position = event.position()
@@ -328,8 +339,22 @@ class SheetCanvas(QWidget):
             self.droppedOutside.emit(path, event.globalPosition().toPoint())
             self.update()
             return
-        result = self.session.apply_drop(self.sheet_index, path, ghost[0], ghost[1])
-        self._handle(result)
+        if (
+            abs(ghost[0] - placement.x) < 1e-9
+            and abs(ghost[1] - placement.y) < 1e-9
+        ):
+            # Nothing moved: this was a click, not a drag (2026-08-04 review).
+            # Applying a "move" to the part's own position would mark the
+            # layout hand-edited -- so the next Optimize asks whether to
+            # discard edits -- for the click an operator makes to read a
+            # label.  The session refuses to commit a no-change edit too;
+            # not asking it at all also keeps the status bar honest.
+            self.update()
+            self.statusMessage.emit(
+                f"{placement.part_number} selected - drag it to move it, R to rotate"
+            )
+            return
+        self._run(lambda: self.session.apply_drop(self.sheet_index, path, ghost[0], ghost[1]))
 
     def _cancel_drag(self) -> None:
         self._drag_path = None
@@ -345,7 +370,12 @@ class SheetCanvas(QWidget):
             self._cancel_drag()
             self.update()
             return
-        if self.selected_path is None:
+        # Guarded exactly like the mouse paths (2026-08-04 review): a
+        # selection made before the layout was invalidated survives in
+        # ``selected_path``, and R / the arrow keys used to hand it straight
+        # to the session, which raised SessionError out of this handler.
+        path = self._live_selection()
+        if path is None:
             super().keyPressEvent(event)
             return
         if key in (Qt.Key.Key_R,):
@@ -360,11 +390,7 @@ class SheetCanvas(QWidget):
         if key in nudges:
             step = 0.0625 if event.modifiers() & Qt.KeyboardModifier.ShiftModifier else 0.5
             dx, dy = nudges[key]
-            self._handle(
-                self.session.nudge_part(
-                    self.sheet_index, self.selected_path, dx * step, dy * step
-                )
-            )
+            self._run(lambda: self.session.nudge_part(self.sheet_index, path, dx * step, dy * step))
             return
         super().keyPressEvent(event)
 
@@ -386,6 +412,10 @@ class SheetCanvas(QWidget):
         """The right-click menu for one part (built separately so it is testable)."""
         placement = self._placement(path)
         menu = QMenu(self)
+        if placement is None:
+            # The layout moved on since the click (an invalidation, a
+            # re-optimize): an empty menu, not an AttributeError.
+            return menu
         menu.addAction(
             f"Rotate {placement.part_number} 90 degrees\tR", self.rotate_selected
         )
@@ -438,31 +468,71 @@ class SheetCanvas(QWidget):
             items = placement.children
         return placement
 
-    def rotate_selected(self) -> None:
+    def _live_selection(self) -> Optional[PartPath]:
+        """The selected path, but only while it still points at a real part.
+
+        Anything the user can aim at a part -- the keyboard, the context
+        menu, the sheet-move commands -- goes through here, so a selection
+        left over from a layout that has since been invalidated becomes
+        "nothing is selected" instead of an exception out of a Qt handler.
+        """
         if self.selected_path is None:
+            return None
+        if self._placement(self.selected_path) is None:
+            self.selected_path = None
+            self._cancel_drag()
+            self.update()
+            self.selectionChanged.emit(self.sheet_index, None)
+            return None
+        return self.selected_path
+
+    def _run(self, command) -> None:
+        """Run one session edit, turning a refusal into a message, never a crash.
+
+        The session raises :class:`SessionError` for a request that makes no
+        sense (no layout, a path into a layout that has been replaced); it
+        returns a falsy :class:`EditResult` for an edit that breaks a
+        machining rule.  Both belong in the status bar.
+        """
+        try:
+            result = command()
+        except SessionError as exc:
+            self.update()
+            self.statusMessage.emit(str(exc))
             return
-        self._handle(self.session.rotate_part(self.sheet_index, self.selected_path))
+        self._handle(result)
+
+    def rotate_selected(self) -> None:
+        path = self._live_selection()
+        if path is None:
+            return
+        self._run(lambda: self.session.rotate_part(self.sheet_index, path))
 
     def centre_selected(self) -> None:
-        if self.selected_path is None:
+        path = self._live_selection()
+        if path is None:
             return
-        self._handle(self.session.centre_in_opening(self.sheet_index, self.selected_path))
+        self._run(lambda: self.session.centre_in_opening(self.sheet_index, path))
 
     def unnest_selected(self) -> None:
-        if self.selected_path is None:
+        path = self._live_selection()
+        if path is None:
             return
-        self._handle(self.session.unnest_part(self.sheet_index, self.selected_path))
+        self._run(lambda: self.session.unnest_part(self.sheet_index, path))
 
     def _nest(self, path: PartPath, host_path: PartPath) -> None:
-        self._handle(self.session.nest_part(self.sheet_index, path, host_path))
+        self._run(lambda: self.session.nest_part(self.sheet_index, path, host_path))
 
     def _move_to_sheet(self, path: PartPath, destination: int) -> None:
-        self._handle(self.session.move_part_to_sheet(self.sheet_index, path, destination))
+        self._run(
+            lambda: self.session.move_part_to_sheet(self.sheet_index, path, destination)
+        )
 
     def move_selected_to_sheet(self, destination: int) -> None:
-        if self.selected_path is None:
+        path = self._live_selection()
+        if path is None:
             return
-        self._move_to_sheet(self.selected_path, destination)
+        self._move_to_sheet(path, destination)
 
     def _handle(self, result: EditResult) -> None:
         """Apply an :class:`EditResult`: follow the part, or explain the refusal."""

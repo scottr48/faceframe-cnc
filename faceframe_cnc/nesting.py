@@ -680,6 +680,14 @@ def _normalize_demand(parts, config: NestingConfig) -> list[PartSpec]:
             raise NestingError(f"{pn}: width must be positive and finite, got {spec.width!r}")
         if not (math.isfinite(spec.height) and spec.height > 0):
             raise NestingError(f"{pn}: height must be positive and finite, got {spec.height!r}")
+        # ``int()`` on a non-finite float raises ValueError for NaN and
+        # OverflowError for +/-inf — the latter is not even a ValueError
+        # subclass, so a caller catching NestingError (itself a ValueError)
+        # would see it crash straight through.  Width/height already guard
+        # with isfinite(); qty needs the same guard before the int()
+        # comparison below (2026-08-04, verified: qty=nan/inf both escaped).
+        if not math.isfinite(spec.qty):
+            raise NestingError(f"{pn}: qty must be a finite number, got {spec.qty!r}")
         if int(spec.qty) != spec.qty or spec.qty < 0:
             raise NestingError(f"{pn}: qty must be a non-negative integer, got {spec.qty!r}")
         if pn in merged:
@@ -696,6 +704,25 @@ def _normalize_demand(parts, config: NestingConfig) -> list[PartSpec]:
     demand = [s for _, s in sorted(merged.items()) if s.qty > 0]
 
     sw, sh = config.sheet_width, config.sheet_height
+    pack_dims = {s.part_number: _pack_dims(s, config) for s in demand}
+    # The knapsack quantises onto a 1/scale grid picked from every part's
+    # RESERVED width/height plus the sheet width (``_pick_scale``): item
+    # widths round UP, sheet capacity rounds DOWN (``_Context`` /
+    # ``_quantize_capacity``) — deliberately conservative so a chosen row
+    # can never overfill the sheet.  When the sheet width itself does not
+    # sit on that grid, the two roundings disagree about the SAME physical
+    # inch, and a part whose real width is <= sheet_width can round up past
+    # the sheet's own rounded-down capacity — unplaceable in any shelf, on
+    # any strategy, even alone on an otherwise-empty sheet.  Checking that
+    # here, with the identical arithmetic the knapsack uses, turns the case
+    # into a clean refusal instead of the packer exhausting every strategy
+    # and raising "internal error: could not place remaining demand" many
+    # calls deep (2026-08-04: NestingConfig(sheet_width=49.3) crashed on any
+    # part in the top 1/16" of the sheet width, including an exactly
+    # full-width 49.3" part).
+    scale, gap_units, capacity = _quantize_capacity(
+        [d for dims in pack_dims.values() for d in dims], config
+    )
     for spec in demand:
         # A WDC has to fit with the room its slot cuts, not just with its
         # footprint, or the packer would place a part the post must refuse.
@@ -705,7 +732,7 @@ def _normalize_demand(parts, config: NestingConfig) -> list[PartSpec]:
         # slot axis.  A WDC taller than 97 - 1.75 = 95.25 therefore cannot be
         # made at all, and saying so here is the only honest answer: the
         # alternative is a layout the validator will refuse (2026-08-04).
-        pw, ph = _pack_dims(spec, config)
+        pw, ph = pack_dims[spec.part_number]
         inset = _edge_inset(spec.part_number, config)
         ew, eh = pw, ph + 2.0 * inset
         upright = ew <= sw + EPS and eh <= sh + EPS
@@ -726,6 +753,28 @@ def _normalize_demand(parts, config: NestingConfig) -> list[PartSpec]:
                 f"(rotated it would be {spec.height}x{spec.width}){reserved}; "
                 f"the part cannot be nested and dimensions must never be altered"
             )
+        # Necessary condition for the knapsack to ever seat this part alone
+        # on a shelf: its RESERVED width, quantised up, must not exceed the
+        # sheet's own width quantised down.  Only ``pw``/``ph`` (never the
+        # edge-inset-inflated ``ew``/``eh``) enter the row-width charge the
+        # knapsack actually applies (``_Context.charged_width`` inflates
+        # only a turned WDC pinned against a side edge, which only ever
+        # NARROWS what fits, never widens it) so testing the base dims is
+        # the correct, most permissive necessary condition.
+        fits_quantized = (upright and _width_units(pw, scale, gap_units) <= capacity) or (
+            turned and _width_units(ph, scale, gap_units) <= capacity
+        )
+        if not fits_quantized:
+            grid = f"1/{scale}\""
+            raise NestingError(
+                f"{spec.part_number}: {spec.width}x{spec.height} fits the "
+                f"{sw}x{sh} sheet by real-number dimensions, but the sheet "
+                f"width {sw:g}\" is not a multiple of {grid} and the packer's "
+                f"grid rounds no part wider than "
+                f"{math.floor(sw * scale) / scale:g}\" onto it; the part "
+                f"cannot be nested on this sheet_width — use a sheet_width "
+                f"that is a multiple of {grid}, or a narrower part"
+            )
     return demand
 
 
@@ -739,6 +788,28 @@ def _pick_scale(values) -> int:
         if all(abs(v * scale - round(v * scale)) < 1e-9 for v in values):
             return scale
     return _SCALE_CANDIDATES[-1]
+
+
+def _quantize_capacity(dims, config: "NestingConfig") -> tuple[int, int, int]:
+    """Pick the knapsack's grid scale for ``dims`` + sheet width and derive
+    ``(scale, gap_units, capacity)`` with EXACTLY the arithmetic
+    :class:`_Context` uses to run the knapsack.
+
+    Factored out so :func:`_normalize_demand` can apply, up front, the
+    identical feasibility test the packer applies later — acceptance and
+    packability must agree, or a part the gate lets through can crash the
+    packer several thousand calls deep instead of being refused cleanly
+    where the caller can see why (2026-08-04).
+    """
+    scale = _pick_scale(list(dims) + [config.sheet_width])
+    gap_units = math.ceil(config.part_gap * scale - 1e-9)
+    capacity = math.floor(config.sheet_width * scale + 1e-9) + gap_units
+    return scale, gap_units, capacity
+
+
+def _width_units(width: float, scale: int, gap_units: int) -> int:
+    """Quantised row-width charge for one item — see ``_Context.width_units``."""
+    return math.ceil(width * scale - 1e-9) + gap_units
 
 
 def _solo_cost(
@@ -826,7 +897,6 @@ class _Context:
         dims = []
         for pw, ph in self.pack_dims.values():
             dims.extend((pw, ph))
-        self.scale = _pick_scale(dims + [config.sheet_width])
 
         # Conservative quantisation: capacity rounded down, item widths up.
         # A row of n parts occupies ``sum(w) + gap * (n - 1)``, modelled as
@@ -837,10 +907,11 @@ class _Context:
         # fraction: quantising ``w + gap`` as one number would spend the
         # rounding allowance of every single item on the gap's remainder and
         # leave a full-sheet-width part unable to fit its own sheet.
-        self.gap_units = math.ceil(config.part_gap * self.scale - 1e-9)
-        self.capacity = (
-            math.floor(config.sheet_width * self.scale + 1e-9) + self.gap_units
-        )
+        # ``_quantize_capacity`` is the SAME arithmetic ``_normalize_demand``
+        # uses to refuse, up front, a part this scale/capacity could never
+        # seat (2026-08-04) — kept as one function so the two can never
+        # drift apart again.
+        self.scale, self.gap_units, self.capacity = _quantize_capacity(dims, config)
         # Distinct candidate shelf heights, tallest first (deterministic).
         self.height_candidates = sorted({d for d in dims}, reverse=True)
         self._shelf_cache: dict[tuple, tuple | None] = {}
@@ -913,7 +984,7 @@ class _Context:
         return placed_width + 2.0 * self.edge_inset[part_number]
 
     def width_units(self, placed_width: float) -> int:
-        return math.ceil(placed_width * self.scale - 1e-9) + self.gap_units
+        return _width_units(placed_width, self.scale, self.gap_units)
 
 
 def _orient_for_shelf(

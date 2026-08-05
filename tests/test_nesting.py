@@ -321,6 +321,102 @@ class SmallCaseTests(unittest.TestCase):
         with self.assertRaises(NestingError):
             nest([PartSpec("N", 10.0, 10.0, -1)], self.config)
 
+    def test_qty_nan_raises_nesting_error(self):
+        # Before the 2026-08-04 fix, ``int(float("nan"))`` raised a bare
+        # ValueError from inside ``_normalize_demand`` -- not wrapped as a
+        # NestingError, so a caller that only caught NestingError (itself a
+        # ValueError subclass) would still see it escape.
+        with self.assertRaises(NestingError) as ctx:
+            nest([PartSpec("NANQ", 10.0, 10.0, float("nan"))], self.config)
+        self.assertIn("finite", str(ctx.exception))
+
+    def test_qty_inf_raises_nesting_error(self):
+        # ``int(float("inf"))`` raises OverflowError, which is not even a
+        # ValueError subclass, so it escaped past NestingError entirely.
+        with self.assertRaises(NestingError) as ctx:
+            nest([PartSpec("INFQ", 10.0, 10.0, float("inf"))], self.config)
+        self.assertIn("finite", str(ctx.exception))
+
+    def test_qty_negative_infinity_raises_nesting_error(self):
+        with self.assertRaises(NestingError):
+            nest([PartSpec("NEGINFQ", 10.0, 10.0, float("-inf"))], self.config)
+
+
+class OffGridSheetWidthTests(unittest.TestCase):
+    """2026-08-04 fix: the knapsack quantises item widths UP and sheet
+    capacity DOWN onto its fallback 1/16" grid (see ``_quantize_capacity``).
+    When ``sheet_width`` itself does not sit on that grid, a part the
+    real-number gate in ``_normalize_demand`` accepted could still have no
+    quantised shelf width it fits into -- not even alone on an empty sheet
+    -- and every strategy would fail, surfacing as
+    ``NestingError("internal error: could not place remaining demand")``
+    many calls below the public API.  The fix makes ``_normalize_demand``
+    apply the SAME quantised arithmetic up front (``_quantize_capacity`` /
+    ``_width_units``, shared with ``_Context``) so the crash becomes a
+    clean, informative refusal there instead.
+    """
+
+    def test_full_width_part_on_off_grid_sheet_is_placed_or_cleanly_refused(self):
+        # Verified reproduction from the review: NestingConfig(sheet_width=
+        # 49.3) with a part exactly as wide as the sheet used to crash with
+        # "internal error: could not place remaining demand" -- the item's
+        # width quantises up (ceil) to one unit past the sheet's own
+        # capacity, which quantises down (floor), even though the two are
+        # the same physical number.  Either outcome below is honest; the
+        # "internal error" wording, and any raw exception, is not.
+        cfg = NestingConfig(sheet_width=49.3)
+        try:
+            result = nest([PartSpec("FULL493", 49.3, 60.0, 1)], cfg)
+        except NestingError as exc:
+            self.assertNotIn("internal error", str(exc))
+            self.assertIn("FULL493", str(exc))
+        else:
+            self.assertEqual(validate_layouts(result, cfg), [])
+            self.assertEqual(result.total_sheets, 1)
+
+    def test_narrow_off_grid_part_is_placed_or_cleanly_refused(self):
+        # The exact review repro: a part narrower than the sheet but inside
+        # the top 1/16" of its width also used to crash.
+        cfg = NestingConfig(sheet_width=49.3)
+        try:
+            result = nest([PartSpec("W4960", 49.29, 60.0, 2)], cfg)
+        except NestingError as exc:
+            self.assertNotIn("internal error", str(exc))
+            self.assertIn("W4960", str(exc))
+        else:
+            self.assertEqual(validate_layouts(result, cfg), [])
+            self.assertEqual(result.total_sheets, 1)
+
+    def test_genuinely_too_wide_part_still_refused_cleanly_on_off_grid_sheet(self):
+        # A part that does not fit even by real-number dimensions must
+        # still be refused by the ORIGINAL real-number gate, with its
+        # original message -- the new quantised check must not change this
+        # outcome or its wording.
+        cfg = NestingConfig(sheet_width=49.3)
+        with self.assertRaises(NestingError) as ctx:
+            nest([PartSpec("TOOWIDE", 49.35, 60.0, 1)], cfg)
+        message = str(ctx.exception)
+        self.assertNotIn("internal error", message)
+        self.assertIn("does not fit", message)
+
+    def test_off_grid_but_scale_16_exact_width_places_normally(self):
+        # 49 + 1/16 IS exactly representable at the fallback scale (16), so
+        # the new gate must not reject it: this is the "no false positive"
+        # counterpart to the two tests above.
+        cfg = NestingConfig(sheet_width=49.0625)
+        result = nest([PartSpec("EXACT", 49.0625, 60.0, 1)], cfg)
+        self.assertEqual(validate_layouts(result, cfg), [])
+        self.assertEqual(result.total_sheets, 1)
+
+    def test_default_grid_sheet_is_unaffected(self):
+        # The default 49x97 sheet is exactly representable at scale 8 (or
+        # 1), so none of the new off-grid machinery should ever engage and
+        # the classic exact-fit case keeps working exactly as before.
+        cfg = NestingConfig()
+        result = nest([PartSpec("FULL", 49.0, 97.0, 1)], cfg)
+        self.assertEqual(validate_layouts(result, cfg), [])
+        self.assertEqual(result.total_sheets, 1)
+
 
 class ValidatorCatchesBadLayoutsTests(unittest.TestCase):
     """The validator must be able to fail, not just pass."""

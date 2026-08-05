@@ -75,13 +75,13 @@ the 2026-08-04 review, all fixed here:
     truncates first, so the failure left a half program under a
     production name.
 
-So: every file is written to ``<name>.partial`` in the same folder and
-moved by :func:`os.replace` onto its final name only once the whole text is
-written, flushed and fsynced (fix for (c) — a failed write cannot even
-reach the final name, let alone truncate what is there), and after the
-writes :func:`write_job` sweeps the output folder for files that match
-THIS job's naming pattern but were not written by THIS run and moves them
-into ``superseded/<stamp>/`` (fixes (a) and (b)).
+So: every file is written to a per-run ``<name>.partial-<pid>-<clock>`` in
+the same folder and moved by :func:`os.replace` onto its final name only
+once the whole text is written, flushed, fsynced and read back (fix for (c)
+— a failed write cannot even reach the final name, let alone truncate what
+is there), and after the writes :func:`write_job` sweeps the output folder
+for files that match THIS job's naming pattern but were not written by THIS
+run and moves them into ``superseded/<stamp>/`` (fixes (a) and (b)).
 
 Nothing is ever deleted: a stale program is somebody's previous job and
 may be the only copy of it.  Nothing outside the job's own naming pattern
@@ -93,6 +93,43 @@ for the sheet whose name it was) and every move that FAILS is a loud
 :attr:`JobResult.quarantine_problems` entry naming the file that is still
 lying beside the job.  The shop rule is that anything the app does on its
 own it also shows.
+
+Three more holes in that, all closed here (2026-08-04 review, fix 7)
+--------------------------------------------------------------------
+(d) *Two orders, one folder and prefix.*  The sweep above only preserved
+    files this run did NOT write, so generating order B into order A's
+    folder at A's prefix silently :func:`os.replace`'d every same-named
+    program of A's out of existence.  Quarantining what a run overwrites
+    was the one case not covered, and it is the likeliest one: the prefix
+    is a setting the shop leaves alone.  Now the file about to be replaced
+    is moved into the SAME ``superseded/<stamp>/`` first, so
+    ``superseded`` lists the previous version of every sheet this run
+    republishes.  If that move cannot be made the sheet is NOT published:
+    a file that cannot be preserved is not one this module will destroy,
+    and the refusal says so on the outcome and in
+    :attr:`JobResult.quarantine_problems`.
+(e) *Publication was atomic per FILE, not per job.*  Seventeen sheets were
+    written and renamed one at a time, so an interruption in the middle
+    left a folder holding new programs for sheets 1-9 and yesterday's for
+    10-17 — every one of them plausible, and no way to tell from the
+    folder.  Now every program is written and verified as a partial FIRST
+    and the renames happen afterwards in one tight loop that does nothing
+    else.  The residual window is honest and small rather than gone: the
+    loop still performs N pairs of renames, so a power failure inside it
+    can leave the last few sheets unpublished.  What it cannot leave is a
+    half-written program, a destroyed previous version (both copies of the
+    boundary sheet are on disk — the old one in ``superseded/``) or a
+    silent mix, because a run that did not finish publishing did not
+    return a :class:`JobResult` at all.
+(f) *One shared ``.partial`` name.*  Two runs writing the same sheet at the
+    same time took turns inside one temp file and published whatever
+    interleaving of the two texts won, under a production name, past every
+    gate.  The temp name now carries this process's id and a clock reading,
+    so concurrent runs cannot touch each other's bytes.  Concurrent runs
+    into one folder are still not a supported thing to do — the loser's
+    in-flight temp file may be quarantined by the winner's sweep — but the
+    failure is then a loud write refusal in one run instead of a corrupt
+    program in both.
 """
 
 from __future__ import annotations
@@ -122,6 +159,7 @@ __all__ = [
     "DRY_RUN_BANNER",
     "PARTIAL_SUFFIX",
     "SUPERSEDED_DIR_NAME",
+    "partial_suffix",
     "dry_run_config",
     "now_created",
     "now_stamp",
@@ -139,7 +177,17 @@ DRY_RUN_BANNER = "*** DRY RUN - AIR CUT ABOVE THE STOCK - NOT A PRODUCTION PROGR
 #: filesystem) and it deliberately does not end in ``.anc``, so a file the
 #: shop's machine or file browser will offer up as a program never exists
 #: until it is complete.
+#:
+#: This is the STEM of the temp name; :func:`partial_suffix` adds a per-run
+#: tail to it (2026-08-04 review, fix 7f).  The stem is what
+#: :data:`_PARTIAL_RE` and :mod:`faceframe_cnc.report.cutsheet` recognise, so a
+#: leftover temp file is still identified as one whatever run made it.
 PARTIAL_SUFFIX = ".partial"
+
+#: Matches :data:`PARTIAL_SUFFIX` with or without a run tail, at the end of a
+#: name.  The tail is made of digits, letters and dashes only, so it cannot
+#: swallow a dot and mistake ``R720101N.anc.partial-1.bak`` for a temp file.
+_PARTIAL_RE = re.compile(re.escape(PARTIAL_SUFFIX) + r"(?:-[A-Za-z0-9-]*)?$")
 
 #: Subfolder of the output folder that stale programs are moved into.  A
 #: fresh ``superseded/<stamp>/`` per run, so two regenerations of the same
@@ -202,6 +250,23 @@ def now_stamp(when: time.struct_time | None = None) -> str:
     )
 
 
+def partial_suffix() -> str:
+    """A temp-file suffix no other run can be using (fix 7f).
+
+    ``.partial-<pid>-<monotonic ns in hex>``.  The process id keeps two
+    concurrent programs apart and the clock reading keeps two jobs inside one
+    process apart, which is what the GUI's Generate button and a future batch
+    loop between them could otherwise produce: with ONE shared ``.partial``
+    name two runs writing the same sheet took turns in the same file and
+    published whichever interleaving of the two texts finished last, under a
+    production name, having passed every gate before the collision existed.
+
+    Only characters :data:`_PARTIAL_RE` accepts, so a leftover is still
+    recognised as a temp file by the stale sweep.
+    """
+    return f"{PARTIAL_SUFFIX}-{os.getpid()}-{time.monotonic_ns():x}"
+
+
 # --------------------------------------------------------------------------
 # Options and results
 # --------------------------------------------------------------------------
@@ -232,7 +297,20 @@ class JobOptions:
     #: Base post table; the sheet size is taken from the nesting config.
     post_config: PostConfig | None = None
 
-    def validate(self) -> list[str]:
+    def validate(self, sheet_count: int | None = None) -> list[str]:
+        """Everything wrong with these options, in words for the UI.
+
+        ``sheet_count`` is how many files the job will produce, which the
+        caller only knows once the layout is in hand — hence optional, and
+        hence :func:`build_job` calling this twice: once on the way in and once
+        with the count.  It is what makes the O-number range checkable: the
+        header format is ``O0001``, four digits, and ``first_o_number`` plus the
+        sheet count is where the numbering ENDS (2026-08-04 review, fix 8).
+        Without it, a job starting at 9995 with 12 sheets used to be refused
+        per sheet, at the eleventh one, by the verifier's ``header`` rule
+        complaining about ``O10005`` — a baffling place to learn that a number
+        in the options dialog was too big.
+        """
         problems: list[str] = []
         if not _PREFIX_RE.match(self.prefix or ""):
             problems.append(
@@ -245,6 +323,14 @@ class JobOptions:
             problems.append("the first sheet index must be between 1 and 98")
         if self.first_o_number < 1 or self.first_o_number > 9999:
             problems.append("the first O-number must be between 1 and 9999")
+        elif sheet_count is not None and self.first_o_number + sheet_count - 1 > 9999:
+            problems.append(
+                f"this job needs {sheet_count} programs, so numbering them from "
+                f"O{self.first_o_number:04d} would run up to "
+                f"O{self.first_o_number + sheet_count - 1} - the confirmed header "
+                f"format O0001 has four digits for it. Start the O-numbers at "
+                f"{9999 - sheet_count + 1} or lower, or split the job"
+            )
         if _BANNER_SAFE_RE.search(self.app_name or ""):
             problems.append("the banner name may not contain parentheses or newlines")
         stamp = self.quarantine_stamp
@@ -265,12 +351,14 @@ class SupersededFile:
     """One stale program this run moved out of the way (2026-08-04 review).
 
     A file gets one of these when it matches the job's own naming pattern
-    (see :func:`job_file_pattern`) and this run did NOT write it: either the
-    job is shorter than the one that filled the folder before, or the sheet
-    of that name was refused this time, or it is a ``.partial`` an earlier
-    run died in the middle of.  Nothing is deleted — ``old_path`` is where
-    it was, ``new_path`` is where it is now, and ``reason`` is what to tell
-    the operator.
+    (see :func:`job_file_pattern`) and is not part of this run's output:
+    either this run REPLACED it with its own program for the same sheet (fix
+    7d — the cross-order overwrite, and by far the commonest case: every
+    regeneration of a prefix produces one of these per sheet), or the job is
+    shorter than the one that filled the folder before, or the sheet of that
+    name was refused this time, or it is a temp file an earlier run died in the
+    middle of.  Nothing is deleted — ``old_path`` is where it was, ``new_path``
+    is where it is now, and ``reason`` is what to tell the operator.
     """
 
     filename: str
@@ -381,7 +469,7 @@ class JobResult:
             lines.append("  " + outcome.describe())
         if self.superseded:
             lines.append(
-                f"  {len(self.superseded)} file(s) left by an earlier run of prefix "
+                f"  {len(self.superseded)} older file(s) of prefix "
                 f"{self.options.prefix} moved to {self.quarantine_dir} (nothing deleted):"
             )
             lines.extend("    " + item.describe() for item in self.superseded)
@@ -596,6 +684,11 @@ def build_job(result, options: JobOptions) -> JobResult:
             f"R<prefix><NN>N.anc only has two digits for it. Split the job, or "
             f"generate one file per unique sheet instead of one per physical sheet."
         )
+    # Now that the file count is known, the O-number range can be judged up
+    # front instead of surfacing as a per-sheet header refusal (fix 8).
+    counted = options.validate(len(sheets))
+    if counted:
+        raise JobError("; ".join(counted))
     created = options.created if options.created is not None else now_created()
 
     outcomes: list[SheetOutcome] = []
@@ -706,17 +799,23 @@ def write_job(result, options: JobOptions) -> JobResult:
     :class:`JobError` only for whole-job failures (bad options, or a layout
     that does not pass :func:`~faceframe_cnc.nesting.validate_layouts`).
 
-    Two things happen here that the module docstring's "how the files reach
+    Three things happen here that the module docstring's "how the files reach
     the disk" section explains in full, and that the caller has to know
     about because it has to SHOW them:
 
-    * each program is written through a ``.partial`` and renamed onto its
-      final name, so a failed write cannot truncate the file that is there
-      (the sheet is reported with ``refusal_kind == "write"`` instead), and
+    * every program is written to a per-run temp name and read back BEFORE any
+      of them is published, so a failed write cannot truncate the file that is
+      there and cannot leave the job half published either (the sheet is
+      reported with ``refusal_kind == "write"`` instead);
+    * a file about to be REPLACED is moved into ``superseded/<stamp>/`` first,
+      so the previous version of every sheet this run republishes survives —
+      and a sheet whose previous version cannot be preserved is not published
+      at all, because destroying it is not this module's call;
     * once the writes are done, files in the output folder that match this
-      job's naming pattern but were not written by this run are moved into
-      ``superseded/<stamp>/`` and listed on :attr:`JobResult.superseded`;
-      a move that fails is a loud :attr:`JobResult.quarantine_problems`.
+      job's naming pattern but were not written by this run are moved into the
+      same ``superseded/<stamp>/`` and listed on
+      :attr:`JobResult.superseded`; a move that fails is a loud
+      :attr:`JobResult.quarantine_problems`.
 
     The PDF cut-sheet report is NOT written here (that is
     :mod:`faceframe_cnc.report`, called by the GUI after this returns), so
@@ -728,12 +827,76 @@ def write_job(result, options: JobOptions) -> JobResult:
     except OSError as exc:
         raise JobError(f"cannot create the output folder {job.output_dir}: {exc}") from exc
 
+    quarantine = _Quarantine(job)
+    prepared = _write_partials(job)
+    _publish(job, prepared, quarantine)
+    _quarantine_stale(job, quarantine)
+    return job
+
+
+class _Quarantine:
+    """This run's ``superseded/<stamp>/``, created the first time it is needed.
+
+    Both users of it — the publish loop preserving a file it is about to
+    replace, and the sweep moving aside a file this run did not write — want
+    ONE folder per run (so the evidence of a single Generate is in a single
+    place) and neither wants to create it when there is nothing to put in it.
+    Hence a tiny object rather than two callers passing a path around and each
+    remembering whether it exists yet.
+    """
+
+    def __init__(self, job: "JobResult"):
+        self._job = job
+        self._folder: str | None = None
+        self._failed = ""
+
+    def preserve(self, path: str, filename: str, reason: str) -> tuple[str | None, str]:
+        """Move ``path`` into the quarantine; ``(new path, problem)``."""
+        if self._failed:
+            return None, self._failed
+        if self._folder is None:
+            stamp = self._job.options.quarantine_stamp or now_stamp()
+            folder, problem = _quarantine_dir(self._job.output_dir, stamp)
+            if folder is None:
+                self._failed = problem
+                return None, problem
+            self._folder = folder
+            self._job.quarantine_dir = folder
+        target = os.path.join(self._folder, filename)
+        try:
+            os.replace(path, target)
+        except OSError as exc:
+            return None, (
+                f"could not move {path} into {self._folder} ({reason}): {exc}"
+            )
+        self._job.superseded.append(
+            SupersededFile(
+                filename=filename, old_path=path, new_path=target, reason=reason
+            )
+        )
+        return target, ""
+
+
+def _write_partials(job: JobResult) -> list[tuple[SheetOutcome, str, str]]:
+    """Write every program to its own temp name and read it back.
+
+    ``[(outcome, partial path, final path)]`` for the sheets that made it;
+    a sheet that did not is refused here with ``refusal_kind == "write"`` and
+    leaves nothing behind.
+
+    Nothing is published in this phase, which is the point (fix 7e): a full
+    disk on sheet 12 of 17 is found while the folder still holds exactly the
+    previous job, instead of half way through replacing it.
+    """
+    suffix = partial_suffix()
+    prepared: list[tuple[SheetOutcome, str, str]] = []
     for outcome in job.outcomes:
         if outcome.text is None:
             continue
         path = os.path.join(job.output_dir, outcome.filename)
+        partial = path + suffix
         try:
-            _write_atomically(path, outcome.text)
+            _write_partial(partial, outcome.text)
         except OSError as exc:
             # Plain ASCII: a refusal reason is printed on the PDF cut sheet.
             outcome.problems = [
@@ -742,15 +905,76 @@ def write_job(result, options: JobOptions) -> JobResult:
             ]
             outcome.refusal_kind = "write"
             continue
+        prepared.append((outcome, partial, path))
+    return prepared
+
+
+def _publish(
+    job: JobResult,
+    prepared: list[tuple[SheetOutcome, str, str]],
+    quarantine: _Quarantine,
+) -> None:
+    """Rename every prepared partial onto its final name, in one tight loop.
+
+    Two renames per sheet: the file already at that name (if any) goes into
+    ``superseded/<stamp>/`` first, then the partial takes its place.  Nothing
+    else happens in here — no generating, no verifying, no directory listing —
+    because the length of this loop IS the window in which the folder is a mix
+    of this job and the last one (see the module docstring's (e)).
+
+    A previous version that cannot be preserved stops that sheet being
+    published: overwriting it would be the very thing (d) is about, and a
+    refusal the operator can read beats a file nobody can get back.
+    """
+    for outcome, partial, path in prepared:
+        if os.path.exists(path):
+            reason = (
+                f"replaced by this run's program for sheet {outcome.sheet_index:02d}"
+            )
+            moved, problem = quarantine.preserve(path, outcome.filename, reason)
+            if moved is None:
+                job.quarantine_problems.append(
+                    f"{problem} - sheet {outcome.sheet_index:02d} was NOT published, "
+                    f"because replacing that file would have destroyed the only copy "
+                    f"of it"
+                )
+                outcome.problems = [
+                    f"could not write {path}: the program already there could not be "
+                    f"moved into the quarantine folder first, and this run will not "
+                    f"overwrite a file it cannot preserve"
+                ]
+                outcome.refusal_kind = "write"
+                _discard(partial)
+                continue
+            outcome.superseded_path = moved
+        try:
+            os.replace(partial, path)
+        except OSError as exc:
+            outcome.problems = [
+                f"could not write {path}: {exc} (nothing reached that name, so any "
+                f"file already there is intact - it is quarantined, not overwritten)"
+            ]
+            outcome.refusal_kind = "write"
+            _discard(partial)
+            continue
         outcome.path = path
         outcome.written = True
 
-    _quarantine_stale(job)
-    return job
+
+def _discard(path: str) -> None:
+    """Remove a temp file, ignoring a failure to do so.
+
+    A leftover is not silently lost either way: the sweep at the end of the job
+    recognises it and quarantines it.
+    """
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
-def _write_atomically(path: str, text: str) -> None:
-    """Write ``text`` so that ``path`` is never half a program.
+def _write_partial(partial: str, text: str) -> None:
+    """Write ``text`` to ``partial`` and prove the bytes are on the disk.
 
     The 2026-08-04 review's failure mode (c): ``open(path, "w")`` truncates
     before the first byte is written, so a crash, a full disk or a machine
@@ -758,31 +982,34 @@ def _write_atomically(path: str, text: str) -> None:
     a program — which starts with a valid header and ends nowhere, and the
     verifier is upstream of that, so nothing would catch it.
 
-    Instead the text goes to ``<path>.partial`` in the SAME folder (only a
-    same-filesystem rename is atomic) and :func:`os.replace` moves it onto
-    the final name in one step once the bytes are on the platter.  Either the
-    old file or the whole new one is there; never anything in between.
-    ``flush`` + ``fsync`` before the rename because the rename being atomic
-    is no help if the CONTENT is still in a buffer the crash eats.
+    Instead the text goes to a temp name in the SAME folder (only a
+    same-filesystem rename is atomic) and :func:`_publish` moves it onto the
+    final name in one step once the bytes are on the platter.  ``flush`` +
+    ``fsync`` because the rename being atomic is no help if the CONTENT is
+    still in a buffer the crash eats — and then the file is read back and
+    compared, because "the write returned without an error" and "the file on
+    the disk is the program the verifier passed" are not the same claim.
 
-    The content is byte-for-byte what the previous version wrote: same text,
+    The content is byte-for-byte what the first version wrote: same text,
     same ``newline=""`` (the generator emits its own CRLFs and the round-trip
     proofs depend on them surviving untranslated).
     """
-    partial = path + PARTIAL_SUFFIX
     try:
         with open(partial, "w", newline="") as handle:
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(partial, path)
+        with open(partial, "r", newline="") as handle:
+            written = handle.read()
+        if written != text:
+            raise OSError(
+                f"the {len(text)} characters written back read as {len(written)} - "
+                f"the file on the disk is not the program the verifier passed"
+            )
     except OSError:
         # Leave nothing behind that a later run would have to reason about.
-        # If even this fails the sweep below quarantines the ``.partial``.
-        try:
-            os.remove(partial)
-        except OSError:
-            pass
+        # If even this fails the sweep at the end quarantines the temp file.
+        _discard(partial)
         raise
 
 
@@ -801,18 +1028,18 @@ def _stale_files(job: JobResult) -> list[tuple[str, str, int | None]]:
     for name in sorted(os.listdir(job.output_dir)):
         if not os.path.isfile(os.path.join(job.output_dir, name)):
             continue  # the superseded/ folder itself, among other things
-        partial = name.endswith(PARTIAL_SUFFIX)
-        base = name[: -len(PARTIAL_SUFFIX)] if partial else name
+        match = _PARTIAL_RE.search(name)
+        base = name[: match.start()] if match else name
         index = _job_file_index(base, pattern)
         if index is None:
             continue
-        if partial:
-            # Nothing a completed write leaves behind is called ``.partial``:
-            # this run cleans up its own, and one at a name it DID write was
-            # reused and published (same temp name).  So whatever is still
-            # here died in an earlier run, and half a program sitting in the
-            # job's folder is exactly what nobody should have to think about
-            # at the machine.
+        if match:
+            # Nothing a completed write leaves behind is a temp file: this run
+            # cleans up its own, published ones are renamed away, and since fix
+            # 7f the temp name carries this run's pid and clock so it cannot be
+            # sharing one with anybody.  So whatever is still here belongs to a
+            # run that died, and half a program sitting in the job's folder is
+            # exactly what nobody should have to think about at the machine.
             stale.append((name, "half written by an interrupted earlier run", None))
             continue
         if base.casefold() in written:
@@ -858,7 +1085,7 @@ def _quarantine_dir(output_dir: str, stamp: str) -> tuple[str | None, str]:
     )
 
 
-def _quarantine_stale(job: JobResult) -> None:
+def _quarantine_stale(job: JobResult, quarantine: "_Quarantine") -> None:
     """Move this job's leftovers aside, and say so — never delete one.
 
     The 2026-08-04 review's failure modes (a) and (b): a regenerated prefix
@@ -885,35 +1112,17 @@ def _quarantine_stale(job: JobResult) -> None:
     if not stale:
         return
 
-    stamp = job.options.quarantine_stamp or now_stamp()
-    folder, problem = _quarantine_dir(job.output_dir, stamp)
-    if folder is None:
-        job.quarantine_problems.append(problem)
-        for name, reason, _index in stale:
-            job.quarantine_problems.append(
-                f"{name} ({reason}) is STILL in {job.output_dir} - move or delete it "
-                f"by hand before taking this folder to the machine"
-            )
-        return
-    job.quarantine_dir = folder
-
     by_name = {o.filename.casefold(): o for o in job.outcomes}
     for name, reason, _index in stale:
         source = os.path.join(job.output_dir, name)
-        target = os.path.join(folder, name)
-        try:
-            os.replace(source, target)
-        except OSError as exc:
+        target, problem = quarantine.preserve(source, name, reason)
+        if target is None:
             job.quarantine_problems.append(
-                f"could not move {source} into {folder} ({reason}): {exc} - it is "
-                f"STILL beside this job's programs and does not belong to it"
+                f"{problem} - it is STILL beside this job's programs and does not "
+                f"belong to it; move or delete it by hand before taking this folder "
+                f"to the machine"
             )
             continue
-        job.superseded.append(
-            SupersededFile(
-                filename=name, old_path=source, new_path=target, reason=reason
-            )
-        )
         outcome = by_name.get(name.casefold())
         if outcome is not None:
             outcome.superseded_path = target

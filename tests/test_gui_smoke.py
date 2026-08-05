@@ -20,9 +20,9 @@ import unittest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
-    from PySide6.QtCore import QPointF, Qt
-    from PySide6.QtGui import QMouseEvent
-    from PySide6.QtWidgets import QApplication
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QKeyEvent, QMouseEvent
+    from PySide6.QtWidgets import QApplication, QDialog
 
     HAVE_QT = True
 except ImportError:  # pragma: no cover - depends on the environment
@@ -30,9 +30,20 @@ except ImportError:  # pragma: no cover - depends on the environment
 
 if HAVE_QT:
     from faceframe_cnc.gui.edit_row_dialog import EditRowDialog
-    from faceframe_cnc.gui.main_window import GENERATE_TOOLTIP, MainWindow
+    from faceframe_cnc.gui.main_window import (
+        GENERATE_TOOLTIP,
+        ORDER_FILE_FILTER,
+        MainWindow,
+    )
     from faceframe_cnc.gui.order_panel import OrderPanel
-    from faceframe_cnc.gui.session import AppSettings, OrderRow, Session, SessionError
+    from faceframe_cnc.gui.session import (
+        AppSettings,
+        OrderRow,
+        RowStatus,
+        Session,
+        SessionError,
+        load_settings,
+    )
     from faceframe_cnc.gui.settings_dialog import SettingsDialog
 
 _APP = None
@@ -62,6 +73,19 @@ def fake_order() -> Session:
         ]
     )
     return session
+
+
+def send_key(widget, key, modifiers=None) -> None:
+    """Deliver one key press to ``widget``'s own handler.
+
+    Called directly rather than through ``QApplication.sendEvent`` so that an
+    exception raised inside the handler reaches the test instead of being
+    swallowed by Qt's event dispatch -- crashing out of a Qt handler is
+    exactly the failure under test in the keyboard cases.
+    """
+    if modifiers is None:
+        modifiers = Qt.KeyboardModifier.NoModifier
+    widget.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, key, modifiers))
 
 
 def send_mouse(widget, kind, point: QPointF, buttons) -> None:
@@ -536,6 +560,387 @@ class EditRowDialogSmokeTests(unittest.TestCase):
         self.assertEqual(accepted, [True])
         self.assertEqual(self.session.row("a").qty, 2)
         self.assertFalse(self.session.row("a").edited)
+
+
+# --------------------------------------------------------------------------
+# Changing the settings (2026-08-04 review, fix 1).  The window must never be
+# able to half-apply a settings change: the OLD layout was packed with the
+# OLD settings, and it must not survive the change in a generate-able state.
+# --------------------------------------------------------------------------
+
+
+def module_main_window():
+    import faceframe_cnc.gui.main_window as module
+
+    return module
+
+
+@unittest.skipUnless(HAVE_QT, "PySide6 is not installed")
+class SettingsFlowSmokeTests(unittest.TestCase):
+    def setUp(self):
+        self._folder = tempfile.TemporaryDirectory()
+        self.addCleanup(self._folder.cleanup)
+        self.settings_path = os.path.join(self._folder.name, "settings.json")
+        self.session = fake_order()
+        self.window = MainWindow(session=self.session, settings_path=self.settings_path)
+        self.addCleanup(self.window.close)
+        self.window.optimize()
+        self.assertTrue(self.window.generate_button.isEnabled())
+
+    def apply_settings(self, settings, *, discard: bool = True, save_ok: bool = True):
+        """Drive edit_settings() with a stubbed dialog.  Returns the warnings."""
+        module = module_main_window()
+        warnings: list[str] = []
+
+        class FakeDialog:
+            DialogCode = QDialog.DialogCode
+
+            def __init__(self, current, parent=None):
+                pass
+
+            def exec(self):
+                return int(QDialog.DialogCode.Accepted)
+
+            def result_settings(self):
+                return settings
+
+        original = (
+            module.SettingsDialog,
+            module.QMessageBox.question,
+            module.QMessageBox.warning,
+            module.save_settings,
+        )
+        module.SettingsDialog = FakeDialog
+        module.QMessageBox.question = staticmethod(
+            lambda *args, **kwargs: (
+                module.QMessageBox.StandardButton.Yes
+                if discard
+                else module.QMessageBox.StandardButton.No
+            )
+        )
+        module.QMessageBox.warning = staticmethod(
+            lambda *args, **kwargs: warnings.append(args[-1])
+        )
+        if not save_ok:
+            module.save_settings = lambda *args, **kwargs: False
+        try:
+            self.window.edit_settings()
+        finally:
+            (
+                module.SettingsDialog,
+                module.QMessageBox.question,
+                module.QMessageBox.warning,
+                module.save_settings,
+            ) = original
+        return warnings
+
+    def test_a_settings_change_re_nests_and_is_written_to_disk(self):
+        warnings = self.apply_settings(AppSettings(part_gap=1.0))
+        self.assertEqual(warnings, [])
+        self.assertEqual(self.session.settings.part_gap, 1.0)
+        self.assertEqual(self.session.config.part_gap, 1.0)
+        self.assertIsNotNone(self.session.result)
+        self.assertTrue(self.window.generate_button.isEnabled())
+        self.assertEqual(load_settings(self.settings_path).part_gap, 1.0)
+
+    def test_declining_the_discard_prompt_applies_nothing_at_all(self):
+        # The widget branch under test only reads session.edited; the session
+        # side of hand editing is covered in test_gui_session.
+        self.session.edited = True
+        before = [(layout.canonical(), run) for layout, run in self.session.sheets]
+
+        warnings = self.apply_settings(
+            AppSettings(sheet_width=40.0, sheet_height=60.0), discard=False
+        )
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(self.session.settings.sheet_width, 49.0)
+        self.assertEqual(self.session.settings.sheet_height, 97.0)
+        self.assertEqual(
+            [(layout.canonical(), run) for layout, run in self.session.sheets], before
+        )
+        self.assertTrue(self.session.edited, "the hand edits are still there")
+        self.assertFalse(
+            os.path.exists(self.settings_path), "nothing may be written to disk"
+        )
+        self.assertIn("unchanged", self.window.statusBar().currentMessage())
+
+    def test_a_settings_change_whose_re_nest_fails_turns_generate_off(self):
+        warnings = self.apply_settings(AppSettings(sheet_width=10.0, sheet_height=10.0))
+
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("Generate NC", warnings[0])
+        self.assertIsNone(self.session.result)
+        self.assertFalse(self.window.generate_button.isEnabled())
+        self.assertFalse(self.session.can_generate())
+        # The new stock IS in force -- the settings were applied, only the
+        # nesting failed -- and the empty preview still paints.
+        self.assertEqual(self.session.config.sheet_width, 10.0)
+        self.assertFalse(self.window.canvas.grab().isNull())
+
+    def test_a_settings_file_that_cannot_be_written_says_so(self):
+        warnings = self.apply_settings(AppSettings(part_gap=1.0), save_ok=False)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("could not be written", warnings[0])
+        # ... and the session still runs on the new value.
+        self.assertEqual(self.session.settings.part_gap, 1.0)
+
+    def test_the_order_file_filter_offers_xls_only(self):
+        self.assertIn("*.xls", ORDER_FILE_FILTER)
+        self.assertNotIn("xlsx", ORDER_FILE_FILTER)
+
+
+# --------------------------------------------------------------------------
+# A selection outliving its layout, and a click that is not a drag
+# (2026-08-04 review, fixes 3 and 4)
+# --------------------------------------------------------------------------
+
+
+@unittest.skipUnless(HAVE_QT, "PySide6 is not installed")
+class StaleSelectionSmokeTests(unittest.TestCase):
+    def setUp(self):
+        self._folder = tempfile.TemporaryDirectory()
+        self.addCleanup(self._folder.cleanup)
+        self.session = fake_order()
+        self.window = MainWindow(
+            session=self.session,
+            settings_path=os.path.join(self._folder.name, "settings.json"),
+        )
+        self.addCleanup(self.window.close)
+        self.window.optimize()
+        self.canvas = self.window.canvas
+        self.canvas.resize(400, 700)
+
+    def invalidate(self) -> None:
+        """Untick a line the way the operator does -- through the panel."""
+        item = self.window.order_panel.table.item(1, 0)
+        item.setCheckState(Qt.CheckState.Unchecked)
+        self.assertIsNone(self.session.result)
+
+    def test_the_selection_is_dropped_when_the_layout_is_invalidated(self):
+        self.canvas.show_sheet(0, (0,))
+        self.assertEqual(self.canvas.selected_path, (0,))
+        self.invalidate()
+        self.assertIsNone(self.canvas.selected_path)
+
+    def test_the_keyboard_does_not_raise_on_a_stale_selection(self):
+        self.canvas.show_sheet(0, (0,))
+        self.invalidate()
+        # Pre-fix these went straight into the session and raised
+        # SessionError("no layout - run the optimizer first") out of the Qt
+        # key handler.
+        for key in (
+            Qt.Key.Key_R,
+            Qt.Key.Key_Left,
+            Qt.Key.Key_Right,
+            Qt.Key.Key_Up,
+            Qt.Key.Key_Down,
+        ):
+            send_key(self.canvas, key)
+        self.assertIsNone(self.canvas.selected_path)
+        self.assertFalse(self.session.edited)
+
+    def test_the_menu_commands_do_not_raise_on_a_stale_selection(self):
+        self.canvas.show_sheet(0, (0,))
+        self.invalidate()
+        self.canvas.rotate_selected()
+        self.canvas.centre_selected()
+        self.canvas.unnest_selected()
+        self.canvas.move_selected_to_sheet(0)
+        self.assertIsNone(self.canvas.selected_path)
+        self.assertIsNone(self.session.result)
+
+    def test_a_stale_selection_after_a_re_optimize_is_dropped_too(self):
+        # A layout with fewer parts than the path remembers.
+        self.canvas.show_sheet(0, (1,))
+        self.session.set_rows(
+            [OrderRow(key="a", part_number="W3036", qty=1, frame_width=30.0, frame_height=36.0)]
+        )
+        self.window.order_panel.reload()
+        self.window.optimize()
+        self.assertIsNone(self.canvas.selected_path)
+        send_key(self.canvas, Qt.Key.Key_R)
+
+    def test_a_click_that_does_not_move_the_part_is_not_an_edit(self):
+        layout, _run = self.session.sheet(0)
+        placement = layout.placements[0]
+        before = [(l.canonical(), r) for l, r in self.session.sheets]
+        point = self.canvas.to_widget(
+            placement.x + placement.width / 2, placement.y + 0.3
+        )
+        send_mouse(
+            self.canvas, QMouseEvent.Type.MouseButtonPress, point, Qt.MouseButton.LeftButton
+        )
+        send_mouse(
+            self.canvas, QMouseEvent.Type.MouseButtonRelease, point, Qt.MouseButton.NoButton
+        )
+
+        self.assertEqual(self.canvas.selected_path, (0,))
+        self.assertFalse(
+            self.session.edited,
+            "reading a label must not arm the discard-edits prompt",
+        )
+        self.assertEqual([(l.canonical(), r) for l, r in self.session.sheets], before)
+        self.assertTrue(self.window.generate_button.isEnabled())
+
+
+# --------------------------------------------------------------------------
+# The resolve editor: which row it is aimed at (fix 6) and the quantity it
+# can now ask for (fix 7).
+# --------------------------------------------------------------------------
+
+
+@unittest.skipUnless(HAVE_QT, "PySide6 is not installed")
+class ResolveEditorSmokeTests(unittest.TestCase):
+    def setUp(self):
+        self.session = Session(AppSettings())
+        self.session.set_rows(
+            [
+                OrderRow(key="ok", part_number="W3036", qty=2, frame_width=30.0, frame_height=36.0),
+                OrderRow(
+                    key="first",
+                    part_number="W2412",
+                    qty=1,
+                    frame_height=12.0,
+                    missing=("width",),
+                    reason="missing frame width",
+                    included=False,
+                ),
+                OrderRow(
+                    key="second",
+                    part_number="W3024",
+                    qty=1,
+                    frame_height=24.0,
+                    missing=("width",),
+                    reason="missing frame width",
+                    included=False,
+                ),
+            ]
+        )
+        self.panel = OrderPanel(self.session)
+        self.addCleanup(self.panel.close)
+
+    def test_a_reload_keeps_the_editor_on_the_row_the_user_picked(self):
+        panel = self.panel
+        self.assertEqual(panel.attention_list.count(), 2)
+        panel.attention_list.setCurrentRow(1)
+        self.assertEqual(panel._resolve_key, "second")
+        panel.width_edit.setText("30")
+
+        # Anything that reloads the panel used to re-aim the editor at row 0
+        # while the table still highlighted the user's row -- so the next
+        # click on "Resolve and include" resolved the WRONG line.
+        panel.all_button.click()
+
+        self.assertEqual(panel._resolve_key, "second")
+        self.assertEqual(panel.attention_list.currentRow(), 1)
+        self.assertEqual(panel.width_edit.text(), "30", "typed values survive a reload")
+
+        panel.resolve_button.click()
+        self.assertEqual(self.session.row("second").frame_width, 30.0)
+        self.assertTrue(self.session.row("second").included)
+        self.assertIsNone(self.session.row("first").frame_width)
+        self.assertFalse(self.session.row("first").included)
+
+    def test_the_editor_defaults_to_the_first_row_when_nothing_is_picked(self):
+        self.assertEqual(self.panel._resolve_key, "first")
+        self.assertEqual(self.panel.attention_list.currentRow(), 0)
+
+    def test_resolving_moves_the_editor_on_to_what_is_left(self):
+        panel = self.panel
+        panel.width_edit.setText("24")
+        panel.resolve_button.click()
+        self.assertEqual(self.session.row("first").frame_width, 24.0)
+        self.assertEqual(panel.attention_list.count(), 1)
+        self.assertEqual(panel._resolve_key, "second")
+
+    def test_a_fractional_quantity_row_gets_a_quantity_box(self):
+        self.session.set_rows(
+            [
+                OrderRow(
+                    key="frac",
+                    part_number="W2412",
+                    qty=2.9,
+                    frame_width=24.0,
+                    frame_height=12.0,
+                    reason="quantity 2.9 is not a whole number",
+                    included=False,
+                )
+            ]
+        )
+        panel = self.panel
+        panel.reload()
+
+        self.assertEqual(panel.attention_list.count(), 1)
+        self.assertTrue(panel.qty_edit.isEnabled())
+        self.assertFalse(panel.width_edit.isEnabled())
+        self.assertFalse(panel.height_edit.isEnabled())
+        self.assertIn("2.9", panel.reason_label.text())
+        self.assertEqual(panel.qty_edit.text(), "", "never pre-filled with a guess")
+
+        panel.qty_edit.setText("3")
+        panel.resolve_button.click()
+
+        resolved = self.session.row("frac")
+        self.assertEqual(resolved.qty, 3)
+        self.assertIs(resolved.status, RowStatus.READY)
+        self.assertTrue(resolved.included)
+        self.assertFalse(panel.qty_edit.isEnabled())
+
+    def test_the_edit_dialog_never_floors_a_fractional_quantity(self):
+        # A QSpinBox cannot hold 2.9; the danger is that it quietly holds 2
+        # and "Save changes" then commits the floor the parser refused to
+        # make.  It must start at 1, say what the order form said, and show
+        # the change it is about to make.
+        self.session.set_rows(
+            [
+                OrderRow(
+                    key="frac",
+                    part_number="W2412",
+                    qty=2.9,
+                    frame_width=24.0,
+                    frame_height=12.0,
+                    reason="quantity 2.9 is not a whole number",
+                    included=False,
+                )
+            ]
+        )
+        dialog = EditRowDialog(self.session, "frac", self.panel)
+        self.addCleanup(dialog.close)
+        self.assertEqual(dialog.qty.value(), 1)
+        self.assertIn("2.9", dialog.original_label.text())
+        self.assertIn("not a whole number", dialog.original_label.text())
+        self.assertEqual(dialog.changes(), {"qty": 1})
+        self.assertIn("qty 2.9 -> 1", dialog.summary_label.text())
+
+        dialog.qty.setValue(3)
+        self.panel._on_dialog_save(dialog, "frac")
+        resolved = self.session.row("frac")
+        self.assertEqual(resolved.qty, 3)
+        self.assertIs(resolved.status, RowStatus.READY)
+
+    def test_a_fractional_quantity_left_blank_is_refused_in_the_panel(self):
+        self.session.set_rows(
+            [
+                OrderRow(
+                    key="frac",
+                    part_number="W2412",
+                    qty=2.9,
+                    frame_width=24.0,
+                    frame_height=12.0,
+                    reason="quantity 2.9 is not a whole number",
+                    included=False,
+                )
+            ]
+        )
+        panel = self.panel
+        panel.reload()
+        messages = []
+        panel.statusMessage.connect(messages.append)
+        panel.resolve_button.click()
+        self.assertTrue(messages)
+        self.assertIn("quantity", messages[-1])
+        self.assertFalse(self.session.row("frac").included)
 
 
 @unittest.skipUnless(HAVE_QT, "PySide6 is not installed")

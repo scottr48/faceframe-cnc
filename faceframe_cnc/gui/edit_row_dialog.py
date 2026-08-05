@@ -33,7 +33,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .session import Session, _format_dim
+from .session import Session, _format_dim, whole_qty
 
 
 class EditRowDialog(QDialog):
@@ -54,7 +54,16 @@ class EditRowDialog(QDialog):
 
         self.qty = QSpinBox()
         self.qty.setRange(1, 100000)
-        self.qty.setValue(max(1, row.qty))
+        # A row the parser held back because its QTY cell was not a whole
+        # number (2026-08-04 parser fix 3) carries that raw value -- 2.9 --
+        # which a QSpinBox cannot hold.  It starts at 1 rather than at a
+        # rounded-off 2.9, on purpose: rounding it here would be the silent
+        # guess the parser refused to make.  What the order form said is on
+        # the "order form:" line above, with a note saying it needs fixing,
+        # and the live summary spells out "qty 2.9 -> N" before the user can
+        # save anything.
+        whole = whole_qty(row.qty)
+        self.qty.setValue(whole if whole is not None and whole >= 1 else 1)
 
         self.width = QDoubleSpinBox()
         self.width.setDecimals(3)
@@ -111,6 +120,11 @@ class EditRowDialog(QDialog):
             f"order form: qty {row.original_qty}, "
             f'{_format_dim(row.original_width)}" x {_format_dim(row.original_height)}"'
         )
+        if row.qty_problem:
+            text += (
+                f"\nthe order form's quantity ({row.qty}) is not a whole number "
+                f"of frames - type the quantity to cut"
+            )
         if row.base_note:
             text += f"\n{row.base_note}"
         return text

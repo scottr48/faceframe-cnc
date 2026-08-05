@@ -172,6 +172,87 @@ commit, each written by a subagent and reviewed:
 Tests 515 → 602, all green; 7-21 order still 41 sheets / 17 unique, zero
 refusals, production and dry-run; reference round-trips still byte-exact.
 
+## 2026-08-04 later session: full-tree double review + fix-everything pass
+
+Scott asked for a full review of the whole tree, then a Codex Sol pass
+framed adversarially ("tell us why we made this incorrectly"), then fixes
+for everything. Five internal review agents (one per subsystem) + Codex
+ran; every CRITICAL/MAJOR claim was verified against the code before being
+accepted (several Codex claims were re-verified by hand). The two reviews
+overlapped on some findings and each caught things the other missed — the
+internal review found the worst one (WDC parser), Codex found the Fanuc
+blind spots. Five coder agents (Sonnet routine / Opus complex, disjoint
+file ownership) implemented all fixes; every diff was reviewed before
+acceptance. **Tests 602 → 766, all green.**
+
+Highlights (each with a test that fails on the old code):
+
+- **CRITICAL, parser**: a WDC row with BOTH dims present skipped the
+  contradiction check, and the shop template prefills the CABINET width —
+  the real 7-7 order parsed WDC2436 qty 30 as a READY 24×36 (20×33
+  opening). Now: `check_wdc_dimensions` auto-corrects the exact
+  template-prefill signature with a provenance note (visible-proof
+  pattern); any other mismatch → needs_attention. 7-7 now parses 18×36,
+  empty needs-attention.
+- **Verifier hardening** (5 new violation kinds): `rapid` (no rapid
+  travels/descends below stock top; post-G28 unknown-Z exempt, and
+  `g-mode` stops manufacturing that state), `cut-order` (onion-skin
+  before through, inner's through before host's, through pass last —
+  references satisfy all three, nothing weakened), `tool-comp` (G43 H
+  must match the active tool), `spindle-start` (M13 required before the
+  first feed move), `g-mode` (G90/G91/G28 only on byte-pinned template
+  lines). Also `_check_config` now validates approach_z/rapid_z vs
+  stock_top_z and cross-validates diameter_comment vs diameter.
+- **Short-part false refusals fixed both ends**: verifier models the
+  perimeter lead-in ramp's actual Z profile (only at-depth segments are
+  material checks); generator falls back through entry sides when the
+  default lead-in leaves sheet+0.375. All 34 generated 7-21 forms
+  byte-identical to before.
+- **`_owner_of` self-skip CLOSED** (the old recorded follow-up): the
+  owner exemption no longer applies to through cuts; a nested inner's
+  through-cut overshooting into its host went 0 → 2 violations. Side
+  effect: RFK0101N (foreign file, T16, already failing header) reports
+  16 findings instead of 8 — artefact, accepted deliberately.
+- **Job lifecycle**: per-run-unique `.partial-<pid>-<ns>` temp names;
+  two-phase publish (write+fsync+read-back ALL partials, then one tight
+  rename loop); an existing program is ALWAYS quarantined to
+  superseded/<stamp>/ before being replaced — a prior order's programs
+  can no longer be destroyed, and an unpreservable file blocks that
+  sheet's publish. O-number overflow validated up front.
+- **GUI**: `Session.set_settings` is now the only settings path, with
+  edit_row-style invalidation (both escape paths that left a stale
+  layout generate-able under new settings are dead; decline-the-prompt
+  applies nothing). Unmillable openings (< 0.395, from the post table,
+  read-only) are refused BY NAME at Optimize, not at Generate.
+  Qty-problem rows (fractional qty like 2.9 — parser no longer floors)
+  get a Quantity box in the resolve editor; EditRowDialog's QSpinBox was
+  silently flooring 2.9 → 2 (found+fixed). No-op clicks no longer mark
+  the layout edited; stale-selection keyboard crash fixed; resolve
+  editor no longer retargets on panel reload; file dialog is .xls-only
+  with a save-as hint for .xlsx.
+- **Parser robustness**: safe_float rejects non-finite ("1e999"/"inf"/
+  "nan"); fractional/non-finite qty → needs_attention (blank/junk still
+  skipped); drawer-base families (2DB/4DB/MICRO3DB → new
+  `FrameType.UNSUPPORTED_DRAWER_BASE`, geometry refuses) and
+  B-accessories (BSK/BFD/BPP/BES/BF, verified never ordered in the
+  reference files) → needs_attention instead of silently wrong frames.
+- **Report**: dry-run banner on cover continuation pages (path now
+  test-exercised); part numbers truncated clear of the count column;
+  refused-list wrapped+capped; `_dim` prints exact 32nds at any
+  magnitude; truthful partial-failure banner ("N OF M FILES FAILED");
+  text_centered_in glyph-band math fixed; cut-list overflow opens a real
+  continuation page; sheet_reports cross-checks outcome contents vs
+  layout (stale job + fresh result now raises); atomic PDF write.
+- **Nesting**: off-grid sheet widths refuse cleanly up front (shared
+  `_quantize_capacity`/`_width_units` so gate and knapsack can't drift;
+  capacity rounding deliberately NOT loosened); non-finite qty →
+  NestingError. Default-sheet output byte-identical.
+
+Deliberately NOT done (design decisions, not bugs): the T13 shallow-cut
+swept-width waiver stays (mirrors the reference files / current
+production); Codex's packaging complaints (installer, README, settings
+location); instant re-optimize on checkbox toggle; T2 support.
+
 ## Where the previous session left off (2026-08-03/04)
 
 Session log, in order — commits `91757dd` (Milestone 5 complete),
@@ -218,20 +299,29 @@ auto-resolution), then row editing (committed at wrap-up; see git log):
 
 - ~~The verifier checks no `F` (feed) words~~ — CLOSED 2026-08-04 (fix 6
   above; `feed`/`spindle-speed` violation kinds, 24 tamper tests).
-- `verifier._owner_of` attributes a move to the smallest containing grown
-  box, which can self-skip a lead-in intrusion; the v-slot check has its
-  own correct ownership rule. Fix someday, with a failing test first.
+- ~~`verifier._owner_of` self-skip~~ — CLOSED 2026-08-04 later session
+  (failing test first; owner exemption no longer applies to through cuts).
+- ~~The cover table's continuation page is unexercised~~ — CLOSED
+  2026-08-04 later session (dry-run banner bug found on it and fixed;
+  45-picture test fixture exercises it).
 - The PDF has been eyeballed rendered at screen resolution (cover, plain,
   nested and WDC pages all correct); nobody has checked a PRINTED page yet.
-- The cover table's continuation page is written but unexercised (needs a
-  job with ~40+ unique sheets to trigger).
 - `report/cutsheet.py` and the .anc job stamp "now" independently when no
   `created` is injected — they can differ across a minute boundary.
+- Qty-problem needs-attention rows resolve through the GUI's new Quantity
+  box; the underlying `resolve()` requires a whole qty for them. A
+  spreadsheet fix is still the cleaner path for a shop that keeps the .xls
+  as the record.
+- Drawer-base families (2DB/4DB/MICRO3DB) are refused as unsupported, not
+  cut wrong. If the shop ever orders one, the real fix is implementing
+  their cross-bar layouts in geometry.py (like THREE_DRAWER).
 
 ## Next
 
-No milestone is open — the spec is fully delivered and the 2026-08-04
-review findings are all fixed. Candidates, Scott's call: the
-`verifier._owner_of` attribution quirk (needs a failing test first), a
-printed-page check of the PDF report, or whatever the shop floor turns up
-next.
+No milestone is open — the spec is fully delivered, and BOTH 2026-08-04
+review passes (the six-fix morning session and the later full-tree
+double review) are fixed and verified. 766 tests green. Remaining
+candidates, Scott's call: a printed-page check of the PDF report,
+implementing the 2DB/4DB/MICRO3DB drawer-base layouts if the shop ever
+orders one, Codex's packaging/deployment wishlist (installer, README,
+settings location), or whatever the shop floor turns up next.

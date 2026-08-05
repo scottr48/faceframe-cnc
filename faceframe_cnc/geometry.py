@@ -15,6 +15,7 @@ stiles on a WDC frame, which are 2" wide (2026-08-03 amendment — see the
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -83,12 +84,27 @@ _MIDDLE_DRAWER_HEIGHT = 9.875
 
 
 class FrameType(Enum):
-    """The faceframe families this shop cuts (spec section 2, as amended)."""
+    """The faceframe families this shop cuts (spec section 2, as amended).
+
+    ``UNSUPPORTED_DRAWER_BASE`` (2026-08-04 review fix 4) is deliberately
+    NOT a family this app knows how to cut: it marks a drawer-base part
+    number (``2DB24``, ``4DB18``, ``MICRO3DB24``, ...) this app recognizes
+    by name but whose cross-bar layout it does not implement. It exists so
+    :func:`infer_frame_type` never has to fall back to ``WALL`` for one of
+    these -- which would silently produce a single-opening frame with no
+    drawer cross-bars, wrong for the real part -- and so
+    :func:`compute_geometry` refuses (see ``_stack_template``'s existing
+    "unhandled frame type" raise) instead of inventing geometry for it.
+    ``order_parser.parse_order`` intercepts rows of this type before they
+    ever reach :func:`compute_geometry` and routes them to
+    ``needs_attention`` instead.
+    """
 
     WALL = "wall"
     BASE = "base"
     THREE_DRAWER = "three_drawer"
     WDC = "wdc"
+    UNSUPPORTED_DRAWER_BASE = "unsupported_drawer_base"
 
 
 @dataclass(frozen=True)
@@ -126,6 +142,19 @@ class FrameGeometry:
     errors: list[str] = field(default_factory=list)
 
 
+#: A drawer-base family the shop's catalogue carries but whose cross-bar
+#: layout this app does not implement (2026-08-04 review, fix 4): a
+#: leading single digit + "DB" (``2DB24``, ``2DB30``, ``2DB33``, ``2DB36``,
+#: ``4DB18``) or "MICRO" + digits + "DB" (``MICRO3DB24``, ``MICRO3DB27``,
+#: ``MICRO3DB30``). ``3DB...`` is NOT one of these -- it is checked first,
+#: above, and returns ``THREE_DRAWER``, a layout this app DOES know (spec
+#: section 3). These families show up in the reference orders' "Drawer
+#: Bases" catalogue section, always at qty 0 or "*" in both files on hand
+#: -- never actually ordered yet, but nothing stops a future order line
+#: from setting one to a real quantity.
+_UNSUPPORTED_DRAWER_BASE = re.compile(r"^(?:\dDB|MICRO\d+DB)")
+
+
 def infer_frame_type(part_number: str) -> FrameType:
     """Infer frame family from a part number prefix (spec section 2, as amended).
 
@@ -134,9 +163,14 @@ def infer_frame_type(part_number: str) -> FrameType:
     which is a plain wall-style frame despite starting with "B". ``WDC...``
     is a special wall-style frame with 2" stiles instead of the usual 1.5"
     (2026-08-03 amendment; the part name encodes the diagonal-corner
-    cabinet's size, not the frame's). Everything else (``W``, ``LS``,
-    ``MC``, ``SB``, ``V``, ``OVD``, ...) is a wall-style single-opening
-    frame with the standard 1.5" stiles.
+    cabinet's size, not the frame's). A leading digit + "DB", or "MICRO" +
+    digits + "DB" (``2DB24``, ``4DB18``, ``MICRO3DB24``, ...), is a
+    drawer-base family this app recognizes by name but cannot lay out
+    (2026-08-04 review fix 4) -- returns ``UNSUPPORTED_DRAWER_BASE``,
+    never ``WALL`` (a plain single-opening frame would be the wrong
+    geometry: these have drawer cross-bars ``WALL`` doesn't model).
+    Everything else (``W``, ``LS``, ``MC``, ``SB``, ``V``, ``OVD``, ...)
+    is a wall-style single-opening frame with the standard 1.5" stiles.
     """
     normalized = part_number.strip().upper()
     if normalized.startswith("3DB"):
@@ -145,6 +179,8 @@ def infer_frame_type(part_number: str) -> FrameType:
         return FrameType.WALL
     if normalized.startswith("WDC"):
         return FrameType.WDC
+    if _UNSUPPORTED_DRAWER_BASE.match(normalized):
+        return FrameType.UNSUPPORTED_DRAWER_BASE
     if normalized.startswith("B"):
         return FrameType.BASE
     return FrameType.WALL
@@ -180,7 +216,12 @@ def _stack_template(frame_type: FrameType) -> list[tuple[str, str | None, float 
             ("opening", "bottom", None),
             ("member", None, MEMBER),
         ]
-    raise ValueError(f"unhandled frame type: {frame_type!r}")
+    raise ValueError(
+        f"unhandled frame type: {frame_type!r} -- geometry is not implemented for it "
+        "(2026-08-04 review fix 4: this is deliberate for UNSUPPORTED_DRAWER_BASE, "
+        "which order_parser.parse_order should have already routed to needs_attention "
+        "before it got here)"
+    )
 
 
 def compute_geometry(part_number: str, width: float, height: float) -> FrameGeometry:

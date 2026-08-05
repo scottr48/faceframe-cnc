@@ -1563,5 +1563,416 @@ class RealOrderTests(unittest.TestCase):
         self.assertTrue(session.edited)
 
 
+# --------------------------------------------------------------------------
+# Settings changes (2026-08-04 review, fix 1): a layout on screen was packed
+# with the settings of the moment, so changing them must take the layout with
+# it -- there is no such thing as a layout that is half-way between two
+# sheet sizes, and Generate must never be able to write one.
+# --------------------------------------------------------------------------
+
+
+def four_frames() -> Session:
+    session = Session(AppSettings())
+    session.set_rows([row("W3030", 30.0, 30.0, 4, key="a")])
+    session.optimize()
+    return session
+
+
+class SetSettingsTests(unittest.TestCase):
+    def test_new_settings_invalidate_the_layout(self):
+        session = four_frames()
+        self.assertTrue(session.can_generate())
+        session.set_settings(AppSettings(sheet_width=40.0, sheet_height=60.0))
+        self.assertIsNone(session.result)
+        self.assertFalse(session.can_generate())
+        self.assertEqual(session.problems(), [])
+        self.assertTrue(session.dirty)
+        # config falls back to the settings once the layout is gone, so the
+        # canvas and the summary describe the stock actually selected.
+        self.assertEqual(
+            (session.config.sheet_width, session.config.sheet_height), (40.0, 60.0)
+        )
+
+    def test_manual_edits_are_dropped_with_the_layout(self):
+        session = four_frames()
+        placement = session.sheet(0)[0].placements[0]
+        moved = session.move_part(0, (0,), placement.x + 1.0, placement.y)
+        self.assertTrue(moved, moved.message)
+        self.assertTrue(session.edited)
+        session.set_settings(AppSettings(part_gap=1.0))
+        self.assertFalse(session.edited)
+        self.assertIsNone(session.result)
+
+    def test_unusable_settings_are_refused_and_nothing_changes(self):
+        session = four_frames()
+        before = canonical(session)
+        with self.assertRaises(SessionError) as caught:
+            session.set_settings(AppSettings(part_gap=MIN_PART_GAP / 2))
+        self.assertIn("part gap must be at least", str(caught.exception))
+        self.assertEqual(session.settings.part_gap, 0.455)
+        self.assertEqual(canonical(session), before)
+        self.assertTrue(session.can_generate())
+
+    def test_a_change_the_optimizer_cannot_see_keeps_the_layout(self):
+        # The remembered output folder and job prefix are settings too, and
+        # they have nothing to do with how the sheet was packed.
+        session = four_frames()
+        before = canonical(session)
+        settings = AppSettings(last_output_dir="C:/nc", job_prefix="7201")
+        session.set_settings(settings)
+        self.assertIsNotNone(session.result)
+        self.assertEqual(canonical(session), before)
+        self.assertTrue(session.can_generate())
+        self.assertEqual(session.settings.job_prefix, "7201")
+
+    def test_a_settings_change_whose_re_nest_fails_leaves_nothing_to_generate(self):
+        # The acceptance case: stock too small for the part.  The layout is
+        # already invalidated, so the failure cannot leave the old one live.
+        session = four_frames()
+        session.set_settings(AppSettings(sheet_width=10.0, sheet_height=10.0))
+        with self.assertRaises(SessionError):
+            session.optimize()
+        self.assertFalse(session.can_generate())
+        self.assertIsNone(session.result)
+        self.assertEqual(
+            (session.config.sheet_width, session.config.sheet_height), (10.0, 10.0)
+        )
+
+
+# --------------------------------------------------------------------------
+# What the machine can cut (2026-08-04 external review, fix 2): a frame can
+# have positive openings that are still too small for the cutter.  Those used
+# to parse READY, nest, preview and only be refused at Generate.
+# --------------------------------------------------------------------------
+
+
+class MillableOpeningTests(unittest.TestCase):
+    def test_the_floor_is_derived_from_the_post_config_not_typed(self):
+        from faceframe_cnc.gui.session import min_millable_opening, opening_tool_inset
+        from faceframe_cnc.post.model import default_config
+
+        post = default_config()
+        self.assertEqual(opening_tool_inset(), -post.openings_pass.offset)
+        self.assertAlmostEqual(opening_tool_inset(), 0.1975)
+        self.assertAlmostEqual(min_millable_opening(), 0.395)
+
+    def test_a_frame_with_a_hair_thin_opening_is_flagged_not_ready(self):
+        session = Session(AppSettings())
+        session.set_rows([row("W3210", 3.2, 10.0, 1, key="thin")])
+        thin = session.row("thin")
+        self.assertIs(thin.status, RowStatus.INVALID)
+        self.assertFalse(thin.can_include)
+        self.assertIsNotNone(thin.unmillable_reason)
+        message = thin.geometry_error or ""
+        self.assertIn("0.2", message)      # the opening it would have
+        self.assertIn("0.1975", message)   # the tool centre offset
+        self.assertIn("0.395", message)    # the minimum that can be cut
+        self.assertEqual(session.demand(), [])
+
+    def test_optimize_refuses_a_ticked_on_uncuttable_line_by_name(self):
+        session = Session(AppSettings())
+        session.set_rows(
+            [row("W3030", 30.0, 30.0, 2, key="ok"), row("W3210", 3.2, 10.0, 1, key="thin")]
+        )
+        with self.assertRaises(SessionError) as caught:
+            session.optimize()
+        message = str(caught.exception)
+        self.assertIn("W3210", message)
+        self.assertIn("3.2 x 10", message)
+        self.assertIn("0.395", message)
+        self.assertIn("untick", message)
+        self.assertIsNone(session.result)
+
+        # Excluding it is the normal way out -- no crash, no dead end.
+        session.set_included("thin", False)
+        result = session.optimize()
+        self.assertEqual(result.total_parts, 2)
+        self.assertTrue(session.can_generate())
+
+    def test_a_frame_just_over_the_floor_is_still_cuttable(self):
+        # 1.5in stiles/rails each side + an opening a thousandth over 0.395.
+        session = Session(AppSettings())
+        session.set_rows([row("W0304", 3.396, 3.396, 1, key="tiny")])
+        self.assertIs(session.row("tiny").status, RowStatus.READY)
+        self.assertIsNone(session.row("tiny").unmillable_reason)
+
+    def test_resolving_into_an_uncuttable_frame_changes_nothing(self):
+        session = Session(AppSettings())
+        session.set_rows(
+            [row("W3210", None, 10.0, 1, key="r", missing=("width",), included=False)]
+        )
+        with self.assertRaises(SessionError) as caught:
+            session.resolve_row("r", width=3.2)
+        self.assertIn("cannot cut", str(caught.exception))
+        after = session.row("r")
+        self.assertIsNone(after.frame_width)
+        self.assertEqual(after.missing, ("width",))
+        self.assertFalse(after.included)
+
+    def test_editing_into_an_uncuttable_frame_changes_nothing(self):
+        session = Session(AppSettings())
+        session.set_rows([row("W3030", 30.0, 30.0, 2, key="a")])
+        with self.assertRaises(SessionError) as caught:
+            session.edit_row("a", width=3.2, height=10.0)
+        self.assertIn("cannot cut", str(caught.exception))
+        self.assertEqual(
+            (session.row("a").frame_width, session.row("a").frame_height), (30.0, 30.0)
+        )
+
+
+# --------------------------------------------------------------------------
+# A click is not an edit (2026-08-04 review, fix 4)
+# --------------------------------------------------------------------------
+
+
+class NoChangeEditTests(unittest.TestCase):
+    def build(self) -> Session:
+        # One picture cut THREE times: a run, which is where a pointless
+        # split-and-re-merge round trip would show up.
+        specs = [PartSpec("W3030", 30.0, 30.0, 3)]
+        session = build(specs, [([Placement("W3030", 0.5, 0.5, 30.0, 30.0)], 3)])
+        self.assertEqual([run for _layout, run in session.sheets], [3])
+        return session
+
+    def test_a_drop_where_the_part_already_is_is_not_an_edit(self):
+        session = self.build()
+        before = canonical(session)
+        before_sheets = session.total_sheets
+        placement = session.sheet(0)[0].placements[0]
+
+        outcome = session.apply_drop(0, (0,), placement.x, placement.y)
+
+        self.assertTrue(outcome, outcome.message)
+        self.assertIn("unchanged", outcome.message)
+        self.assertFalse(outcome.split)
+        self.assertFalse(outcome.merged)
+        self.assertFalse(session.edited, "a click must not arm the discard prompt")
+        self.assertEqual(canonical(session), before, "the run structure must be intact")
+        self.assertEqual(session.total_sheets, before_sheets)
+        # The part is still findable where the caller was told it is.
+        self.assertEqual(outcome.sheet_index, 0)
+        self.assertEqual(outcome.path, (0,))
+
+    def test_a_nudge_that_moves_it_is_still_an_edit(self):
+        session = self.build()
+        before = canonical(session)
+        self.assertTrue(session.nudge_part(0, (0,), 0.0, 0.0625))
+        self.assertTrue(session.edited)
+        self.assertNotEqual(canonical(session), before)
+
+    def test_the_no_op_click_still_leaves_generate_available(self):
+        session = self.build()
+        placement = session.sheet(0)[0].placements[0]
+        session.apply_drop(0, (0,), placement.x, placement.y)
+        self.assertTrue(session.can_generate())
+
+
+# --------------------------------------------------------------------------
+# Quantities the order form did not write as whole numbers (2026-08-04
+# parser fix 3, and the GUI fallout the parser flagged).
+# --------------------------------------------------------------------------
+
+
+def qty_problem_session() -> Session:
+    session = Session(AppSettings())
+    session.set_rows(
+        [
+            row("W3030", 30.0, 30.0, 2, key="ok"),
+            row(
+                "W2412",
+                24.0,
+                12.0,
+                2.9,
+                key="frac",
+                reason="quantity 2.9 is not a whole number",
+                included=False,
+            ),
+        ]
+    )
+    return session
+
+
+class QuantityProblemTests(unittest.TestCase):
+    def test_a_fractional_quantity_is_never_ready(self):
+        session = qty_problem_session()
+        frac = session.row("frac")
+        self.assertTrue(frac.qty_problem)
+        self.assertIs(frac.status, RowStatus.NEEDS_ATTENTION)
+        self.assertFalse(frac.can_include)
+        self.assertIn(frac, session.needs_attention_rows())
+        self.assertEqual([s.part_number for s in session.demand()], ["W3030"])
+        self.assertIn("2.9", frac.hint)
+
+    def test_it_cannot_be_ticked_on_and_the_refusal_says_why(self):
+        session = qty_problem_session()
+        with self.assertRaises(SessionError) as caught:
+            session.set_included("frac", True)
+        self.assertIn("whole number", str(caught.exception))
+
+    def test_resolving_without_a_quantity_is_refused_and_changes_nothing(self):
+        session = qty_problem_session()
+        with self.assertRaises(SessionError) as caught:
+            session.resolve_row("frac")
+        self.assertIn("quantity", str(caught.exception))
+        self.assertEqual(session.row("frac").qty, 2.9)
+        self.assertFalse(session.row("frac").included)
+
+    def test_resolving_with_a_whole_quantity_puts_it_on_the_cut_list(self):
+        session = qty_problem_session()
+        session.optimize()
+        resolved = session.resolve_row("frac", qty=3)
+        self.assertEqual(resolved.qty, 3)
+        self.assertIs(resolved.status, RowStatus.READY)
+        self.assertTrue(resolved.included)
+        self.assertEqual(resolved.reason, "")
+        self.assertEqual(session.total_frames, 5)
+        # Same rule as every other order change: the layout goes.
+        self.assertIsNone(session.result)
+        self.assertFalse(session.can_generate())
+
+    def test_a_fractional_quantity_typed_into_the_resolver_is_refused(self):
+        session = qty_problem_session()
+        for bad in (2.9, "2.9", "abc", 0, -1):
+            with self.assertRaises(SessionError):
+                session.resolve_row("frac", qty=bad)
+        self.assertTrue(session.row("frac").qty_problem)
+
+    def test_the_edit_dialog_can_fix_it_too(self):
+        session = qty_problem_session()
+        edited = session.edit_row("frac", qty=3)
+        self.assertEqual(edited.qty, 3)
+        self.assertIs(edited.status, RowStatus.READY)
+        self.assertTrue(edited.included)
+        self.assertEqual(edited.reason, "", "the stale amber reason must go")
+
+    def test_a_row_the_geometry_engine_refuses_is_flagged_never_crashed(self):
+        # The parser routes 2DB/4DB/MICRO3DB and B-prefixed accessories to
+        # needs_attention WITH both dimensions (2026-08-04 parser fix 4), and
+        # compute_geometry raises on those families -- straight out of
+        # OrderRow.status, i.e. out of the order table's paint path, before
+        # this was caught.
+        session = Session(AppSettings())
+        session.set_rows(
+            [
+                row(
+                    "2DB24",
+                    24.0,
+                    30.0,
+                    1,
+                    key="d",
+                    reason="2DB24 is an unsupported drawer-base family",
+                    needs_attention=True,
+                    included=False,
+                )
+            ]
+        )
+        bad = session.row("d")
+        self.assertIs(bad.status, RowStatus.NEEDS_ATTENTION)
+        self.assertFalse(bad.can_include)
+        self.assertIn("cannot compute openings", bad.geometry_error or "")
+        self.assertEqual(session.demand(), [])
+        with self.assertRaises(SessionError):
+            session.set_included("d", True)
+        # Confirming it is still refused: the geometry gate has the last word.
+        with self.assertRaises(SessionError):
+            session.resolve_row("d")
+
+    def test_a_flagged_row_survives_revert(self):
+        session = Session(AppSettings())
+        session.set_rows(
+            [
+                row(
+                    "WDC2436",
+                    24.0,
+                    36.0,
+                    2,
+                    key="w",
+                    reason="WDC2436 entered as 24 x 36 but the part number encodes 18 x 36",
+                    needs_attention=True,
+                    included=False,
+                )
+            ]
+        )
+        self.assertIs(session.row("w").status, RowStatus.NEEDS_ATTENTION)
+        session.resolve_row("w", width=18.0)
+        self.assertIs(session.row("w").status, RowStatus.READY)
+        session.revert_row("w")
+        reverted = session.row("w")
+        self.assertIs(reverted.status, RowStatus.NEEDS_ATTENTION)
+        self.assertTrue(reverted.needs_attention)
+        self.assertFalse(reverted.included)
+
+
+# --------------------------------------------------------------------------
+# Editing a row validates the combination the user actually asked for
+# (2026-08-04 review, fix 5)
+# --------------------------------------------------------------------------
+
+
+class EditRowCombinationTests(unittest.TestCase):
+    def setUp(self):
+        # A row missing its width whose PRESENT height is junk (2) -- the
+        # exact shape that made the old edit_row refuse a good edit while
+        # quoting "30 x 2", a size the user never typed.
+        self.session = Session(AppSettings())
+        self.session.set_rows(
+            [
+                row(
+                    "W3030",
+                    None,
+                    2.0,
+                    1,
+                    key="x",
+                    missing=("width",),
+                    reason="missing frame width",
+                    included=False,
+                )
+            ]
+        )
+
+    def test_completing_the_gap_and_fixing_the_junk_value_is_accepted(self):
+        edited = self.session.edit_row("x", width=30.0, height=30.0)
+        self.assertEqual((edited.frame_width, edited.frame_height), (30.0, 30.0))
+        self.assertEqual(edited.missing, ())
+        self.assertIs(edited.status, RowStatus.READY)
+        self.assertTrue(edited.included)
+        self.assertIn("height 2 -> 30", edited.note)
+
+    def test_a_refusal_quotes_what_was_typed_and_applies_nothing(self):
+        with self.assertRaises(SessionError) as caught:
+            self.session.edit_row("x", width=30.0, height=2.5)
+        self.assertIn("30 x 2.5", str(caught.exception))
+        after = self.session.row("x")
+        self.assertIsNone(after.frame_width)
+        self.assertEqual(after.frame_height, 2.0)
+        self.assertEqual(after.missing, ("width",))
+        self.assertFalse(after.included)
+        self.assertEqual(after.qty, 1)
+
+    def test_still_missing_after_the_edit_is_refused(self):
+        with self.assertRaises(SessionError) as caught:
+            self.session.edit_row("x", height=30.0)
+        self.assertIn("still needs a frame width", str(caught.exception))
+        self.assertEqual(self.session.row("x").frame_height, 2.0)
+
+
+# --------------------------------------------------------------------------
+# Order files this program cannot read (2026-08-04 review, fix 8)
+# --------------------------------------------------------------------------
+
+
+class OrderFileFormatTests(unittest.TestCase):
+    def test_an_xlsx_is_refused_with_instructions_not_a_generic_failure(self):
+        session = Session(AppSettings())
+        for name in ("order.xlsx", "ORDER.XLSM", "book.xlsb"):
+            with self.assertRaises(SessionError) as caught:
+                session.load_order(os.path.join("nowhere", name))
+            message = str(caught.exception)
+            self.assertIn("Excel 97-2003", message)
+            self.assertIn(".xls", message)
+            self.assertIn("Save As", message)
+        self.assertEqual(session.rows, [])
+
+
 if __name__ == "__main__":
     unittest.main()

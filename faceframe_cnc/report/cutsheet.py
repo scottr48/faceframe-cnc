@@ -66,7 +66,7 @@ from ..geometry import (
     wdc_slot_axis_is_height,
 )
 from ..gui.session import sheet_openings
-from ..post.job import APP_BANNER_NAME, DRY_RUN_BANNER, now_created
+from ..post.job import APP_BANNER_NAME, DRY_RUN_BANNER, PARTIAL_SUFFIX, now_created
 from . import pdf
 
 __all__ = [
@@ -108,6 +108,13 @@ FOOTER_TEXT_Y = 30.0
 DRAWING_REGION = (36.0, 56.0, 264.0, 574.0)
 #: The cut list occupies the mirror-image column to its right.
 CUTLIST_REGION = (312.0, 56.0, 264.0, 574.0)
+
+#: How far the cut list's boxed "xN" count sits from the row's left edge.
+#: The part number column must stay clear of it: a name of ~15+ characters
+#: at the row's bold 9.5pt would otherwise print UNDER the count and the
+#: two would overlap into an unreadable glyph pile.
+_CUTLIST_COUNT_OFFSET = 78.0
+_CUTLIST_NUMBER_MAX_WIDTH = _CUTLIST_COUNT_OFFSET - 4.0
 
 REGULAR = pdf.HELVETICA
 BOLD = pdf.HELVETICA_BOLD
@@ -212,12 +219,21 @@ class SheetReport:
     nested: int
     refused: bool
     problems: tuple[str, ...]
+    #: How many of :attr:`files` failed — always equal to ``len(files)``
+    #: outside one-file-per-physical-sheet mode, but in that mode a single
+    #: bad file among a picture's run must not read as "nothing was
+    #: written" when the rest of the run wrote clean (2026-08-04 review).
+    failed_files: int = 0
 
     @property
     def status_text(self) -> str:
         if not self.files:
             return "NO FILE"
-        return "REFUSED" if self.refused else "written"
+        if not self.refused:
+            return "written"
+        if 0 < self.failed_files < len(self.files):
+            return f"{self.failed_files} of {len(self.files)} FAILED"
+        return "REFUSED"
 
 
 def sheet_reports(result, job) -> list[SheetReport]:
@@ -263,9 +279,28 @@ def sheet_reports(result, job) -> list[SheetReport]:
 
     reports: list[SheetReport] = []
     for index, ((layout, run), group) in enumerate(zip(pictures, groups)):
+        # Pictures and outcomes are paired by count and position alone above
+        # — a stale job re-paired against a freshly re-optimized layout of
+        # the same LENGTH would mispair silently, putting one sheet's
+        # filenames over another sheet's drawing.  Every SheetOutcome
+        # carries its own part-count manifest (contents), independent of
+        # position, so it is cross-checked against this picture's actual
+        # part counts before the pairing is trusted (2026-08-04 review).
+        expected_counts = layout.part_counts()
+        for outcome in group:
+            if dict(outcome.contents) != expected_counts:
+                raise ReportError(
+                    f"sheet {index + 1}: NC outcome {outcome.filename!r} carries "
+                    f"{dict(outcome.contents)} but the layout for this picture has "
+                    f"{expected_counts} — the job and the layout have drifted apart, "
+                    f"refusing to pair them"
+                )
         names = tuple(outcome.filename for outcome in group)
         problems: list[str] = []
+        failed_files = 0
         for outcome in group:
+            if not outcome.ok:
+                failed_files += 1
             for problem in outcome.problems:
                 if problem not in problems:
                     problems.append(problem)
@@ -286,6 +321,7 @@ def sheet_reports(result, job) -> list[SheetReport]:
                 nested=layout.child_count(),
                 refused=bool(problems),
                 problems=tuple(problems),
+                failed_files=failed_files,
             )
         )
     return reports
@@ -401,8 +437,15 @@ def build_report(result, job, *, created: Optional[str] = None) -> bytes:
 def write_report(result, job, path: str, *, created: Optional[str] = None) -> str:
     """Write the report to ``path`` and return the absolute path.
 
-    The bytes are composed in full before the file is opened, so a report
-    that cannot be composed never truncates a previous one.  Every failure
+    The bytes are composed in full before any file is touched, so a report
+    that cannot be composed never truncates a previous one.  The write
+    itself is also atomic (2026-08-04 review — this had the exact
+    bare-``open(path, "wb")`` shape :func:`faceframe_cnc.post.job.write_job`
+    was fixed of the review before): the bytes go to ``<path>.partial`` in
+    the SAME folder first, flushed and ``fsync``'d, and :func:`os.replace`
+    swaps it onto ``target`` in one step, so a crash or a full disk
+    mid-write can only leave the ``.partial`` behind — never a half-written
+    report at the name an operator would actually open.  Every failure
     comes back as :class:`ReportError`.
     """
     data = build_report(result, job, created=created)
@@ -413,10 +456,18 @@ def write_report(result, job, path: str, *, created: Optional[str] = None) -> st
             os.makedirs(folder, exist_ok=True)
         except OSError as exc:
             raise ReportError(f"cannot create the report folder {folder}: {exc}") from exc
+    partial = target + PARTIAL_SUFFIX
     try:
-        with open(target, "wb") as handle:
+        with open(partial, "wb") as handle:
             handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(partial, target)
     except OSError as exc:
+        try:
+            os.remove(partial)
+        except OSError:
+            pass
         raise ReportError(f"could not write {target}: {exc}") from exc
     return target
 
@@ -431,6 +482,22 @@ _COL_RUN = (190.0, 30.0)
 _COL_CONTENTS = (228.0, 236.0)
 _COL_NESTED = (470.0, 30.0)
 _COL_STATUS = (508.0, 68.0)
+
+#: How many refused filenames the cover names explicitly before falling
+#: back to "and N more" — a sane cap so the line stays readable regardless
+#: of how many sheets were refused, and :func:`~faceframe_cnc.report.pdf.wrap_text`
+#: below still wraps it, so even the capped line cannot run off the page
+#: (2026-08-04 review: an unwrapped ", ".join of 5+ names used to).
+_REFUSED_NAMES_SHOWN = 6
+_REFUSED_SUMMARY_MAX_LINES = 4
+
+
+def _refused_summary_text(refused: Sequence) -> str:
+    names = [report.filename for report in refused]
+    shown = ", ".join(names[:_REFUSED_NAMES_SHOWN])
+    if len(names) > _REFUSED_NAMES_SHOWN:
+        shown += f", and {len(names) - _REFUSED_NAMES_SHOWN} more"
+    return f"{len(refused)} sheet(s) were REFUSED and have no NC program: {shown}"
 
 
 def _cover(document, result, job, reports, stamp, app_name) -> None:
@@ -461,20 +528,7 @@ def _cover(document, result, job, reports, stamp, app_name) -> None:
     y -= 18.0
 
     if job.dry_run:
-        page.rect(
-            CONTENT_LEFT,
-            y - 4.0,
-            CONTENT_WIDTH,
-            18.0,
-            fill=pdf.hex_color("#fdf1e0"),
-            stroke=DRY_RUN_COLOR,
-            line_width=0.9,
-        )
-        page.text(
-            CONTENT_LEFT + 6.0, y + 1.0, DRY_RUN_BANNER, font=BOLD, size=9,
-            color=DRY_RUN_COLOR,
-        )
-        y -= 24.0
+        y = _dry_run_banner(page, y)
 
     y = _headline_tiles(page, result, reports, y)
     y -= 16.0
@@ -491,7 +545,22 @@ def _cover(document, result, job, reports, stamp, app_name) -> None:
             page.text(
                 CONTENT_LEFT, top, "UNIQUE SHEETS (continued)", font=BOLD, size=10
             )
-            y = _table_header(page, top - 12.0)
+            # A plain 12pt drop (enough for the heading's own line height)
+            # was too tight once the banner box was added below it: the
+            # box's top edge landed a couple of points ABOVE the heading's
+            # baseline and printed through the bottom of its letters.  18pt
+            # matches the gap the first cover page already uses after its
+            # own last header line, so the banner never touches the text
+            # above it.
+            y = top - 18.0
+            # The "dry runs marked on every page" invariant applies to the
+            # cover's own overflow pages too — a continuation page carries
+            # rows that say "written" with nothing else on it to say
+            # otherwise, so the banner repeats here exactly as it does on
+            # every sheet page.
+            if job.dry_run:
+                y = _dry_run_banner(page, y)
+            y = _table_header(page, y)
         y = _cover_row(page, y, report)
 
     y -= 6.0
@@ -519,15 +588,40 @@ def _cover(document, result, job, reports, stamp, app_name) -> None:
     refused = [report for report in reports if report.refused]
     if refused:
         y -= 13.0
-        page.text(
-            CONTENT_LEFT,
-            y,
-            f"{len(refused)} sheet(s) were REFUSED and have no NC program: "
-            + ", ".join(report.filename for report in refused),
-            font=BOLD,
-            size=9,
-            color=REFUSED_COLOR,
+        lines = pdf.wrap_text(
+            _refused_summary_text(refused), BOLD, 9, CONTENT_WIDTH,
+            max_lines=_REFUSED_SUMMARY_MAX_LINES,
         )
+        for offset, line in enumerate(lines):
+            page.text(
+                CONTENT_LEFT,
+                y - offset * 11.0,
+                line,
+                font=BOLD,
+                size=9,
+                color=REFUSED_COLOR,
+            )
+
+
+def _dry_run_banner(page, y) -> float:
+    """The cover's dry-run banner, factored out so it can be repeated on
+    every continuation page of the unique-sheets table (fix for the
+    2026-08-04 review: a >42-unique-sheet dry run's overflow page carried
+    rows saying "written" with no mark that this whole job is a rehearsal)."""
+    page.rect(
+        CONTENT_LEFT,
+        y - 4.0,
+        CONTENT_WIDTH,
+        18.0,
+        fill=pdf.hex_color("#fdf1e0"),
+        stroke=DRY_RUN_COLOR,
+        line_width=0.9,
+    )
+    page.text(
+        CONTENT_LEFT + 6.0, y + 1.0, DRY_RUN_BANNER, font=BOLD, size=9,
+        color=DRY_RUN_COLOR,
+    )
+    return y - 24.0
 
 
 def _headline_tiles(page, result, reports, y) -> float:
@@ -611,11 +705,12 @@ def _cover_row(page, y, report) -> float:
         size=8.0,
         align="right",
     )
+    status_font = BOLD if report.refused else REGULAR
     page.text(
         _COL_STATUS[0],
         y,
-        report.status_text,
-        font=BOLD if report.refused else REGULAR,
+        pdf.truncate(report.status_text, status_font, 8.0, CONTENT_RIGHT - _COL_STATUS[0]),
+        font=status_font,
         size=8.0,
         color=REFUSED_COLOR if report.refused else MUTED,
     )
@@ -653,7 +748,7 @@ def _sheet_page(document, result, job, report, ordered, app_name) -> None:
         color=MUTED,
     )
     _draw_sheet(page, report.layout, result.config, ordered, (scale, origin_x, origin_y))
-    _draw_cut_list(page, report, ordered)
+    _draw_cut_list(document, page, report, ordered)
 
 
 def _sheet_header(page, job, report, total) -> None:
@@ -712,6 +807,20 @@ def _sheet_header(page, job, report, total) -> None:
         )
         y -= 13.0
     if report.refused:
+        # 2026-08-04 review: in one-file-per-physical-sheet mode a single
+        # bad file among a picture's run used to print the same banner as a
+        # total loss ("NO NC PROGRAM WAS WRITTEN") even when most of the
+        # run wrote clean — 7 of 8, say.  The banner text now says which
+        # case this is; either way it errs loud, because a partial failure
+        # is still a reason not to run this sheet until it is resolved.
+        total_files = len(report.files)
+        if 0 < report.failed_files < total_files:
+            banner_text = (
+                f"{report.failed_files} OF {total_files} FILES IN THIS RUN FAILED - "
+                "DO NOT MACHINE THIS SHEET UNTIL RESOLVED"
+            )
+        else:
+            banner_text = "REFUSED - NO NC PROGRAM WAS WRITTEN FOR THIS SHEET"
         banner_height = 15.0
         page.rect(
             CONTENT_LEFT, y - 3.0, CONTENT_WIDTH, banner_height,
@@ -719,7 +828,7 @@ def _sheet_header(page, job, report, total) -> None:
         )
         page.text(
             CONTENT_LEFT + 5.0, y + 1.0,
-            "REFUSED - NO NC PROGRAM WAS WRITTEN FOR THIS SHEET",
+            pdf.truncate(banner_text, BOLD, 9, CONTENT_WIDTH - 10.0),
             font=BOLD, size=9, color=REFUSED_COLOR,
         )
         y -= banner_height + 2.0
@@ -909,56 +1018,99 @@ def _draw_label(page, x, y, width, height, text, nested: bool, is_host: bool) ->
     )
 
 
-def _draw_cut_list(page, report, ordered) -> None:
-    x0, y0, width, height = CUTLIST_REGION
-    top = y0 + height
-    page.text(x0, top, "CUT LIST", font=BOLD, size=10)
+def _cut_list_row_plan(row, width: float) -> tuple[float, bool, list[str]]:
+    """``(vertical space this row needs, is_wdc, its wrapped detail lines)``.
+
+    The wrapped lines are computed once here and reused by the drawing
+    code below, so the page-budget check and the actual draw can never
+    disagree about how many lines a row takes — the 2026-08-04 review
+    finding was exactly that disagreement: the old check assumed ONE
+    wrapped detail line where :func:`~faceframe_cnc.report.pdf.wrap_text`
+    can hand back two, so a worst-case row could spill past the region
+    floor onto the drawing beneath it.
+    """
+    is_wdc = row.frame_type == FrameType.WDC.value
+    detail = f"{row.frame_type} - openings {row.openings}"
+    detail_lines = pdf.wrap_text(detail, REGULAR, 7.5, width, max_lines=2)
+    needed = (
+        10.0  # the title line (part number / count / size)
+        + len(detail_lines) * 8.5
+        + (8.5 if is_wdc else 0.0)
+        + (8.5 if row.hosts else 0.0)
+        + 6.0  # the separator rule's spacing, above and below
+    )
+    return needed, is_wdc, detail_lines
+
+
+def _draw_cut_list_row(page, x0, width, y, row, is_wdc, detail_lines) -> float:
+    page.text(
+        x0,
+        y,
+        pdf.truncate(row.part_number, BOLD, 9.5, _CUTLIST_NUMBER_MAX_WIDTH),
+        font=BOLD,
+        size=9.5,
+    )
+    page.text(
+        x0 + _CUTLIST_COUNT_OFFSET, y, f"x{row.count}", font=BOLD, size=9.5, color=MUTED
+    )
+    page.text(
+        x0 + width, y, row.size_text, font=BOLD, size=9.5, align="right"
+    )
+    y -= 10.0
+    for line in detail_lines:
+        page.text(x0, y, line, size=7.5, color=MUTED)
+        y -= 8.5
+    if is_wdc:
+        # 2026-08-03 owner request: the paperwork says out loud what is
+        # special about a WDC frame, in the slot centrelines' colour so
+        # the note and the dashed lines on the drawing read as one fact.
+        page.text(x0, y, _wdc_cutlist_note(), size=7.5, color=WDC_SLOT_EDGE)
+        y -= 8.5
+    if row.hosts:
+        page.text(x0, y, row.nested_text, size=7.5, color=CHILD_EDGE)
+        y -= 8.5
+    y -= 3.0
+    page.line(x0, y + 2.0, x0 + width, y + 2.0, stroke=pdf.gray(0.88), line_width=0.4)
+    y -= 3.0
+    return y
+
+
+def _cut_list_page_head(page, x0, width, top: float, title: str) -> float:
+    page.text(x0, top, title, font=BOLD, size=10)
     y = top - 4.0
     page.line(x0, y, x0 + width, y, stroke=RULE, line_width=0.8)
-    y -= 12.0
+    return y - 12.0
 
-    rows = cut_list(report.layout, ordered)
-    for position, row in enumerate(rows):
-        is_wdc = row.frame_type == FrameType.WDC.value
-        needed = (
-            21.0
-            + (10.0 if row.hosts else 0.0)
-            + (8.5 if is_wdc else 0.0)
-        )
-        if y - needed < y0:
-            page.text(
+
+def _draw_cut_list(document, page, report, ordered) -> None:
+    """The cut list beside the drawing.
+
+    2026-08-04 review: a sheet with more distinct part numbers than one
+    column holds used to stop with "see the cover page contents list" —
+    but that list is capped at 3 wrapped lines and never carries a size,
+    so an overflowed row's dimensions were nowhere on the paperwork at
+    all.  Instead, a row that will not fit starts a real continuation
+    page (the same page-flow the cover's own table overflow already
+    uses), so every part number this sheet carries is on paper somewhere
+    with its size next to it.
+    """
+    x0, _y0, width, height = CUTLIST_REGION
+    top = CUTLIST_REGION[1] + height
+    floor = CUTLIST_REGION[1]
+    y = _cut_list_page_head(page, x0, width, top, "CUT LIST")
+
+    for row in cut_list(report.layout, ordered):
+        needed, is_wdc, detail_lines = _cut_list_row_plan(row, width)
+        if y - needed < floor:
+            page = document.add_page()
+            y = _cut_list_page_head(
+                page,
                 x0,
-                y,
-                f"... and {len(rows) - position} more part number(s); see the "
-                f"cover page contents list",
-                size=7.5,
-                color=MUTED,
+                width,
+                PAGE_HEIGHT - MARGIN - 12.0,
+                f"CUT LIST (continued) - {report.filename}",
             )
-            break
-        page.text(x0, y, row.part_number, font=BOLD, size=9.5)
-        page.text(
-            x0 + 78.0, y, f"x{row.count}", font=BOLD, size=9.5, color=MUTED
-        )
-        page.text(
-            x0 + width, y, row.size_text, font=BOLD, size=9.5, align="right"
-        )
-        y -= 10.0
-        detail = f"{row.frame_type} - openings {row.openings}"
-        for line in pdf.wrap_text(detail, REGULAR, 7.5, width, max_lines=2):
-            page.text(x0, y, line, size=7.5, color=MUTED)
-            y -= 8.5
-        if is_wdc:
-            # 2026-08-03 owner request: the paperwork says out loud what is
-            # special about a WDC frame, in the slot centrelines' colour so
-            # the note and the dashed lines on the drawing read as one fact.
-            page.text(x0, y, _wdc_cutlist_note(), size=7.5, color=WDC_SLOT_EDGE)
-            y -= 8.5
-        if row.hosts:
-            page.text(x0, y, row.nested_text, size=7.5, color=CHILD_EDGE)
-            y -= 8.5
-        y -= 3.0
-        page.line(x0, y + 2.0, x0 + width, y + 2.0, stroke=pdf.gray(0.88), line_width=0.4)
-        y -= 3.0
+        y = _draw_cut_list_row(page, x0, width, y, row, is_wdc, detail_lines)
 
 
 # --------------------------------------------------------------------------
@@ -990,8 +1142,22 @@ def _footers(document, stamp, app_name) -> None:
 
 
 def _dim(value: float) -> str:
-    """A dimension in inches, trimmed: ``21``, ``9.875``, ``0.455``."""
-    return f"{float(value):g}"
+    """A dimension in inches, trimmed: ``21``, ``9.875``, ``0.455``.
+
+    ``%g`` (the previous implementation) keeps only 6 SIGNIFICANT digits,
+    so a value like 47.03125 — an exact 32nd, the machine's own grid —
+    printed as "47.0312": no longer exact, and wrong by more than
+    rounding at the last cut digit as magnitude grows.  Rounding to 5
+    DECIMAL places instead keeps every 32nd (0.03125) exact regardless of
+    how many digits are in front of the point, while still swallowing
+    float noise from earlier arithmetic (19.099999999999998 -> "19.1").
+    Trailing zeros (and a bare trailing point) are trimmed the same way
+    ``%g`` would have.
+    """
+    text = f"{round(float(value), 5):.5f}"
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text if text not in ("", "-", "-0") else "0"
 
 
 def _wdc_cutlist_note() -> str:

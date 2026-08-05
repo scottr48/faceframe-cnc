@@ -70,7 +70,10 @@ runs straight into the program footer)::
 
 from __future__ import annotations
 
+import re
+
 from .model import (
+    SIDES,
     Box,
     CutPlan,
     PanelSpec,
@@ -94,7 +97,14 @@ __all__ = [
     "groove_segment",
     "wdc_slot_segment",
     "default_entry_side",
+    "entry_side_for",
+    "loop_points",
+    "loop_extent",
 ]
+
+#: Parses the number back out of a ``ToolSpec.diameter_comment`` so it can be
+#: held to the ``diameter`` beside it (2026-08-04 review, fix 10).
+_DIA_COMMENT_RE = re.compile(r"^\(DIAMETER: (-?\d*\.?\d+)\)$")
 
 NEWLINE = "\r\n"
 
@@ -227,6 +237,143 @@ def wdc_slot_segment(
     return (box.x0 - overrun, y), (box.x1 + overrun, y)
 
 
+def loop_points(box: Box, side: str, tool: ToolSpec, spec: PassSpec, config: PostConfig):
+    """Every XY point one closed profile loop commands, in order.
+
+    ``(pre, entry, corner1..4, close, overshoot, out)`` — the lead-in ramp's
+    start, the point it lands on, the four corners traversed counter-clockwise,
+    the return to the lead-in point, the one-tool-diameter overshoot past it and
+    the lead-out ramp's end.  :meth:`_Emitter.loop` emits exactly these and
+    :func:`loop_extent` measures exactly these, so the envelope test in
+    :func:`entry_side_for` can never disagree with the code that is written.
+    """
+    ramp = (config.approach_z - spec.z_cut) * config.ramp_ratio
+    over = tool.diameter
+    lead = spec.lateral_lead
+
+    if side == "bottom":
+        entry = (box.mid_x, box.y0)
+        step, normal = (1.0, 0.0), (0.0, -1.0)
+        corners = [
+            (box.x1, box.y0),
+            (box.x1, box.y1),
+            (box.x0, box.y1),
+            (box.x0, box.y0),
+        ]
+    elif side == "right":
+        entry = (box.x1, box.mid_y)
+        step, normal = (0.0, 1.0), (1.0, 0.0)
+        corners = [
+            (box.x1, box.y1),
+            (box.x0, box.y1),
+            (box.x0, box.y0),
+            (box.x1, box.y0),
+        ]
+    elif side == "top":
+        entry = (box.mid_x, box.y1)
+        step, normal = (-1.0, 0.0), (0.0, 1.0)
+        corners = [
+            (box.x0, box.y1),
+            (box.x0, box.y0),
+            (box.x1, box.y0),
+            (box.x1, box.y1),
+        ]
+    elif side == "left":
+        entry = (box.x0, box.mid_y)
+        step, normal = (0.0, -1.0), (-1.0, 0.0)
+        corners = [
+            (box.x0, box.y0),
+            (box.x1, box.y0),
+            (box.x1, box.y1),
+            (box.x0, box.y1),
+        ]
+    else:  # pragma: no cover - guarded by the plan validator
+        raise ValueError(f"unknown entry side {side!r}")
+
+    pre = (
+        entry[0] - step[0] * ramp + normal[0] * lead,
+        entry[1] - step[1] * ramp + normal[1] * lead,
+    )
+    overshoot = (entry[0] + step[0] * over, entry[1] + step[1] * over)
+    out = (
+        entry[0] + step[0] * (over + ramp) + normal[0] * lead,
+        entry[1] + step[1] * (over + ramp) + normal[1] * lead,
+    )
+    return [pre, entry, *corners, entry, overshoot, out]
+
+
+def loop_extent(
+    box: Box, side: str, tool: ToolSpec, spec: PassSpec, config: PostConfig
+) -> Box:
+    """The XY rectangle one loop's whole motion needs, ramps included."""
+    points = loop_points(box, side, tool, spec, config)
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    return Box(min(xs), min(ys), max(xs), max(ys))
+
+
+def entry_side_for(
+    box: Box,
+    kind: str,
+    tool: ToolSpec,
+    spec: PassSpec,
+    config: PostConfig,
+    override: str | None = None,
+) -> str:
+    """Which edge to lead in on, given that the lead-in has to FIT.
+
+    :func:`default_entry_side` says what the reference CAM does, which for
+    every perimeter is the right edge.  A perimeter's lead-in ramp is about
+    four inches long, so on a SHORT part it runs four inches past the part
+    along the entry edge — and for a 48x5 frame near the front of the sheet
+    that ramp starts at Y-1.012, a full inch outside the sheet plus its 0.375
+    trim overhang.  The verifier is right to refuse that (a rapid and a ramp
+    over the fence is still over the fence); what was wrong was emitting it
+    and calling a legal layout unbuildable (2026-08-04 review, fix 6).
+
+    So the measured default is tried first and kept whenever it fits, which is
+    what keeps every reference file and every sheet the optimizer produces
+    today byte-identical.  Only when it does NOT fit does this fall back to the
+    first of the four edges that does, in :data:`~.model.SIDES` order, and only
+    when none of the four fits does it refuse — with the envelope and the part
+    in the message, because at that point the sheet needs re-nesting.
+
+    An explicit ``override`` (a :attr:`~.model.FeatureRef.entry` from a
+    reconstructed file) is obeyed as given: replicating what the shop's CAM
+    actually did is the point of that field, and the verifier has the last
+    word on it either way.
+    """
+    if override is not None:
+        return override
+    envelope = Box(
+        -config.overhang,
+        -config.overhang,
+        config.sheet_width + config.overhang,
+        config.sheet_length + config.overhang,
+    )
+    preferred = default_entry_side(box, kind)
+    order = [preferred] + [side for side in SIDES if side != preferred]
+    tried: list[str] = []
+    for side in order:
+        extent = loop_extent(box, side, tool, spec, config)
+        if envelope.contains(extent, 1e-9):
+            return side
+        tried.append(
+            f"{side} -> x[{extent.x0:.4f}, {extent.x1:.4f}] "
+            f"y[{extent.y0:.4f}, {extent.y1:.4f}]"
+        )
+    ramp = (config.approach_z - spec.z_cut) * config.ramp_ratio
+    raise ValueError(
+        f"no lead-in edge fits: the {box.width:g}x{box.height:g} cut at "
+        f"({box.x0:.4f}, {box.y0:.4f}) needs a {ramp:g} lead-in ramp and a "
+        f"{tool.diameter:g} overshoot, and every edge runs outside the "
+        f"{config.sheet_width:g}x{config.sheet_length:g} sheet plus its "
+        f"{config.overhang:g} overhang - "
+        + "; ".join(tried)
+        + ". Re-nest the sheet so this part is further from the edge"
+    )
+
+
 class _Emitter:
     """Accumulates lines while tracking the modal machine position."""
 
@@ -324,57 +471,17 @@ class _Emitter:
         first: bool,
     ) -> None:
         """Cut one closed rectangle counter-clockwise, leading in on the
-        midpoint of ``side``."""
-        cfg = self.config
-        ramp = (cfg.approach_z - spec.z_cut) * cfg.ramp_ratio
-        over = tool.diameter
-        lead = spec.lateral_lead
+        midpoint of ``side``.
 
-        # Entry point, travel direction along the entry edge (CCW), and the
-        # outward normal used to stand the ramp off the profile line.
-        if side == "bottom":
-            entry = (box.mid_x, box.y0)
-            step, normal = (1.0, 0.0), (0.0, -1.0)
-            corners = [
-                (box.x1, box.y0),
-                (box.x1, box.y1),
-                (box.x0, box.y1),
-                (box.x0, box.y0),
-            ]
-        elif side == "right":
-            entry = (box.x1, box.mid_y)
-            step, normal = (0.0, 1.0), (1.0, 0.0)
-            corners = [
-                (box.x1, box.y1),
-                (box.x0, box.y1),
-                (box.x0, box.y0),
-                (box.x1, box.y0),
-            ]
-        elif side == "top":
-            entry = (box.mid_x, box.y1)
-            step, normal = (-1.0, 0.0), (0.0, 1.0)
-            corners = [
-                (box.x0, box.y1),
-                (box.x0, box.y0),
-                (box.x1, box.y0),
-                (box.x1, box.y1),
-            ]
-        elif side == "left":
-            entry = (box.x0, box.mid_y)
-            step, normal = (0.0, -1.0), (-1.0, 0.0)
-            corners = [
-                (box.x0, box.y0),
-                (box.x1, box.y0),
-                (box.x1, box.y1),
-                (box.x0, box.y1),
-            ]
-        else:  # pragma: no cover - guarded by the plan validator
-            raise ValueError(f"unknown entry side {side!r}")
+        The geometry itself is :func:`loop_points`, shared with
+        :func:`loop_extent` so that the envelope test which CHOOSES the entry
+        side measures the same motion this writes.
+        """
+        points = loop_points(box, side, tool, spec, self.config)
+        pre, entry = points[0], points[1]
+        corners = points[2:6]
+        close, overshoot, out = points[6], points[7], points[8]
 
-        pre = (
-            entry[0] - step[0] * ramp + normal[0] * lead,
-            entry[1] - step[1] * ramp + normal[1] * lead,
-        )
         self.preposition(pre[0], pre[1], tool, first)
         self.line(
             f"G1 {self._axis_words(entry[0], entry[1])} "
@@ -383,14 +490,8 @@ class _Emitter:
         for i, corner in enumerate(corners):
             words = self._axis_words(corner[0], corner[1])
             self.line(f"{words} F{fmt(spec.cut_feed)}" if i == 0 else words)
-        self.line(self._axis_words(entry[0], entry[1]))
-        self.line(
-            self._axis_words(entry[0] + step[0] * over, entry[1] + step[1] * over)
-        )
-        out = (
-            entry[0] + step[0] * (over + ramp) + normal[0] * lead,
-            entry[1] + step[1] * (over + ramp) + normal[1] * lead,
-        )
+        self.line(self._axis_words(close[0], close[1]))
+        self.line(self._axis_words(overshoot[0], overshoot[1]))
         self.line(f"{self._axis_words(out[0], out[1])} Z{fmt(self.config.approach_z)}")
         self.retract()
 
@@ -429,6 +530,43 @@ def _check_config(cfg: PostConfig, program: SheetProgram) -> None:
     for what, z in (("ramp plane", cfg.approach_z), ("rapid plane", cfg.rapid_z)):
         if z > cfg.z_max + 1e-9:
             raise ValueError(f"the {what} Z{z} is above the Z{cfg.z_max} ceiling")
+        # 2026-08-04 review, fix 1: both planes are reached by RAPIDS, so both
+        # have to clear the stock.  With approach_z 0.6 against a 0.75 stock top
+        # the post used to emit `G0 Z0.6` prepositions -- a rapid plunge 0.15
+        # into the part, at every feature, and the verifier had nothing to say
+        # about it because none of its rules looked at a G0.
+        if z < cfg.stock_top_z - 1e-9:
+            raise ValueError(
+                f"the {what} Z{z} is below the Z{cfg.stock_top_z} top of the stock - "
+                f"the machine RAPIDS to it, so it would rapid-plunge "
+                f"{cfg.stock_top_z - z:g} into the part before any feed move starts"
+            )
+    if cfg.rapid_z < cfg.approach_z - 1e-9:
+        raise ValueError(
+            f"the rapid plane Z{cfg.rapid_z} is below the ramp plane "
+            f"Z{cfg.approach_z} - the retract between features would descend"
+        )
+
+    # Fix 10: the verifier arms its cone rule by matching the diameter the FILE
+    # declares to the float in this table, so a comment that has drifted away
+    # from its own number silently swaps the v-slot check for a stream of
+    # misleading foreign-cut refusals.  The two are one measurement; hold them
+    # to each other here, where the table is in hand.
+    for section, tool in sorted(cfg.tools.items()):
+        match = _DIA_COMMENT_RE.match(tool.diameter_comment)
+        if match is None:
+            raise ValueError(
+                f"the {section!r} tool T{tool.number} declares "
+                f"{tool.diameter_comment!r}, which is not a (DIAMETER: n) comment - "
+                f"the verifier identifies a tool by the diameter the program states"
+            )
+        if abs(float(match.group(1)) - tool.diameter) > 1e-9:
+            raise ValueError(
+                f"the {section!r} tool T{tool.number} announces "
+                f"{tool.diameter_comment} but its diameter is {tool.diameter:g} - "
+                f"the comment is what the machine operator and the verifier both "
+                f"read, so the two may not disagree"
+            )
 
     # The V-slot geometry everything downstream uses -- overrun, swept
     # width, the optimizer's end clearance -- is the cone's "radius equals
@@ -559,9 +697,18 @@ def generate(
                         f"which has {len(part.openings)}"
                     )
                 opening = part.openings[ref.index]
-                side = ref.entry or default_entry_side(opening, "opening")
                 cut = opening.grow(spec.offset)
                 _require_cuttable(cut, f"opening {ref.index} of part {ref.part}")
+                try:
+                    side = entry_side_for(
+                        cut, "opening", tool, spec, cfg, override=ref.entry
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        f"opening {ref.index} of {part.part_number} @"
+                        f"({part.box.x0:.4f},{part.box.y0:.4f}) cannot be cut on this "
+                        f"sheet: {exc}"
+                    ) from exc
                 emitter.loop(cut, side, tool, spec, i == 0)
 
         elif section == SECTION_PERIMETER:
@@ -574,9 +721,17 @@ def generate(
             for spec, refs in zip(cfg.perimeter_passes, plan.perimeter):
                 for ref in refs:
                     part = part_of(ref, "perimeter")
-                    side = ref.entry or default_entry_side(part.box, "perimeter")
                     cut = part.box.grow(spec.offset)
                     _require_cuttable(cut, f"the footprint of part {ref.part}")
+                    try:
+                        side = entry_side_for(
+                            cut, "perimeter", tool, spec, cfg, override=ref.entry
+                        )
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"{part.part_number} @({part.box.x0:.4f},"
+                            f"{part.box.y0:.4f}) cannot be cut on this sheet: {exc}"
+                        ) from exc
                     emitter.loop(cut, side, tool, spec, index == 0)
                     index += 1
                     if index == 1 and cfg.perimeter_marker_after_first_loop:

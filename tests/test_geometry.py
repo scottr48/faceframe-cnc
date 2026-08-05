@@ -46,6 +46,38 @@ class InferFrameTypeTests(unittest.TestCase):
         self.assertEqual(infer_frame_type("3db24"), FrameType.THREE_DRAWER)
         self.assertEqual(infer_frame_type("bbc36"), FrameType.WALL)
 
+    def test_unsupported_drawer_base_families(self):
+        # 2026-08-04 review fix 4: these drawer-base families (from the
+        # reference orders' "Drawer Bases" catalogue section) have cross
+        # bars this app does not know how to lay out -- they must never
+        # fall through to WALL (a single opening, no cross bars at all).
+        for part in (
+            "2DB24",
+            "2DB30",
+            "2DB33",
+            "2DB36",
+            "4DB18",
+            "MICRO3DB24",
+            "MICRO3DB27",
+            "MICRO3DB30",
+        ):
+            with self.subTest(part=part):
+                self.assertEqual(
+                    infer_frame_type(part), FrameType.UNSUPPORTED_DRAWER_BASE
+                )
+
+    def test_3db_is_not_unsupported(self):
+        # 3DB... is checked FIRST and returns THREE_DRAWER -- a layout
+        # this app does know -- never UNSUPPORTED_DRAWER_BASE.
+        self.assertEqual(infer_frame_type("3DB24"), FrameType.THREE_DRAWER)
+        self.assertEqual(infer_frame_type("3DB30"), FrameType.THREE_DRAWER)
+
+    def test_unsupported_drawer_base_case_insensitive(self):
+        self.assertEqual(infer_frame_type("2db24"), FrameType.UNSUPPORTED_DRAWER_BASE)
+        self.assertEqual(
+            infer_frame_type("micro3db24"), FrameType.UNSUPPORTED_DRAWER_BASE
+        )
+
 
 class WallGeometryTests(unittest.TestCase):
     def test_w3036(self):
@@ -103,6 +135,22 @@ class WdcGeometryTests(unittest.TestCase):
         g = compute_geometry("WDC2436", 3, 36)
         self.assertEqual(g.openings, [])
         self.assertTrue(g.errors)
+
+
+class UnsupportedDrawerBaseGeometryTests(unittest.TestCase):
+    """2026-08-04 review fix 4: never silently produce WALL geometry for these."""
+
+    def test_compute_geometry_refuses_2db24(self):
+        with self.assertRaises(ValueError):
+            compute_geometry("2DB24", 24, 30)
+
+    def test_compute_geometry_refuses_4db18(self):
+        with self.assertRaises(ValueError):
+            compute_geometry("4DB18", 18, 30)
+
+    def test_compute_geometry_refuses_micro3db24(self):
+        with self.assertRaises(ValueError):
+            compute_geometry("MICRO3DB24", 24, 30)
 
 
 class BaseGeometryTests(unittest.TestCase):

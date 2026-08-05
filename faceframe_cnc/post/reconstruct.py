@@ -47,11 +47,33 @@ from .model import (
     SheetProgram,
     default_config,
 )
-from .generator import default_entry_side, groove_segment, wdc_slot_segment
+from .generator import (
+    default_entry_side,
+    entry_side_for,
+    groove_segment,
+    wdc_slot_segment,
+)
 
 __all__ = ["ReconstructionError", "reconstruct", "reconstruct_text"]
 
 TOL = 1e-6
+
+#: Decimals a coordinate reaches this module with.  The post prints four and
+#: strips trailing zeros, so nothing read out of a file is more precise than
+#: that.
+PLACES = 4
+
+#: Tolerance for comparing a value this module COMPUTED against one the file
+#: PRINTED (2026-08-04 review, fix 9).  ``TOL`` is right for printed-against-
+#: printed — both sides are then on the same 0.0001 grid — but wrong the
+#: moment an exact midpoint meets a rounded one: a 30.0625" frame's opening has
+#: its mid-x at 16.03125, the post can only print ``X16.0312``, and the
+#: half-of-the-last-digit difference made :func:`_entry_side` refuse a file the
+#: post had just written.  5e-5 is the largest error a four-decimal rounding
+#: can introduce, so anything above it is enough; 1e-4 keeps the margin
+#: visible and is still four orders of magnitude tighter than the smallest
+#: distance between two different edges of a real frame.
+PRINTED_TOL = 1e-4
 
 _WORD_RE = re.compile(r"([A-Za-z])(-?\d*\.?\d+)")
 _TOOL_RE = re.compile(r"^\(ROUTE TOOL #(\d+):")
@@ -160,14 +182,21 @@ def _loop_box(feature: _Feature) -> Box:
 
 
 def _entry_side(feature: _Feature, box: Box) -> str:
+    """Which edge's midpoint the lead-in landed on.
+
+    An edge MIDPOINT is the one place in this module where an exact value meets
+    a printed one — halving a 0.0001-grid coordinate lands off the grid every
+    time the span is an odd number of ten-thousandths — so this comparison uses
+    :data:`PRINTED_TOL` rather than :data:`TOL` (2026-08-04 review, fix 9).
+    """
     ex, ey = feature.points[0][0], feature.points[0][1]
-    if abs(ey - box.y0) < TOL and abs(ex - box.mid_x) < TOL:
+    if abs(ey - box.y0) < PRINTED_TOL and abs(ex - box.mid_x) < PRINTED_TOL:
         return "bottom"
-    if abs(ex - box.x1) < TOL and abs(ey - box.mid_y) < TOL:
+    if abs(ex - box.x1) < PRINTED_TOL and abs(ey - box.mid_y) < PRINTED_TOL:
         return "right"
-    if abs(ey - box.y1) < TOL and abs(ex - box.mid_x) < TOL:
+    if abs(ey - box.y1) < PRINTED_TOL and abs(ex - box.mid_x) < PRINTED_TOL:
         return "top"
-    if abs(ex - box.x0) < TOL and abs(ey - box.mid_y) < TOL:
+    if abs(ex - box.x0) < PRINTED_TOL and abs(ey - box.mid_y) < PRINTED_TOL:
         return "left"
     raise ReconstructionError(
         f"lead-in point ({ex}, {ey}) is not the midpoint of any edge of {box}"
@@ -327,7 +356,16 @@ def reconstruct_text(text: str, config: PostConfig | None = None):
                 part=index_of[id(owner)],
                 kind="opening",
                 index=ref_index,
-                entry=None if side == default_entry_side(box, "opening") else side,
+                entry=None
+                if side
+                == _effective_entry_side(
+                    box.grow(cfg.openings_pass.offset),
+                    "opening",
+                    cfg.tools[SECTION_OPENINGS],
+                    cfg.openings_pass,
+                    cfg,
+                )
+                else side,
             )
         )
 
@@ -339,7 +377,8 @@ def reconstruct_text(text: str, config: PostConfig | None = None):
         ]
 
     perimeter_refs: list[list[FeatureRef]] = []
-    for entries in passes:
+    for pass_index, entries in enumerate(passes):
+        spec = cfg.perimeter_passes[pass_index]
         pass_refs: list[FeatureRef] = []
         for box, side in entries:
             owner = next((p for p in parts if p.box == box), None)
@@ -352,7 +391,14 @@ def reconstruct_text(text: str, config: PostConfig | None = None):
                     part=index_of[id(owner)],
                     kind="perimeter",
                     entry=None
-                    if side == default_entry_side(box, "perimeter")
+                    if side
+                    == _effective_entry_side(
+                        box.grow(spec.offset),
+                        "perimeter",
+                        cfg.tools[SECTION_PERIMETER],
+                        spec,
+                        cfg,
+                    )
                     else side,
                 )
             )
@@ -367,6 +413,26 @@ def reconstruct_text(text: str, config: PostConfig | None = None):
         sections=tuple(order) if order else DEFAULT_SECTIONS,
     )
     return program, plan
+
+
+def _effective_entry_side(cut: Box, kind: str, tool, spec, cfg: PostConfig) -> str:
+    """What :func:`~.generator.generate` would choose, left to itself.
+
+    A :attr:`~.model.FeatureRef.entry` is recorded only when the file did
+    something the emitter would NOT have done by default, so this has to be the
+    emitter's own rule and not a copy of half of it: since the 2026-08-04
+    entry-side fallback (fix 6) the default depends on whether the lead-in fits
+    the sheet, and a reconstruction that asked only
+    :func:`~.generator.default_entry_side` would drop the override on exactly
+    the parts the fallback exists for — and regenerate a different file.
+
+    A cut with no fitting edge at all cannot be the emitter's default by
+    definition, so the actual side is recorded explicitly.
+    """
+    try:
+        return entry_side_for(cut, kind, tool, spec, cfg)
+    except ValueError:
+        return ""
 
 
 def _innermost(parts: list[PartProgram], box: Box) -> PartProgram | None:
@@ -523,4 +589,11 @@ def _groove_ref(parts, index_of, start, end, cfg: PostConfig) -> FeatureRef:
 
 
 def _same(a, b) -> bool:
-    return abs(a[0] - b[0]) < TOL and abs(a[1] - b[1]) < TOL
+    """Do a segment endpoint this module computed and one the file printed match?
+
+    Computed-against-printed, so :data:`PRINTED_TOL` (see fix 9): a groove or
+    slot centreline is derived from a footprint that is itself a printed
+    coordinate plus an exact inset, and any of those arithmetic steps can land
+    a half-ten-thousandth off what the post was able to print.
+    """
+    return abs(a[0] - b[0]) < PRINTED_TOL and abs(a[1] - b[1]) < PRINTED_TOL

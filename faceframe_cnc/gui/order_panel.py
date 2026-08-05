@@ -125,10 +125,20 @@ class OrderPanel(QWidget):
         self.height_edit = QLineEdit()
         self.width_edit.setPlaceholderText("inches")
         self.height_edit.setPlaceholderText("inches")
+        # 2026-08-04: the parser now holds back a row whose QTY cell is not a
+        # whole number (it keeps "2.9" rather than flooring it), so the
+        # resolve editor has to be able to ask for a quantity as well -- an
+        # editor that can only fix dimensions has nothing to offer such a row.
+        # Enabled only for those rows, the same way the dimension boxes are
+        # enabled only for the dimensions that are actually missing.
+        self.qty_edit = QLineEdit()
+        self.qty_edit.setPlaceholderText("whole number of frames")
+        self.qty_edit.setEnabled(False)
         self.resolve_button = QPushButton("Resolve and include")
         self.resolve_button.clicked.connect(self._on_resolve)
 
         form = QFormLayout()
+        form.addRow("Quantity", self.qty_edit)
         form.addRow("Frame width", self.width_edit)
         form.addRow("Frame height", self.height_edit)
 
@@ -212,17 +222,38 @@ class OrderPanel(QWidget):
 
             attention = session.needs_attention_rows()
             no_frame = session.no_frame_rows()
+            # 2026-08-04 review: reload() used to snap the resolve editor to
+            # attention row 0 on EVERY rebuild -- so "Cut all", or saving an
+            # unrelated edit dialog, silently re-aimed the editor (with its
+            # prefilled suggestions) at a different line than the one the
+            # user had picked and the table still highlighted, and one click
+            # on "Resolve and include" then resolved that other line.  The
+            # editor's target is preserved by row identity across a reload
+            # and only defaults to the first entry when there is nothing to
+            # preserve.  ``_loading`` keeps the clear() below from wiping the
+            # target through currentRowChanged before we get to read it.
+            target = self._resolve_key
+            resolvable = {row.key for row in attention} | {row.key for row in no_frame}
+            if target is not None and target not in resolvable:
+                target = None  # resolved, or a different order was loaded
             self.attention_list.clear()
+            keys: list[str] = []
             for row in attention:
                 item = QListWidgetItem(f"{row.part_number} (qty {row.qty}) - {row.reason}")
                 item.setData(Qt.ItemDataRole.UserRole, row.key)
                 self.attention_list.addItem(item)
+                keys.append(row.key)
             # The box holds the resolve editor, which a NO_FRAME row selected
             # directly in the table (see _on_table_selection_changed) can
             # also open, so keep it available whenever either kind exists.
             self.attention_box.setVisible(bool(attention) or bool(no_frame))
-            if attention:
-                self.attention_list.setCurrentRow(0)
+            if target is None and keys:
+                target = keys[0]
+            self.attention_list.setCurrentRow(keys.index(target) if target in keys else -1)
+            # Same row as before the reload: keep whatever the user has
+            # already typed into the editor.  A different row (or the first
+            # one, freshly defaulted): fill in that row's suggestions.
+            self._show_editor_for(target, keep_values=target == self._resolve_key)
 
             if no_frame:
                 self.no_frame_label.setText(
@@ -289,6 +320,11 @@ class OrderPanel(QWidget):
         return self._resolve_key
 
     def _on_attention_selected(self, _index: int) -> None:
+        # reload() clears and rebuilds this list, which fires
+        # currentRowChanged(-1) on the way; without this guard that wiped the
+        # editor's target (and then reload's own choice) mid-rebuild.
+        if self._loading:
+            return
         item = self.attention_list.currentItem()
         key = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
         self._show_editor_for(key)
@@ -361,15 +397,27 @@ class OrderPanel(QWidget):
         self.statusMessage.emit(f"{row.part_number} reverted to order form values")
         self.includeChanged.emit()
 
-    def _show_editor_for(self, key: Optional[str]) -> None:
+    def _show_editor_for(self, key: Optional[str], *, keep_values: bool = False) -> None:
+        """Aim the resolve editor at ``key`` (``None`` = nothing to resolve).
+
+        ``keep_values`` re-aims at the row already showing without touching
+        the boxes, so a reload triggered by something else on the panel
+        cannot throw away half-typed numbers.
+        """
         self._resolve_key = key
         if key is None:
             self.reason_label.setText("")
+            self.qty_edit.setEnabled(False)
             return
         row = self.session.row(key)
         self.reason_label.setText(f"{row.reason}. {row.hint}")
+        # A qty-problem row is the one case where the quantity is what needs
+        # fixing; every other row keeps the quantity the order form gave.
+        self.qty_edit.setEnabled(row.qty_problem)
         self.width_edit.setEnabled("width" in row.missing)
         self.height_edit.setEnabled("height" in row.missing)
+        if keep_values:
+            return
         width, height = suggest_dimensions(row.part_number)
         self.width_edit.setText(
             "" if not self.width_edit.isEnabled() or width is None else f"{width:g}"
@@ -377,6 +425,11 @@ class OrderPanel(QWidget):
         self.height_edit.setText(
             "" if not self.height_edit.isEnabled() or height is None else f"{height:g}"
         )
+        # Never pre-filled: the order form's own value is the thing that is
+        # wrong, and rounding it for the user would be exactly the silent
+        # guess the spec forbids.  The reason line above quotes what the
+        # sheet actually said.
+        self.qty_edit.setText("")
 
     def _on_resolve(self) -> None:
         key = self._current_attention_key()
@@ -387,12 +440,18 @@ class OrderPanel(QWidget):
                 key,
                 width=self.width_edit.text().strip() or None,
                 height=self.height_edit.text().strip() or None,
+                # Only when the box is live for this row: a disabled box must
+                # never send a quantity the user cannot see they are sending.
+                qty=(self.qty_edit.text().strip() or None)
+                if self.qty_edit.isEnabled()
+                else None,
             )
         except SessionError as exc:
             self.statusMessage.emit(str(exc))
             return
         self.reload()
         self.statusMessage.emit(
-            f"{row.part_number} resolved to {row.size_text} and added to the cut list"
+            f"{row.part_number} resolved to {row.size_text} "
+            f"(qty {row.qty}) and added to the cut list"
         )
         self.lineResolved.emit(key)

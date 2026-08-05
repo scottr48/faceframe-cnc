@@ -33,6 +33,19 @@ What is checked
 ``z-limit``       every commanded Z lies in [z_min, z_max] (spec section 8
                   machine protection; factory defaults are the deepest cut
                   and the rapid plane measured in the references).
+``rapid``         no RAPID move travels below the top of the stock (see
+                  below).
+``g-mode``        ``G90``/``G91``/``G28`` appear only where the post puts
+                  them — inside the fixed header/footer/section-tail lines
+                  (and ``G90`` on the pattern-pinned ``G0 G54 G90 X.. Y..``
+                  prepositions).  The verifier reads every coordinate as
+                  ABSOLUTE, so it may not accept a program that switches to
+                  incremental.
+``tool-comp``     every ``G43`` states an ``H`` equal to the tool in the
+                  spindle, and no other line carries an ``H`` at all (bar
+                  the fixed ``G90 H0 M25`` footer line).
+``spindle-start`` every tool section starts the spindle (``M13``) before its
+                  first feed move.
 ``dry-run``       only when the config says the program is an air cut
                   (``PostConfig.dry_run``): no FEED move may reach the top
                   of the stock.  The rapid ``G28 Z0`` homing moves in the
@@ -58,10 +71,53 @@ What is checked
                   pass) and every closed loop closes.
 ``missing-cut``   a cut the sheet's layout calls for is not in the file.
 ``extra-cut``     a cut is in the file that the layout does not call for.
-                  Both of these are checked ONLY when the caller hands
-                  :func:`verify` an :class:`ExpectedWork` manifest (see
-                  below); with ``expected=None`` the file is judged entirely
-                  on its own, exactly as it always was.
+``cut-order``     the cuts are in the file but in an order that would drop a
+                  part under the spindle (see "Chronology" below).  These
+                  three are checked ONLY when the caller hands :func:`verify`
+                  an :class:`ExpectedWork` manifest (see below); with
+                  ``expected=None`` the file is judged entirely on its own,
+                  exactly as it always was.
+
+Rapids (2026-08-04 review, fix 1)
+---------------------------------
+Every material rule below is about FEED moves: a ``G0`` removes no material
+on purpose, so all of them skip it.  Nothing then said where a rapid may go,
+and a hand-edited ``G0 Z2.5`` retract turned into ``G0 Z0.`` verified clean —
+a spinning bit rapid-traversing the whole sheet at spoilboard level, which is
+the single most expensive mistake this file exists to prevent.
+
+So ``rapid`` requires the obvious thing the references all do: a rapid
+retracts, traverses high and stops ABOVE the stock, and the plunge that
+follows is a feed move.  Both endpoints and therefore the whole (straight)
+segment must stay at or above :attr:`~.model.PostConfig.stock_top_z`.
+
+The one honest exemption is that after a ``G28`` the control is at its own
+home position and the program's absolute Z is unknown until the next Z word —
+which is exactly the state the fixed ``G0 G20 G91 G28 Z0 M15`` prologue, the
+``G17 G91 G28 Z0 M95`` section tails and the ``G91 G28 Z0 M15`` / ``G90 X24.
+Y96.`` footer park leave it in.  Moves made while Z is unknown carry no rapid
+finding; ``g-mode`` is what stops anybody manufacturing that state mid-body,
+since the post only ever writes ``G28`` on those fixed lines.
+
+Chronology (2026-08-04 review, fix 2)
+-------------------------------------
+``missing-cut``/``extra-cut`` match the file against the manifest as an
+unordered multiset, so a program with every required cut in a catastrophic
+ORDER passed: swap the two perimeter passes and the sheet is cut through
+before anything is holding it; free a host before the frame nested in its
+opening and the inner is loose in a hole under a moving spindle.  Both were
+verified clean before this check.
+
+Three relations, all derived from the manifest (which is derived from the
+layout), all judged on the line the matched cut appears on:
+
+a)  per part, the onion-skin perimeter pass before the through pass;
+b)  per host/inner pair, the inner's through pass before the host's;
+c)  per part, its through perimeter pass is the LAST cut of that part —
+    once a part is free, nothing may cut it again.
+
+All three hold in R710101N, R720101N and R730101N (checked from the files,
+not assumed) and in every sheet the planner generates.
 
 Foreign cuts and MISSING cuts (2026-08-04 review)
 -------------------------------------------------
@@ -118,6 +174,30 @@ safe direction for a check whose job is to catch a cut nobody approved.
 
 Cuts that never reach the stock (a dry-run file) have no cone and are
 skipped, exactly as they are by ``foreign-cut``.
+
+Where the cone may reach is the PLANNER's rule, tightened here to match it
+(2026-08-04 review, fix 11): :func:`~.from_layout.plan_sheet` refuses a sweep
+the sheet does not contain, while this check used to allow the ordinary 0.375
+trim overhang on top.  A cone running off the sheet is a cut into the fence,
+not into trim, so the looser of the two rules was simply wrong; RFK0101N — the
+file the T17 grammar was measured from — keeps its slots well inside the sheet
+and is unaffected.
+
+Ramps have a Z profile (2026-08-04 review, fix 6)
+-------------------------------------------------
+A lead-in ramp descends 1 unit of Z per 2 of travel, so a perimeter ramp is
+about 4" long and spends most of that length 1-2 INCHES ABOVE the sheet.
+Judging the whole move at its minimum Z — which is what ``foreign-cut`` used
+to do — refused legal work: a 24x6 valance above a 30" frame was reported as
+cutting into its neighbour by a ramp segment physically above it.
+
+So a move is now split along its own Z profile.  Z varies linearly with
+travel, so "the part of this move at or below the stock top" and "the part of
+it through the stock" are each one contiguous sub-segment, and each is judged
+on its own: the through part with the tool's swept width, the part in the
+material but not through on its tool centre (the shallow-cut waiver above),
+and the part above the stock not at all, because up there the bit is not
+touching anything.
 
 Feeds and spindle speeds (2026-08-04, owner-approved follow-up)
 --------------------------------------------------------------
@@ -260,6 +340,21 @@ _SECTION_TAIL = ("M59", "G80", "G17 G91 G28 Z0 M95", "M92")
 _ALLOWED_G = {0, 1, 8, 17, 20, 28, 40, 43, 54, 80, 90, 91}
 _ALLOWED_M = {7, 13, 15, 22, 25, 30, 59, 88, 89, 92, 95}
 
+#: The one non-literal line shape the post writes a ``G90`` on: the position
+#: a tool section restates before its ``Tn`` call, and the first preposition
+#: of a section (the same line plus the spindle start).  ``_check_sections``
+#: pins the shape; only the coordinates and the speed vary, so ``g-mode`` can
+#: recognise it exactly rather than by "starts with".
+#:
+#: The spindle words are optional here on purpose: whether this line starts the
+#: spindle and at what speed is ``spindle-start``'s and ``spindle-speed``'s
+#: business, and one wrong line should draw one finding from the rule that owns
+#: it, not a second confusing one from this one.
+_PREPOSITION_RE = re.compile(
+    r"^G0 G54 G90 X-?(?:\d+\.?\d*|\.\d+) Y-?(?:\d+\.?\d*|\.\d+)"
+    r"(?: M13)?(?: S\d+)?$"
+)
+
 _WORD_RE = re.compile(r"([A-Za-z])(-?\d*\.?\d+)")
 _O_RE = re.compile(r"^O\d{4} \(.+\)$")
 _CREATED_RE = re.compile(r"^\(CREATED ON .*\)$")
@@ -290,6 +385,11 @@ class _Move:
     which is the move's own line when the move states its own F, and an
     earlier one when it inherits (see the module docstring's feed section).
     ``feed`` is ``None`` only before the program's first F word.
+
+    ``z_known`` is False while the control's absolute Z is not something this
+    re-parse can know — from a ``G28`` homing move until the next commanded Z
+    word.  The rapid-safety rule is the one check that must not guess there
+    (see the module docstring's "Rapids" section).
     """
 
     rapid: bool
@@ -304,6 +404,7 @@ class _Move:
     tool: int = 0
     feed: float | None = None
     feed_line: int = 0
+    z_known: bool = True
 
 
 def verify_file(
@@ -344,14 +445,18 @@ def verify(
     problems.extend(_check_footer(lines))
     problems.extend(_check_sections(lines))
 
-    moves, motion_problems = _simulate(lines, cfg)
+    fixed = _fixed_line_numbers(lines)
+    problems.extend(_check_g_modes(lines, fixed))
+    moves, motion_problems = _simulate(lines, cfg, fixed)
     problems.extend(motion_problems)
     problems.extend(_check_limits(moves, cfg))
+    problems.extend(_check_rapids(moves, cfg))
     # Feeds and speeds are judged against the SAME table, and independently
     # of the expected-work manifest: a reference file with no layout behind
     # it still has to be cutting at the right feed (2026-08-04 follow-up).
     problems.extend(_check_feeds(moves, cfg))
     problems.extend(_check_speeds(lines, cfg))
+    problems.extend(_check_spindle_start(lines))
     if cfg.dry_run:
         problems.extend(_check_air_cut(moves, cfg))
 
@@ -511,12 +616,108 @@ def _check_sections(lines: list[str]) -> list[Violation]:
 # --------------------------------------------------------------------------
 
 
-def _simulate(lines: list[str], cfg: PostConfig) -> tuple[list[_Move], list[Violation]]:
+def _fixed_line_numbers(lines: list[str]) -> set[int]:
+    """1-based numbers of the lines this post writes from a FIXED template.
+
+    The prologue, the program footer and each section's tail are byte-pinned:
+    ``_check_header``/``_check_footer``/``_check_sections`` already require
+    them verbatim, and they are the only places the post ever writes ``G91``,
+    ``G28`` or an ``H`` word.  ``g-mode`` and ``tool-comp`` need to know WHERE
+    those lines are, not merely that such text exists somewhere, or a hand
+    edit could plant a copy mid-body and exempt itself.
+
+    Only lines that actually match their template are returned, so a program
+    with a broken footer gets the ``footer`` finding it deserves rather than a
+    silent exemption on the mangled line.
+    """
+    fixed: set[int] = set()
+
+    index = 5
+    while index < len(lines) and lines[index].startswith("("):
+        index += 1  # optional generated-by banner comments
+    for offset, expected in enumerate(_HEADER_TAIL):
+        pos = index + offset
+        if 0 <= pos < len(lines) and lines[pos] == expected:
+            fixed.add(pos + 1)
+
+    first = len(lines) - len(_FOOTER)
+    for offset, expected in enumerate(_FOOTER):
+        pos = first + offset
+        if 0 <= pos < len(lines) and lines[pos] == expected:
+            fixed.add(pos + 1)
+
+    heads = [i for i, line in enumerate(lines) if line.startswith("(ROUTE TOOL")]
+    for pos, head in enumerate(heads):
+        if pos + 1 >= len(heads):
+            continue  # the last section runs into the footer, handled above
+        end = heads[pos + 1] - 1
+        for offset, expected in enumerate(_SECTION_TAIL):
+            at = end - len(_SECTION_TAIL) + offset
+            if 0 <= at < len(lines) and lines[at] == expected:
+                fixed.add(at + 1)
+    return fixed
+
+
+def _check_g_modes(lines: list[str], fixed: set[int]) -> list[Violation]:
+    """``G90``/``G91``/``G28`` only where the post puts them.
+
+    This verifier reads every X/Y/Z as an ABSOLUTE coordinate, because that is
+    all the post ever emits: ``G91`` appears in the fixed header, section-tail
+    and footer lines and nowhere else, always paired with ``G28`` homing.  A
+    ``G91`` inserted before a body loop used to be accepted (both codes are in
+    the reference files, so ``code`` passed it) while every coordinate after it
+    was still read as absolute — the verifier would be checking a program the
+    control would not run, and the control would run an incremental runaway.
+
+    Refusing the mode change is the honest answer rather than implementing
+    incremental interpretation for a post that never writes it.  ``G28`` is on
+    the same list because it is what makes the absolute Z unknown (see
+    "Rapids"), so allowing it mid-body would hand the rapid rule a blind spot.
+    """
+    problems: list[Violation] = []
+    for index, raw in enumerate(lines, start=1):
+        if index in fixed:
+            continue
+        code = _COMMENT_RE.sub("", raw).strip()
+        if not code or code == "%":
+            continue
+        found = sorted(
+            {
+                int(float(value))
+                for letter, value in _WORD_RE.findall(code)
+                if letter.upper() == "G" and int(float(value)) in (28, 90, 91)
+            }
+        )
+        if not found:
+            continue
+        if found == [90] and _PREPOSITION_RE.match(code):
+            continue  # the pattern-pinned section preposition
+        problems.append(
+            Violation(
+                "g-mode",
+                f"{', '.join('G%d' % n for n in found)} on {code!r} - this post "
+                f"only sets G90/G91/G28 on its fixed header, section-tail and "
+                f"footer lines, and every coordinate in this file is read as "
+                f"absolute, so a mode change here means the file no longer "
+                f"describes what the control would do",
+                index,
+            )
+        )
+    return problems
+
+
+def _simulate(
+    lines: list[str], cfg: PostConfig, fixed: set[int] | None = None
+) -> tuple[list[_Move], list[Violation]]:
     """Walk the whole program as the control would and return every move."""
     problems: list[Violation] = []
     moves: list[_Move] = []
+    fixed = fixed if fixed is not None else _fixed_line_numbers(lines)
     modal_rapid = True
     x = y = z = 0.0
+    # A program opens by homing Z, so where the spindle IS before the first
+    # commanded Z is not something this re-parse can know.
+    z_known = False
     radius = 0.0
     tool_number = 0
     # Modal feed, exactly as the control holds it: set by any F word on any
@@ -543,6 +744,10 @@ def _simulate(lines: list[str], cfg: PostConfig) -> tuple[list[_Move], list[Viol
         new_x, new_y, new_z = x, y, z
         moved = False
         line_rapid = None
+        homing = False
+        commands_z = False
+        comp_on = False
+        h_words: list[int] = []
         for letter, value in words:
             letter = letter.upper()
             if letter == "G":
@@ -553,6 +758,12 @@ def _simulate(lines: list[str], cfg: PostConfig) -> tuple[list[_Move], list[Viol
                     )
                 if number in (0, 1):
                     line_rapid = number == 0
+                if number == 28:
+                    homing = True
+                if number == 43:
+                    comp_on = True
+            elif letter == "H":
+                h_words.append(int(float(value)))
             elif letter == "M":
                 number = int(float(value))
                 if number not in _ALLOWED_M:
@@ -586,8 +797,21 @@ def _simulate(lines: list[str], cfg: PostConfig) -> tuple[list[_Move], list[Viol
             elif letter == "Z":
                 new_z = float(value)
                 moved = True
+                commands_z = True
+        problems.extend(
+            _tool_comp_problems(h_words, comp_on, tool_number, index, raw, fixed)
+        )
         if line_rapid is not None:
             modal_rapid = line_rapid
+        # A commanded Z re-establishes where the spindle is; a G28 on the same
+        # line sends it home again afterwards, so homing wins.  The MOVE's Z is
+        # trustworthy only when both of its ends are, which is why the state
+        # before the line matters as much as the state after it.
+        was_known = z_known
+        if commands_z:
+            z_known = True
+        if homing:
+            z_known = False
         if moved:
             moves.append(
                 _Move(
@@ -603,10 +827,73 @@ def _simulate(lines: list[str], cfg: PostConfig) -> tuple[list[_Move], list[Viol
                     tool_number,
                     modal_feed,
                     modal_feed_line,
+                    was_known and z_known,
                 )
             )
             x, y, z = new_x, new_y, new_z
     return moves, problems
+
+
+def _tool_comp_problems(
+    h_words: list[int],
+    comp_on: bool,
+    tool_number: int,
+    index: int,
+    raw: str,
+    fixed: set[int],
+) -> list[Violation]:
+    """``G43 Hn`` must name the tool in the spindle (2026-08-04 review, fix 3).
+
+    ``H`` selects the tool-LENGTH offset table row.  The references pair it
+    with the tool every time (``G43 H13 Z2.5`` in the T13 section), and the
+    verifier read no ``H`` word at all, so ``G43 H12`` in a T11 section passed:
+    the control would then hold the 3/8 compression bit at the 0.2 downshear's
+    length, and every Z in the program would be wrong by the difference — a
+    spoilboard strike or a sheet of onion skin, depending which way.
+
+    So: a ``G43`` owes an ``H`` equal to the active tool, and an ``H`` anywhere
+    else is refused outright.  The one ``H`` the post writes without a ``G43``
+    is the fixed footer's ``G90 H0 M25``, which CANCELS the offset on the way
+    out; it is exempt by position, not by value.
+    """
+    problems: list[Violation] = []
+    if comp_on:
+        if not h_words:
+            problems.append(
+                Violation(
+                    "tool-comp",
+                    f"G43 turns tool-length compensation on without an H word, so "
+                    f"the control would use whatever offset row was last selected - "
+                    f"T{tool_number} needs H{tool_number}",
+                    index,
+                )
+            )
+        for number in h_words:
+            if number != tool_number:
+                problems.append(
+                    Violation(
+                        "tool-comp",
+                        f"G43 H{number} with T{tool_number} in the spindle - the "
+                        f"tool-length offset must be the tool's own row "
+                        f"(H{tool_number}), or every Z in this section is out by "
+                        f"the difference between the two tools",
+                        index,
+                    )
+                )
+        return problems
+    for number in h_words:
+        if index in fixed:
+            continue  # the fixed footer's ``G90 H0 M25`` cancels the offset
+        problems.append(
+            Violation(
+                "tool-comp",
+                f"H{number} on {raw.strip()!r} - this post states an H only on a "
+                f"G43 line (where it must equal the tool number) and on the fixed "
+                f"G90 H0 M25 footer line that cancels the offset",
+                index,
+            )
+        )
+    return problems
 
 
 def _check_limits(moves: list[_Move], cfg: PostConfig) -> list[Violation]:
@@ -648,6 +935,122 @@ def _check_limits(moves: list[_Move], cfg: PostConfig) -> list[Violation]:
                     )
                 )
                 break
+    return problems
+
+
+def _check_rapids(moves: list[_Move], cfg: PostConfig) -> list[Violation]:
+    """No rapid may travel below the top of the stock (module docstring).
+
+    Two shapes, which is the whole rule:
+
+    *   a rapid may not move in X or Y while it is below the stock top — that
+        is the bit dragged sideways through the sheet at cutting depth;
+    *   a rapid may not DESCEND to below the stock top — that is the bit driven
+        into the material at rapid speed instead of fed in at the operation's
+        entry feed.
+
+    Straight moves, so Z is linear and checking the two ends checks the whole
+    segment.  What is deliberately NOT a finding is the ``G0 Z2.5`` retract that
+    every feature ends with: it starts at the bottom of the cut, where the bit
+    already is, and goes straight up without moving in XY.  A rule that only
+    looked at the lowest Z the move touches would refuse every reference file.
+
+    Moves made while the absolute Z is unknown — after a ``G28`` and before the
+    next Z word, i.e. exactly the fixed homing lines and the section
+    prepositions that follow them — are exempt, because there is nothing honest
+    to compare (see the module docstring's "Rapids").
+    """
+    problems: list[Violation] = []
+    for move in moves:
+        if not move.rapid or not move.z_known:
+            continue
+        low = min(move.z0, move.z1)
+        if low >= cfg.stock_top_z - TOL:
+            continue
+        travels = abs(move.x1 - move.x0) > TOL or abs(move.y1 - move.y0) > TOL
+        descends = move.z1 < cfg.stock_top_z - TOL and move.z1 < move.z0 - TOL
+        if travels:
+            problems.append(
+                Violation(
+                    "rapid",
+                    f"a rapid (G0) traverses x[{min(move.x0, move.x1):.4f}, "
+                    f"{max(move.x0, move.x1):.4f}] y[{min(move.y0, move.y1):.4f}, "
+                    f"{max(move.y0, move.y1):.4f}] while as low as Z{low}, below the "
+                    f"Z{cfg.stock_top_z} top of the stock - a spinning bit dragged "
+                    f"sideways through the sheet at rapid speed. A rapid must "
+                    f"retract first, traverse high, and only then come down",
+                    move.line,
+                )
+            )
+        elif descends:
+            problems.append(
+                Violation(
+                    "rapid",
+                    f"a rapid (G0) plunges from Z{move.z0} to Z{move.z1}, below the "
+                    f"Z{cfg.stock_top_z} top of the stock - the descent into a cut "
+                    f"is a G1 at the operation's entry feed, never a G0",
+                    move.line,
+                )
+            )
+    return problems
+
+
+def _check_spindle_start(lines: list[str]) -> list[Violation]:
+    """Every tool section starts the spindle before it feeds (fix 4).
+
+    :func:`_check_speeds` already catches a wrong ``S``, an ``M13`` with no
+    ``S`` and a section that states no speed at all — but not the plainest
+    failure of the lot: DELETE the ``M13`` and keep the ``S`` word, and the
+    section verified clean while the control plunged a stationary bit into
+    three-quarter MDF at 150 ipm.  The S word only loads the speed register;
+    ``M13`` is what turns the spindle on.
+
+    Judged per section on the first FEED move, tracking G0/G1 modally the way
+    the control does, and reported once per section: "this section never starts
+    the spindle" is one fact about the section.
+    """
+    problems: list[Violation] = []
+    head = 0
+    tool_number = 0
+    started = False
+    reported = False
+    modal_rapid = True
+
+    for index, raw in enumerate(lines, start=1):
+        if _TOOL_RE.match(raw):
+            head, tool_number, started, reported = index, 0, False, False
+            modal_rapid = True
+            continue
+        code = _COMMENT_RE.sub("", raw).strip()
+        if not code or code == "%":
+            continue
+        moved = False
+        line_rapid = None
+        for letter, value in _WORD_RE.findall(code):
+            letter = letter.upper()
+            if letter == "T":
+                tool_number = int(float(value))
+            elif letter == "M" and int(float(value)) == 13:
+                started = True
+            elif letter == "G":
+                number = int(float(value))
+                if number in (0, 1):
+                    line_rapid = number == 0
+            elif letter in ("X", "Y", "Z"):
+                moved = True
+        if line_rapid is not None:
+            modal_rapid = line_rapid
+        if head and moved and not modal_rapid and not started and not reported:
+            reported = True
+            problems.append(
+                Violation(
+                    "spindle-start",
+                    f"the T{tool_number} section feeds into the material before any "
+                    f"M13 starts the spindle - an S word only loads the speed, so "
+                    f"this would drive a stationary bit into the stock",
+                    index,
+                )
+            )
     return problems
 
 
@@ -1140,9 +1543,21 @@ def _check_foreign_cuts(
 ) -> list[Violation]:
     """No cut may run through a part it is not cutting.
 
-    A move is judged against every part except the one whose own feature it
-    is cutting, which is the part whose footprint (grown by the trim
-    overhang) contains the whole move.
+    Each move is split along its own Z profile first (see the module
+    docstring's "Ramps have a Z profile"), and each piece judged on what the
+    bit is doing there:
+
+    *   above the stock: nothing, because it is cutting nothing;
+    *   in the material but not through: tool CENTRE against every part's solid
+        except the one the move is attributed to — the part whose footprint,
+        grown by the trim overhang, contains the whole move.  That exemption is
+        what lets a T13 groove cut its own part, which is the whole reason it
+        exists;
+    *   right through the sheet: the tool's full swept width against EVERY
+        part's solid, the attributed one included.  A through cut inside a
+        frame member is that member sawn in half whoever it belongs to, and
+        exempting the containing footprint is how an inner frame's runaway cut
+        through its host used to go unreported (2026-08-04, fix 12).
     """
     problems: list[Violation] = []
     solids = [(part, part.solids()) for part in parts]
@@ -1151,38 +1566,121 @@ def _check_foreign_cuts(
     for move in moves:
         if move.rapid:
             continue
-        if min(move.z0, move.z1) >= cfg.stock_top_z - TOL:
-            continue  # never enters the stock
         if _v_bit_radius(move, cfg) is not None:
             continue  # the cone rule owns these (see _check_v_slot_cuts)
+        in_stock = _z_span(move, cfg.stock_top_z)
+        if in_stock is None:
+            continue  # never enters the stock
         own = _owner_of(move, parts, cfg)
-        through = min(move.z0, move.z1) <= through_z + TOL
-        band = 0.0
-        centre = Box(
-            min(move.x0, move.x1),
-            min(move.y0, move.y1),
-            max(move.x0, move.x1),
-            max(move.y0, move.y1),
-        )
-        swept = centre.grow(move.radius) if through else centre.grow(band)
-        for part, bands in solids:
-            if part is own:
-                continue
-            for solid in bands:
-                if solid.overlaps(swept, TOL):
-                    problems.append(
-                        Violation(
-                            "foreign-cut",
-                            f"a cutting move at Z{min(move.z0, move.z1)} enters the "
-                            f"solid of the part at {part.box}",
-                            move.line,
+        through = _z_span(move, through_z)
+        # One region per depth regime the move passes through (see the module
+        # docstring's "Ramps have a Z profile"): the part of the move that goes
+        # right through the sheet cuts its full swept width and may not enter
+        # ANY part's solid, its own included -- a through cut inside a part is
+        # the part sawn in half, and attributing it to a containing footprint
+        # is how a runaway cut used to hide (fix 12).  The part that is in the
+        # material but not through is judged on its tool centre only, which is
+        # the shallow-cut waiver above and keeps the T13 groove legal.
+        regions: list[tuple[Box, float, bool]] = []
+        if through is not None:
+            regions.append((_span_box(move, *through), move.radius, False))
+            for lo, hi in _span_minus(in_stock, through):
+                regions.append((_span_box(move, lo, hi), 0.0, True))
+        else:
+            regions.append((_span_box(move, *in_stock), 0.0, True))
+
+        for centre, radius, owner_cuts_here in regions:
+            swept = centre.grow(radius)
+            depth = cfg.stock_top_z - min(move.z0, move.z1)
+            for part, bands in solids:
+                if owner_cuts_here and part is own:
+                    continue
+                whose = (
+                    "the solid of the part it is itself attributed to, "
+                    if part is own
+                    else "the solid of the part "
+                )
+                why = (
+                    " - a cut right through the sheet may only run in the trim "
+                    "margin or inside an opening, never through a frame member"
+                    if part is own
+                    else ""
+                )
+                for solid in bands:
+                    if solid.overlaps(swept, TOL):
+                        problems.append(
+                            Violation(
+                                "foreign-cut",
+                                f"a cutting move up to {depth:g} deep sweeps "
+                                f"x[{swept.x0:.4f}, {swept.x1:.4f}] "
+                                f"y[{swept.y0:.4f}, {swept.y1:.4f}] and enters "
+                                f"{whose}at {part.box}{why}",
+                                move.line,
+                            )
                         )
-                    )
-                    break
+                        break
+                else:
+                    continue
+                break
             else:
                 continue
             break
     return problems
+
+
+def _z_span(move: _Move, z_limit: float) -> tuple[float, float] | None:
+    """The parameter interval of ``move`` where Z is at or below ``z_limit``.
+
+    ``0`` is the move's start and ``1`` its end.  Z varies linearly with
+    travel, so the answer is always one contiguous interval (or ``None`` when
+    the move stays above the limit throughout) — which is what lets the
+    material checks judge a descending ramp where it is actually cutting
+    instead of pretending the whole 4 inches happen at its deepest Z.
+    """
+    z0, z1 = move.z0, move.z1
+    if abs(z1 - z0) <= 1e-12:
+        return (0.0, 1.0) if z0 <= z_limit + TOL else None
+    crossing = (z_limit - z0) / (z1 - z0)
+    low, high = 0.0, 1.0
+    if z1 < z0:
+        low = max(0.0, crossing)
+    else:
+        high = min(1.0, crossing)
+    if high < low:
+        return None
+    return low, high
+
+
+def _span_minus(
+    outer: tuple[float, float], inner: tuple[float, float]
+) -> list[tuple[float, float]]:
+    """``outer`` less ``inner``, both parameter intervals of one move.
+
+    ``inner`` is always at one end of ``outer`` here (both come from
+    :func:`_z_span` on the same monotonic Z), so at most one interval comes
+    back; the general shape is written out anyway so a caller cannot be
+    surprised by that assumption.
+    """
+    (low, high), (cut_low, cut_high) = outer, inner
+    out: list[tuple[float, float]] = []
+    if cut_low > low + 1e-12:
+        out.append((low, min(cut_low, high)))
+    if cut_high < high - 1e-12:
+        out.append((max(cut_high, low), high))
+    return out
+
+
+def _span_box(move: _Move, low: float, high: float) -> Box:
+    """The XY extent of the sub-segment of ``move`` between the two fractions."""
+    xs = (
+        move.x0 + (move.x1 - move.x0) * low,
+        move.x0 + (move.x1 - move.x0) * high,
+    )
+    ys = (
+        move.y0 + (move.y1 - move.y0) * low,
+        move.y0 + (move.y1 - move.y0) * high,
+    )
+    return Box(min(xs), min(ys), max(xs), max(ys))
 
 
 def _v_bit_radius(move: _Move, cfg: PostConfig) -> float | None:
@@ -1204,9 +1702,12 @@ def _check_v_slot_cuts(
     """The 45-degree slot, judged on the cone it sweeps (module docstring)."""
     problems: list[Violation] = []
     solids = [(part, part.solids()) for part in parts]
-    low_x, low_y = -cfg.overhang, -cfg.overhang
-    high_x = cfg.sheet_width + cfg.overhang
-    high_y = cfg.sheet_length + cfg.overhang
+    # The SHEET, with no trim overhang added (2026-08-04 review, fix 11): the
+    # planner's rule is that the sheet must contain the sweep, and a cone that
+    # runs off the edge cuts the fence rather than trim.
+    low_x, low_y = 0.0, 0.0
+    high_x = cfg.sheet_width
+    high_y = cfg.sheet_length
 
     for move in moves:
         if move.rapid:
@@ -1240,9 +1741,9 @@ def _check_v_slot_cuts(
                     f"the 45-degree slot at Z{min(move.z0, move.z1)} cuts "
                     f"{reach} wide either side of its path, sweeping "
                     f"x[{swept.x0:.4f}, {swept.x1:.4f}] "
-                    f"y[{swept.y0:.4f}, {swept.y1:.4f}] - outside the "
-                    f"{cfg.sheet_width}x{cfg.sheet_length} sheet plus its "
-                    f"{cfg.overhang} overhang",
+                    f"y[{swept.y0:.4f}, {swept.y1:.4f}] - off the "
+                    f"{cfg.sheet_width}x{cfg.sheet_length} sheet, which is the "
+                    f"fence and the spoilboard, not trim",
                     move.line,
                 )
             )
@@ -1347,6 +1848,14 @@ class ExpectedCut:
     ``what`` names the feature and ``consequence`` says what the operator
     gets if it is not there; both end up verbatim in the refusal the GUI and
     the PDF cut sheet show.
+
+    ``part``, ``host`` and ``pass_position`` are the manifest's statement of
+    the sheet's STRUCTURE, which is what the chronology rules need (see the
+    module docstring): ``part`` is the placement's position in the layout walk
+    (hosts before their passengers), ``host`` the index of the placement whose
+    opening it sits in (``None`` at the top level) and ``pass_position`` which
+    perimeter depth pass a ``"perimeter"`` entry is (``None`` for anything
+    else).  All three come off the layout, like every other field here.
     """
 
     kind: str
@@ -1356,6 +1865,9 @@ class ExpectedCut:
     part_box: Box
     what: str
     consequence: str
+    part: int = 0
+    host: int | None = None
+    pass_position: int | None = None
 
     def describe(self) -> str:
         return (
@@ -1427,8 +1939,8 @@ def expected_work(layout, config: PostConfig | None = None) -> ExpectedWork:
     cfg = config or default_config()
     placements = getattr(layout, "placements", layout)
     cuts: list[ExpectedCut] = []
-    for placement in _walk_placements(placements):
-        cuts.extend(_expected_for_placement(placement, cfg))
+    for index, placement, host in _walk_placements(placements):
+        cuts.extend(_expected_for_placement(placement, cfg, index, host))
     if not cuts:
         raise ValueError(
             "this sheet holds no placement, so there is no work to expect of its "
@@ -1437,14 +1949,28 @@ def expected_work(layout, config: PostConfig | None = None) -> ExpectedWork:
     return ExpectedWork(tuple(cuts))
 
 
-def _walk_placements(placements):
-    """Every placement on the sheet, hosts before their passengers."""
+def _walk_placements(placements, host=None, counter=None):
+    """``(index, placement, host index)``, hosts before their passengers.
+
+    The index is the placement's position in this walk and is the manifest's
+    identity for a part — stable, derived from the layout, and enough for the
+    chronology rules to say "this frame is nested in that one" without the
+    verifier ever seeing a :class:`~.model.PartProgram`.
+    """
+    if counter is None:
+        counter = [0]
     for placement in placements:
-        yield placement
-        yield from _walk_placements(getattr(placement, "children", ()) or ())
+        index = counter[0]
+        counter[0] += 1
+        yield index, placement, host
+        yield from _walk_placements(
+            getattr(placement, "children", ()) or (), index, counter
+        )
 
 
-def _expected_for_placement(placement, cfg: PostConfig) -> list[ExpectedCut]:
+def _expected_for_placement(
+    placement, cfg: PostConfig, part: int = 0, host: int | None = None
+) -> list[ExpectedCut]:
     box = Box.from_size(
         float(placement.x),
         float(placement.y),
@@ -1455,7 +1981,14 @@ def _expected_for_placement(placement, cfg: PostConfig) -> list[ExpectedCut]:
     name = placement.part_number
     cuts: list[ExpectedCut] = []
 
-    def add(kind: str, z: float, path: Box, what: str, consequence: str) -> None:
+    def add(
+        kind: str,
+        z: float,
+        path: Box,
+        what: str,
+        consequence: str,
+        pass_position: int | None = None,
+    ) -> None:
         cuts.append(
             ExpectedCut(
                 kind=kind,
@@ -1465,6 +1998,9 @@ def _expected_for_placement(placement, cfg: PostConfig) -> list[ExpectedCut]:
                 part_box=box,
                 what=what,
                 consequence=consequence,
+                part=part,
+                host=host,
+                pass_position=pass_position,
             )
         )
 
@@ -1549,6 +2085,7 @@ def _expected_for_placement(placement, cfg: PostConfig) -> list[ExpectedCut]:
             f"{role} ({position + 1} of {total}, tool centre {spec.offset:g} "
             f"outside the part edge)",
             consequence,
+            pass_position=position,
         )
 
     return cuts
@@ -1702,12 +2239,14 @@ def _check_expected_work(
     """
     problems: list[Violation] = []
     used = [False] * len(found)
-    for cut in expected.cuts:
+    at: dict[int, _FoundCut] = {}
+    for index, cut in enumerate(expected.cuts):
         position = _find_cut(found, used, cut)
         if position is None:
             problems.append(Violation("missing-cut", cut.describe()))
         else:
             used[position] = True
+            at[index] = found[position]
     for position, item in enumerate(found):
         if used[position]:
             continue
@@ -1721,6 +2260,113 @@ def _check_expected_work(
                 item.line,
             )
         )
+    problems.extend(_check_chronology(expected, at))
+    return problems
+
+
+def _check_chronology(
+    expected: ExpectedWork, at: dict[int, _FoundCut]
+) -> list[Violation]:
+    """The three ordering rules of the module docstring's "Chronology".
+
+    Judged on the line each matched cut appears on, which is the only sense in
+    which a re-parse can see time.  A relation whose two ends are not both
+    matched is skipped in silence: the missing half is already a
+    ``missing-cut``, and repeating it as an ordering complaint would bury the
+    one finding that says what to do about it.
+    """
+    problems: list[Violation] = []
+    cuts = expected.cuts
+    total_passes = max(
+        (c.pass_position for c in cuts if c.pass_position is not None), default=None
+    )
+    if total_passes is None:
+        return problems  # a manifest with no perimeter pass has no chronology
+
+    #: ``part -> (onion index, through index, [every other cut's index])``
+    onion: dict[int, int] = {}
+    through: dict[int, int] = {}
+    others: dict[int, list[int]] = {}
+    host_of: dict[int, int | None] = {}
+    for index, cut in enumerate(cuts):
+        host_of[cut.part] = cut.host
+        if cut.kind == "perimeter" and cut.pass_position == total_passes:
+            through[cut.part] = index
+        elif cut.kind == "perimeter" and cut.pass_position == 0 and total_passes:
+            # Rule (a) owns the onion skin, so it is deliberately not also in
+            # ``others``: one wrong order, one finding.
+            onion[cut.part] = index
+        else:
+            others.setdefault(cut.part, []).append(index)
+
+    def line(index: int) -> int | None:
+        item = at.get(index)
+        return None if item is None else item.line
+
+    def name(index: int) -> str:
+        cut = cuts[index]
+        return f"{cut.part_number} @({cut.part_box.x0:.4f},{cut.part_box.y0:.4f})"
+
+    # (a) the onion skin before the pass that frees the part
+    for part, skin_index in onion.items():
+        cut_index = through.get(part)
+        if cut_index is None:
+            continue
+        skin, freed = line(skin_index), line(cut_index)
+        if skin is None or freed is None or skin < freed:
+            continue
+        problems.append(
+            Violation(
+                "cut-order",
+                f"{name(cut_index)}: the full-depth perimeter pass (line {freed}) "
+                f"runs BEFORE the onion-skin pass (line {skin}). The skin is what "
+                f"holds the part while the rest of the sheet is cut; cutting "
+                f"through first leaves it loose under a moving spindle",
+                freed,
+            )
+        )
+
+    # (b) an inner frame is freed before the host it sits in
+    for part, cut_index in through.items():
+        host = host_of.get(part)
+        if host is None:
+            continue
+        host_index = through.get(host)
+        if host_index is None:
+            continue
+        inner_line, host_line = line(cut_index), line(host_index)
+        if inner_line is None or host_line is None or inner_line < host_line:
+            continue
+        problems.append(
+            Violation(
+                "cut-order",
+                f"{name(cut_index)} is nested in {name(host_index)}, but the host "
+                f"is cut free on line {host_line}, before the inner on line "
+                f"{inner_line}. The inner would then be sitting in a hole in a "
+                f"slab that is no longer attached to the sheet",
+                host_line,
+            )
+        )
+
+    # (c) nothing touches a part after the pass that frees it
+    for part, cut_index in through.items():
+        freed = line(cut_index)
+        if freed is None:
+            continue
+        for other in others.get(part, ()):
+            when = line(other)
+            if when is None or when < freed:
+                continue
+            problems.append(
+                Violation(
+                    "cut-order",
+                    f"{name(cut_index)}: {cuts[other].what} runs on line {when}, "
+                    f"AFTER the full-depth perimeter pass on line {freed} that cuts "
+                    f"the part free - the part is loose by then and nothing holds "
+                    f"it in place for that cut",
+                    when,
+                )
+            )
     return problems
 
 

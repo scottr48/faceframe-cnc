@@ -81,11 +81,15 @@ __all__ = [
     "OpeningRect",
     "Session",
     "default_settings_path",
+    "frame_problem",
     "load_settings",
+    "min_millable_opening",
+    "opening_tool_inset",
     "save_settings",
     "sheet_openings",
     "suggest_dimensions",
     "wdc_detail",
+    "whole_qty",
 ]
 
 #: Part path: indices from the sheet's top-level placement list down through
@@ -311,6 +315,10 @@ class SessionError(RuntimeError):
     """A request the session cannot carry out, with a message fit for the UI."""
 
 
+#: Spreadsheet formats the .xls parser (pandas + xlrd) cannot read at all.
+_MODERN_EXCEL_SUFFIXES = (".xlsx", ".xlsm", ".xlsb")
+
+
 class RowStatus(Enum):
     READY = "ready"
     NEEDS_ATTENTION = "needs attention"
@@ -445,6 +453,118 @@ def _format_dim(value: Optional[float]) -> str:
     return "?" if value is None else f"{value:g}"
 
 
+def whole_qty(value: object) -> Optional[int]:
+    """``value`` as a whole quantity, or ``None`` when it is not one.
+
+    The order parser deliberately keeps a QTY cell that is a number but not
+    a whole one (``2.9``) exactly as the sheet wrote it (2026-08-04 review
+    fix 3) rather than flooring it, so everything downstream has to be able
+    to ask "is this a real quantity yet?" without guessing.  ``None`` here
+    means "a human still has to say what the quantity is".
+    """
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number != int(number):
+        return None
+    return int(number)
+
+
+# --------------------------------------------------------------------------
+# What the machine can actually cut (2026-08-04 external review)
+# --------------------------------------------------------------------------
+#
+# A frame can pass compute_geometry and still be uncuttable: a wall frame
+# 3.2 wide has a positive 0.2 opening, which nests and previews happily and
+# is then refused by the NC post, because the opening pass runs the tool
+# CENTRE inside each opening edge and 0.2 has no room for that.  The offsets
+# are read out of the post's measured table instead of being typed here, so
+# this module can never disagree with what the machine does.
+
+#: Cached tool-centre inset (see :func:`opening_tool_inset`).
+_OPENING_INSET: Optional[float] = None
+
+
+def opening_tool_inset() -> float:
+    """How far inside each opening edge the NC post runs its tool centre.
+
+    READ-ONLY from :func:`faceframe_cnc.post.model.default_config`: the T11
+    opening pass runs 0.1975 inside the finished edge (0.1875 tool radius +
+    0.010 of finish stock left for T12) and the T12 detail pass 0.1.  The
+    deepest of those insets decides whether an opening has any tool path
+    left at all.  Imported lazily and cached — this is the only number the
+    order model needs out of the post package.
+    """
+    global _OPENING_INSET
+    if _OPENING_INSET is None:
+        from ..post.model import default_config
+
+        post = default_config()
+        _OPENING_INSET = max(
+            -float(post.openings_pass.offset), -float(post.detail_pass.offset), 0.0
+        )
+    return _OPENING_INSET
+
+
+def min_millable_opening() -> float:
+    """Smallest routed opening the NC post can cut — twice the tool inset.
+
+    An opening this size or smaller collapses to nothing once the offset is
+    applied, which is exactly the refusal
+    :mod:`faceframe_cnc.post.generator` raises at Generate time ("collapses
+    to 0x... once the tool offset is applied").  Frames like that are
+    refused here instead — at include / edit / optimize time — so a sheet
+    can never be nested, previewed and only then refused at the machine.
+    """
+    return 2.0 * opening_tool_inset()
+
+
+def _too_small_to_cut(geometry) -> Optional[str]:
+    """The first opening too small for the cutter, worded for the shop, or ``None``."""
+    floor = min_millable_opening()
+    inset = opening_tool_inset()
+    for opening in geometry.openings:
+        if min(opening.width, opening.height) <= floor + EPS:
+            # Most frames have one opening simply labelled "opening"; the
+            # drawer stacks name theirs (top / middle / bottom / door).
+            which = "the" if opening.label == "opening" else f"the {opening.label}"
+            return (
+                f"{which} opening would be {opening.width:g} x "
+                f"{opening.height:g} in, which the machine cannot cut: the NC "
+                f"opening pass runs the tool centre {inset:g} in inside each "
+                f"edge, so an opening must be more than {floor:g} in wide and "
+                f"tall"
+            )
+    return None
+
+
+def frame_problem(part_number: str, width: float, height: float) -> Optional[str]:
+    """Why this frame cannot be cut, or ``None`` when it can.
+
+    Two gates, in the order the work meets them:
+
+    1.  :func:`~faceframe_cnc.geometry.compute_geometry` — the frame's own
+        geometry (spec section 3).  A part family the geometry engine
+        deliberately refuses to lay out (an unsupported drawer base —
+        2026-08-04 parser fix 4) raises out of it; that becomes a problem
+        message here rather than an exception, because this is called from
+        :attr:`OrderRow.status`, i.e. from the order table's paint path.
+    2.  the NC post's tool geometry (:func:`min_millable_opening`) — a
+        positive opening can still be too small for the cutter.
+    """
+    try:
+        geometry = compute_geometry(part_number, width, height)
+    except ValueError:  # geometry.py refuses this part family outright
+        return (
+            f"{part_number}: this app cannot compute openings for this part "
+            f"family - check the line against the order form"
+        )
+    if geometry.errors:
+        return geometry.errors[0]
+    return _too_small_to_cut(geometry)
+
+
 @dataclass
 class OrderRow:
     """One line of the order as the GUI shows it.
@@ -456,7 +576,12 @@ class OrderRow:
 
     key: str
     part_number: str
-    qty: int
+    #: Whole in every ordinary case.  A QTY cell the order form wrote as
+    #: something other than a whole number (``2.9``) arrives here as the raw
+    #: float the parser refused to floor (2026-08-04 review fix 3); see
+    #: :attr:`qty_problem`, which keeps such a row off the cut list until a
+    #: human says what the quantity really is.
+    qty: "int | float"
     frame_width: Optional[float] = None
     frame_height: Optional[float] = None
     included: bool = True
@@ -464,6 +589,15 @@ class OrderRow:
     missing: tuple[str, ...] = ()
     #: Free-text explanation shown beside a needs-attention row.
     reason: str = ""
+    #: The parser held this row back for something that is NOT expressible
+    #: as a missing dimension or a bad quantity: a WDC row whose entered
+    #: dimensions contradict its part number, an unsupported drawer-base
+    #: family, a catalogue accessory (2026-08-04 parser fixes 1 and 4).
+    #: Those rows arrive with ``missing == ()`` and a whole ``qty``, so
+    #: nothing in their own data would stop :attr:`status` reading them as
+    #: READY — this flag does.  Cleared by :meth:`Session.resolve_row` (the
+    #: user confirming the line), restored by :meth:`Session.revert_row`.
+    needs_attention: bool = False
     #: Provenance remark on a READY row (2026-08-03 amendment): the parser
     #: sets it when it derived a dimension the spreadsheet left blank (a
     #: WDC frame width from the part number), so the GUI can show where the
@@ -493,6 +627,9 @@ class OrderRow:
     #: leaving it READY with a dimension quietly wiped back to ``None``.
     original_missing: Optional[tuple[str, ...]] = None
     original_reason: Optional[str] = None
+    #: :attr:`needs_attention` as loaded, so :meth:`Session.revert_row` can
+    #: put a confirmed-by-hand row back into the state the parser gave it.
+    original_needs_attention: Optional[bool] = None
     #: The note as loaded (a WDC derivation remark, or ``""``) -- the part
     #: :meth:`OrderRow._compose_note` never overwrites, only appends to.
     base_note: Optional[str] = None
@@ -508,6 +645,8 @@ class OrderRow:
             self.original_missing = self.missing
         if self.original_reason is None:
             self.original_reason = self.reason
+        if self.original_needs_attention is None:
+            self.original_needs_attention = self.needs_attention
         if self.base_note is None:
             self.base_note = self.note
 
@@ -551,6 +690,17 @@ class OrderRow:
         return infer_frame_type(self.part_number)
 
     @property
+    def qty_problem(self) -> bool:
+        """True while the quantity is not a whole number (parser fix 3).
+
+        Derived from the data, not from a flag: the moment a whole quantity
+        is supplied the problem is gone.  Such a row must never read READY —
+        a fractional demand cannot be cut, and before this was checked the
+        row looked ready to cut with "2.9" printed in its Qty column.
+        """
+        return whole_qty(self.qty) is None
+
+    @property
     def status(self) -> RowStatus:
         if self.missing:
             # 2026-08-03 amendment: missing BOTH dims is "no faceframe
@@ -559,21 +709,48 @@ class OrderRow:
             if len(self.missing) >= 2:
                 return RowStatus.NO_FRAME
             return RowStatus.NEEDS_ATTENTION
+        if self.qty_problem or self.needs_attention:
+            return RowStatus.NEEDS_ATTENTION
         if self.geometry_error is not None:
             return RowStatus.INVALID
         return RowStatus.READY
 
     @property
     def geometry_error(self) -> Optional[str]:
-        """Why this frame's geometry is unusable, or ``None``.
+        """Why this frame cannot be cut, or ``None``.
 
         Spec section 3: a frame too short for its pattern is flagged in the
-        UI instead of quietly producing garbage openings.
+        UI instead of quietly producing garbage openings.  Since the
+        2026-08-04 external review this also covers a frame whose openings
+        are positive but too small for the NC post's tool offsets (see
+        :func:`frame_problem`) — the same "flag it, never cut it" channel,
+        because "0.2 wide opening" is no more cuttable than "no opening".
         """
         if self.frame_width is None or self.frame_height is None:
             return None
-        geometry = compute_geometry(self.part_number, self.frame_width, self.frame_height)
-        return geometry.errors[0] if geometry.errors else None
+        return frame_problem(self.part_number, self.frame_width, self.frame_height)
+
+    @property
+    def unmillable_reason(self) -> Optional[str]:
+        """Why the NC post could not cut this frame's OPENINGS, or ``None``.
+
+        Deliberately narrower than :attr:`geometry_error`: only the
+        tool-offset floor (2026-08-04 external review), so
+        :meth:`Session.optimize` can refuse a ticked-on row for it by name
+        without changing what happens to rows the geometry engine already
+        refuses.
+        """
+        if self.frame_width is None or self.frame_height is None:
+            return None
+        try:
+            geometry = compute_geometry(
+                self.part_number, self.frame_width, self.frame_height
+            )
+        except ValueError:
+            return None  # an unlayoutable family: geometry_error's business
+        if geometry.errors:
+            return None  # ditto
+        return _too_small_to_cut(geometry)
 
     @property
     def can_include(self) -> bool:
@@ -600,7 +777,14 @@ class OrderRow:
     @property
     def hint(self) -> str:
         """Guidance for the needs-attention editor."""
+        if self.qty_problem:
+            return (
+                f"the order form's quantity is {self.qty!r}, which is not a "
+                f"whole number of frames — type the quantity to cut"
+            )
         if not self.missing:
+            if self.needs_attention:
+                return "check this line against the order form, then confirm it"
             return ""
         if self.status is RowStatus.NO_FRAME:
             return (
@@ -860,6 +1044,39 @@ class Session:
         self.skipped_rows: int = 0
         self._problems: list[str] = []
 
+    # -- settings --------------------------------------------------------
+
+    def set_settings(self, settings: AppSettings) -> None:
+        """Install new optimizer settings, invalidating any layout on screen.
+
+        The ONLY way the GUI is allowed to change the settings a layout was
+        packed with (2026-08-04 review): the previous layout was nested for
+        the OLD sheet size / part gap / inside-nesting rules, so leaving it
+        in place would leave a layout that is generate-able under settings
+        it was never checked against — the same governing rule as
+        :meth:`edit_row`'s and :meth:`set_included`'s, and the same
+        invalidation (``result = None``, problems cleared, the manual-edit
+        flag reset).
+
+        Guarded, and guarded BEFORE anything is stored: unusable settings
+        raise :class:`SessionError` with the same messages
+        :meth:`AppSettings.validate` gives and the session keeps the
+        settings it had, so a half-applied change is impossible.  Settings
+        that do not change the optimizer's input at all (a remembered output
+        folder, a job prefix) are stored without touching the layout, the
+        same no-op rule :meth:`set_included` follows.
+        """
+        problems = settings.validate()
+        if problems:
+            raise SessionError("; ".join(problems))
+        layout_changed = settings.to_config() != self.settings.to_config()
+        self.settings = settings
+        if layout_changed:
+            self.result = None
+            self._problems = []
+            self.edited = False
+            self.dirty = True
+
     # -- order -----------------------------------------------------------
 
     def load_order(self, path: str) -> None:
@@ -869,6 +1086,18 @@ class Session:
         other part of the model — and so the GUI can report a missing
         dependency as a message box instead of an import crash.
         """
+        # The parser is xlrd-only, i.e. legacy .xls only.  A modern .xlsx
+        # would otherwise come back as a generic "could not read" (the file
+        # dialog even used to offer *.xlsx), which tells the operator
+        # nothing about what to do next.
+        suffix = os.path.splitext(path)[1].lower()
+        if suffix in _MODERN_EXCEL_SUFFIXES:
+            raise SessionError(
+                f"{os.path.basename(path)} is a modern Excel file ({suffix}); "
+                f"this program reads the shop's Excel 97-2003 order form "
+                f"(.xls).  Open it in Excel and use File > Save As > "
+                f"\"Excel 97-2003 Workbook (*.xls)\", then open that file."
+            )
         try:
             from ..order_parser import parse_order
         except ImportError as exc:  # pragma: no cover - depends on the install
@@ -884,22 +1113,29 @@ class Session:
 
         rows: list[OrderRow] = []
         for line in parsed.lines:
-            rows.append(
-                OrderRow(
-                    key=f"r{line.row_index}:{line.part_number}",
-                    part_number=line.part_number,
-                    qty=line.qty,
-                    frame_width=line.frame_width,
-                    frame_height=line.frame_height,
-                    included=True,
-                    # 2026-08-03 amendment: a WDC dimension the parser
-                    # derived from the part number arrives annotated, and
-                    # the annotation must survive to the order panel.
-                    note=getattr(line, "note", "") or "",
-                    row_index=line.row_index,
-                )
+            row = OrderRow(
+                key=f"r{line.row_index}:{line.part_number}",
+                part_number=line.part_number,
+                qty=line.qty,
+                frame_width=line.frame_width,
+                frame_height=line.frame_height,
+                included=True,
+                # 2026-08-03 amendment: a WDC dimension the parser
+                # derived from the part number arrives annotated, and
+                # the annotation must survive to the order panel.
+                note=getattr(line, "note", "") or "",
+                row_index=line.row_index,
             )
+            # A line the parser read cleanly can still be uncuttable — a
+            # frame too short for its pattern, or (2026-08-04 external
+            # review) openings too small for the NC post's tool offsets.
+            # Such a row is INVALID, so it starts UNTICKED: leaving it
+            # ticked would show the operator a locked, unticked checkbox
+            # while the session still counted the line as wanted.
+            row.included = row.can_include
+            rows.append(row)
         for line in parsed.needs_attention:
+            missing = tuple(line.missing)
             rows.append(
                 OrderRow(
                     key=f"r{line.row_index}:{line.part_number}",
@@ -908,8 +1144,14 @@ class Session:
                     frame_width=line.frame_width,
                     frame_height=line.frame_height,
                     included=False,
-                    missing=tuple(line.missing),
+                    missing=missing,
                     reason=line.reason,
+                    # Rows held back for something neither a missing
+                    # dimension nor a bad quantity (a WDC contradiction, an
+                    # unsupported drawer-base family, an accessory) need the
+                    # flag, or status would read them as READY -- their own
+                    # data looks complete.  See OrderRow.needs_attention.
+                    needs_attention=not missing and whole_qty(line.qty) is not None,
                     row_index=line.row_index,
                 )
             )
@@ -988,10 +1230,13 @@ class Session:
         """
         row = self.row(key)
         if included and not row.can_include:
-            raise SessionError(
-                f"{row.part_number} cannot be included until its "
-                f"{' and '.join(row.missing) or 'geometry'} is resolved"
-            )
+            if row.missing:
+                detail = f"its {' and '.join(row.missing)} is missing"
+            elif row.qty_problem:
+                detail = f"its quantity ({row.qty!r}) is not a whole number"
+            else:
+                detail = row.reason or row.geometry_error or "its geometry is unusable"
+            raise SessionError(f"{row.part_number} cannot be included: {detail}")
         if row.included != included:
             row.included = included
             self.dirty = True
@@ -1023,22 +1268,38 @@ class Session:
         *,
         width: Optional[float] = None,
         height: Optional[float] = None,
+        qty: object = None,
         include: bool = True,
     ) -> OrderRow:
-        """Supply the dimension the spreadsheet was missing (spec section 2).
+        """Supply what the order form did not give this row (spec section 2).
 
-        Only the missing dimensions are taken; a value the sheet already
-        had is never overwritten here.  Raises :class:`SessionError` when
-        the row is still incomplete or the value is not a usable size.
-        On success the row moves onto the cut list (a demand that did not
-        exist before), so the current layout is invalidated the same way
-        :meth:`edit_row` invalidates it -- ``result = None``, problems
-        cleared -- the same governing rule: a layout built before this row
-        was resolved must never be reachable from Generate.
+        Takes whatever the user typed and validates THAT combination, whole:
+
+        *   a dimension supplied here wins over the one the sheet had (a
+            present-but-dubious value — a WDC width that contradicts the
+            part number, 2026-08-04 parser fix 1 — has to be correctable;
+            the same rule :func:`faceframe_cnc.order_parser.resolve` follows);
+        *   ``qty`` is REQUIRED when the row's quantity is not a whole number
+            (2026-08-04 parser fix 3: the sheet said ``2.9``) and optional
+            otherwise, and must be a whole number of at least 1;
+        *   nothing at all is required for a row the parser merely wants
+            confirmed (an unsupported family, an accessory) — those are
+            resolved by confirming them, and the geometry gate below still
+            has the last word.
+
+        Raises :class:`SessionError` when the row would still be incomplete,
+        when a value is not usable, or when the resulting frame cannot be
+        cut — and in every one of those cases the row is left exactly as it
+        was, never half-resolved.  On success the row moves onto the cut
+        list (a demand that did not exist before), so the current layout is
+        invalidated the same way :meth:`edit_row` invalidates it --
+        ``result = None``, problems cleared -- the same governing rule: a
+        layout built before this row was resolved must never be reachable
+        from Generate.
         """
         row = self.row(key)
-        if not row.missing:
-            raise SessionError(f"{row.part_number} is not missing any dimension")
+        if not (row.missing or row.needs_attention or row.qty_problem):
+            raise SessionError(f"{row.part_number} has nothing that needs resolving")
 
         def coerce(name: str, value: object) -> Optional[float]:
             if value is None or value == "":
@@ -1053,8 +1314,8 @@ class Session:
 
         new_width = coerce("width", width)
         new_height = coerce("height", height)
-        resolved_width = row.frame_width if row.frame_width is not None else new_width
-        resolved_height = row.frame_height if row.frame_height is not None else new_height
+        resolved_width = new_width if new_width is not None else row.frame_width
+        resolved_height = new_height if new_height is not None else row.frame_height
 
         still_missing = [
             name
@@ -1066,22 +1327,38 @@ class Session:
                 f"{row.part_number} still needs a frame {' and '.join(still_missing)}"
             )
 
-        before = (row.frame_width, row.frame_height, row.missing, row.reason, row.resolved)
-        row.frame_width = resolved_width
-        row.frame_height = resolved_height
-        row.missing = ()
-        row.resolved = True
-        row.reason = ""
+        resolved_qty = row.qty
+        if qty is not None and qty != "":
+            resolved_qty = qty
+        whole = whole_qty(resolved_qty)
+        if whole is None:
+            raise SessionError(
+                f"{row.part_number}: quantity {resolved_qty!r} is not a whole "
+                f"number of frames — type the quantity to cut"
+            )
+        if whole <= 0:
+            raise SessionError(
+                f"{row.part_number}: quantity must be at least 1 (got "
+                f"{resolved_qty!r}) - use the Cut checkbox to leave a line out"
+            )
 
-        error = row.geometry_error
+        # Validate the whole candidate BEFORE touching the row, so a refusal
+        # leaves no partial state behind (spec section 3: a frame that cannot
+        # produce openings never reaches the optimizer).
+        error = frame_problem(row.part_number, resolved_width, resolved_height)
         if error is not None:
-            # Leave the row exactly as it was rather than let a frame that
-            # cannot produce openings reach the optimizer (spec section 3).
-            (row.frame_width, row.frame_height, row.missing, row.reason, row.resolved) = before
             raise SessionError(
                 f"{row.part_number} {resolved_width:g} x {resolved_height:g}: {error}"
             )
 
+        row.frame_width = resolved_width
+        row.frame_height = resolved_height
+        row.qty = whole
+        row.missing = ()
+        row.needs_attention = False
+        row.resolved = True
+        row.reason = ""
+        row.note = row._compose_note()
         row.included = bool(include)
         self.dirty = True
         self.result = None
@@ -1105,19 +1382,26 @@ class Session:
         :meth:`resolve_row`'s coercion: quantity must be a positive
         integer -- zero is refused, since excluding a line is what the Cut
         checkbox is for, and the error says so -- and a supplied dimension
-        must be a positive finite number.  The candidate is applied on a
-        trial basis first; if :func:`~faceframe_cnc.geometry.compute_geometry`
-        cannot make openings out of the result, :class:`SessionError` is
-        raised with its message and the row is left byte-for-byte as it
-        was, the same discipline :meth:`resolve_row` and the layout edits
-        already use.
+        must be a positive finite number.
 
-        A row still missing a dimension is completed exactly the way
-        :meth:`resolve_row` completes it -- that plumbing is reused here
-        rather than duplicated -- when this call supplies whatever it is
-        still missing; supplying only part of what an incomplete row needs
-        is refused with the same message :meth:`resolve_row` gives.  A qty-
-        only edit is allowed on an incomplete row without resolving it.
+        NOTHING is written until every check has passed, and the checks are
+        run against exactly the combination the caller asked for -- the new
+        width WITH the new height (2026-08-04 review): the previous version
+        validated the full candidate but then delegated the commit to
+        :meth:`resolve_row`, which re-validated the new dimension against
+        the OLD one and could refuse a perfectly good edit while quoting a
+        size the user never typed ("30 x 2" for a row whose junk height was
+        2 and which the user had just replaced).  A refusal therefore leaves
+        the row byte-for-byte as it was, the same discipline the layout
+        edits use.
+
+        A row still missing a dimension is completed here when this call
+        supplies whatever it is still missing (and is then ticked onto the
+        cut list, since it now has something to cut); supplying only part of
+        what an incomplete row needs is refused with the same message
+        :meth:`resolve_row` gives.  A qty-only edit is allowed on an
+        incomplete row without resolving it, and a whole quantity typed here
+        also clears a row the parser held back for a fractional QTY.
 
         On success the note is rewritten to say what changed from the
         order-form originals (never losing a pre-existing derivation note —
@@ -1127,6 +1411,7 @@ class Session:
         pre-edit numbers must never be reachable from Generate.
         """
         row = self.row(key)
+        was_blocked = row.status is not RowStatus.READY
 
         def coerce_dim(name: str, value: object) -> float:
             try:
@@ -1139,13 +1424,9 @@ class Session:
 
         new_qty = row.qty
         if qty is not None:
-            try:
-                as_float = float(qty)  # type: ignore[arg-type]
-                new_qty = int(as_float)
-                if as_float != new_qty:
-                    raise ValueError
-            except (TypeError, ValueError):
-                raise SessionError(f"quantity {qty!r} is not a whole number") from None
+            new_qty = whole_qty(qty)
+            if new_qty is None:
+                raise SessionError(f"quantity {qty!r} is not a whole number")
             if new_qty <= 0:
                 raise SessionError(
                     f"quantity must be at least 1 (got {qty!r}) - use the Cut "
@@ -1156,44 +1437,44 @@ class Session:
         new_width = row.frame_width if width is None else coerce_dim("width", width)
         new_height = row.frame_height if height is None else coerce_dim("height", height)
 
-        if row.missing and (width is not None or height is not None):
+        # -- validate the whole candidate, then commit it in one go --------
+        completing = bool(row.missing)
+        if new_width is not None and new_height is not None:
+            error = frame_problem(row.part_number, new_width, new_height)
+            if error is not None:
+                raise SessionError(
+                    f"{row.part_number} {new_width:g} x {new_height:g}: {error}"
+                )
+        elif completing and (width is not None or height is not None):
             still_missing = [
                 name
                 for name, value in (("width", new_width), ("height", new_height))
                 if value is None
             ]
-            if still_missing:
-                raise SessionError(
-                    f"{row.part_number} still needs a frame {' and '.join(still_missing)}"
-                )
-            # Every missing dimension is now supplied.  resolve_row is
-            # reused to complete the row, but it deliberately takes ONLY
-            # the dimension(s) actually missing -- if this same save also
-            # changed the dimension the sheet DID have, that change must
-            # not be silently dropped, so the FULL candidate is validated
-            # here first and both dimensions are installed explicitly
-            # afterwards.
-            probe = compute_geometry(row.part_number, new_width, new_height)
-            if probe.errors:
-                raise SessionError(
-                    f"{row.part_number} {new_width:g} x {new_height:g}: "
-                    f"{probe.errors[0]}"
-                )
-            self.resolve_row(key, width=new_width, height=new_height, include=True)
-            row.frame_width, row.frame_height = new_width, new_height
-        elif new_width is not None and new_height is not None:
-            before = (row.frame_width, row.frame_height)
-            row.frame_width, row.frame_height = new_width, new_height
-            error = row.geometry_error
-            if error is not None:
-                row.frame_width, row.frame_height = before
-                raise SessionError(
-                    f"{row.part_number} {new_width:g} x {new_height:g}: {error}"
-                )
-        # else: the row is still missing a dimension and this call did not
-        # supply one -- a qty-only edit on an incomplete row falls through.
+            raise SessionError(
+                f"{row.part_number} still needs a frame {' and '.join(still_missing)}"
+            )
+        else:
+            # The row is still missing a dimension and this call did not
+            # supply one -- a qty-only edit on an incomplete row.
+            completing = False
 
         row.qty = new_qty
+        if new_width is not None and new_height is not None:
+            row.frame_width, row.frame_height = new_width, new_height
+            if completing:
+                row.missing = ()
+                row.resolved = True
+                row.reason = ""
+        # A reason the row is no longer guilty of (a fractional quantity the
+        # user has just typed as a whole number) must not stay on screen as
+        # a stale amber warning.
+        if row.reason and not row.missing and not row.needs_attention and not row.qty_problem:
+            row.reason = ""
+        if was_blocked and row.status is RowStatus.READY:
+            # The edit unblocked the line: it has something to cut now, so
+            # it joins the cut list the way a resolved row does.
+            row.included = True
         row.note = row._compose_note()
         self.dirty = True
         self.result = None
@@ -1220,8 +1501,9 @@ class Session:
         row.frame_width = row.original_width
         row.frame_height = row.original_height
         row.note = row.base_note or ""
-        if row.original_missing:
-            row.missing = row.original_missing
+        if row.original_missing or row.original_needs_attention:
+            row.missing = row.original_missing or ()
+            row.needs_attention = bool(row.original_needs_attention)
             row.reason = row.original_reason or ""
             row.resolved = False
             row.included = False
@@ -1264,11 +1546,33 @@ class Session:
     # -- optimize --------------------------------------------------------
 
     def optimize(self) -> NestingResult:
-        """Run the optimizer over the included lines (discards manual edits)."""
+        """Run the optimizer over the included lines (discards manual edits).
+
+        Refuses, before packing anything, a line whose openings the NC post
+        cannot cut (2026-08-04 external review: a 3.2 x 10 wall frame yields
+        a positive 0.2 opening that nested and previewed fine and was only
+        refused at Generate, after the operator had built a layout around
+        it).  Named, with the size and the minimum, and left to be corrected
+        or unticked -- never a crash.
+        """
         config = self.settings.to_config()
         problems = self.settings.validate()
         if problems:
             raise SessionError("; ".join(problems))
+        blocked = [
+            (row, row.unmillable_reason)
+            for row in self.rows
+            if row.included and row.unmillable_reason is not None
+        ]
+        if blocked:
+            raise SessionError(
+                "; ".join(
+                    f"{row.part_number} {row.frame_width:g} x {row.frame_height:g}: "
+                    f"{reason}"
+                    for row, reason in blocked
+                )
+                + " - correct the frame size or untick the line"
+            )
         demand = self.demand()
         try:
             result = nest(demand, config)
@@ -1501,6 +1805,36 @@ class Session:
                 elif existing is focus:
                     merged = True
 
+        # ``landed`` is always still in ``grouped`` (every edit leaves at
+        # least the edited part on its picture); the fallback only keeps a
+        # future edit that empties the focused sheet from raising here.
+        if landed in grouped:
+            sheet_index = grouped.index(landed)
+            new_path = _path_of(landed.layout, target) or ()
+        else:
+            sheet_index = 0 if grouped else -1
+            new_path = ()
+
+        # A gesture that changed NOTHING is not an edit (2026-08-04 review):
+        # a press and release with no movement -- the click an operator makes
+        # to read a part's label -- used to commit a "move" to the part's own
+        # position, which set ``edited`` (arming the "Discard manual edits?"
+        # prompt on the next Optimize) and, on a sheet cut more than once,
+        # split one sheet out of its run and merged it straight back.  The
+        # comparison is canonical, the same identity the packer groups runs
+        # by, so a sub-1e-4 twitch of the mouse is a no-op too, and it covers
+        # every gesture (rotating a square part, re-nesting a child where it
+        # already sits) rather than just the click.
+        before = [(layout.canonical(), run) for layout, run in self.result.unique_sheets]
+        after = [(picture.layout.canonical(), picture.run) for picture in grouped]
+        if after == before:
+            return EditResult(
+                True,
+                f"{target.part_number} unchanged",
+                sheet_index=sheet_index,
+                path=new_path,
+            )
+
         trial = NestingResult(
             unique_sheets=[(p.layout, p.run) for p in grouped],
             total_sheets=sum(p.run for p in grouped),
@@ -1518,15 +1852,6 @@ class Session:
         self.result = trial
         self._problems = problems
         self.edited = True
-        # ``landed`` is always still in ``grouped`` (every edit leaves at
-        # least the edited part on its picture); the fallback only keeps a
-        # future edit that empties the focused sheet from raising here.
-        if landed in grouped:
-            sheet_index = grouped.index(landed)
-            new_path = _path_of(landed.layout, target) or ()
-        else:
-            sheet_index = 0 if grouped else -1
-            new_path = ()
         return EditResult(
             True,
             description,

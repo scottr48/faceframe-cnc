@@ -477,7 +477,11 @@ class Page:
         color: Color = BLACK,
     ) -> None:
         """Text centred both ways in a box, using Helvetica's own metrics."""
-        baseline = y + (height - (ASCENT - DESCENT) * size) / 2.0 + DESCENT * size
+        # The glyph band a baseline anchors is ASCENT above it and DESCENT
+        # below it, so its total height is (ASCENT + DESCENT) * size -- not
+        # (ASCENT - DESCENT) * size, which is what this used to subtract and
+        # which rode every centred label about DESCENT * size too high.
+        baseline = y + (height - (ASCENT + DESCENT) * size) / 2.0 + DESCENT * size
         self.text(
             x + width / 2.0,
             baseline,

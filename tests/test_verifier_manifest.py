@@ -37,15 +37,28 @@ import re
 import unittest
 
 from faceframe_cnc.post import (
+    CutPlan,
+    FeatureRef,
     JobOptions,
+    ProgramHeader,
     build_job,
     default_config,
     dry_run_config,
+    generate,
+    plan_sheet,
     post_config_for,
+    reconstruct,
     verify,
     verify_file,
 )
 from faceframe_cnc.post import job as job_module
+from faceframe_cnc.post.model import (
+    SECTION_DETAIL,
+    SECTION_OPENINGS,
+    SECTION_PANEL,
+    SECTION_PERIMETER,
+    SECTION_WDC_SLOT,
+)
 from faceframe_cnc.post.verifier import ExpectedWork, expected_work
 from tests.test_nc_job import CREATED, job_for, nested_sample, wdc_sheet
 
@@ -520,6 +533,265 @@ class BuildJobRefusesAWrongFeedTest(unittest.TestCase):
         job = build_job(self.result, self.options())
         self.assertEqual([o.describe() for o in job.refused], [])
         self.assertIsNotNone(job.outcomes[0].text)
+
+
+# --------------------------------------------------------------------------
+# 2026-08-04 review, fix 2: the manifest was an unordered multiset
+# --------------------------------------------------------------------------
+
+
+class CutOrderTest(unittest.TestCase):
+    """Every required cut present, in an order that wrecks the sheet.
+
+    ``missing-cut``/``extra-cut`` matched the file against the manifest as a
+    multiset, so nothing at all enforced chronology.  Two orders that verified
+    clean before this, both catastrophic on the machine:
+
+    * cut every part THROUGH before taking any of them to the onion skin — the
+      whole sheet is loose parts while the spindle is still working;
+    * free a host before the frame nested in its opening — the inner is then
+      sitting in a hole in a slab that is no longer attached to anything.
+
+    And one that had never been stated at all: a part is only held while it is
+    still attached, so its through pass has to be the LAST cut that touches it.
+
+    The relations come off the :class:`ExpectedWork` manifest, which is built
+    from the layout (an AST test in ``tests/test_post.py`` forbids the verifier
+    importing the planner or the emitter), and they are judged on the line each
+    matched cut appears on.  All three hold in R710101N, R720101N and R730101N —
+    checked in :class:`ReferenceChronologyTest` below, off the files.
+    """
+
+    def setUp(self):
+        self.result, self.config = nested_sample()
+        self.layout = self.result.unique_sheets[0][0]
+        self.cfg = post_config_for(self.config)
+        self.program, self.plan = plan_sheet(
+            self.layout,
+            ProgramHeader(name="R990101N", created=CREATED),
+            self.result.demand,
+            self.config,
+            self.cfg,
+        )
+        self.expected = expected_work(self.layout, self.cfg)
+
+    def check(self, text, config=None):
+        config = config or self.cfg
+        return verify(text, config, expected_work(self.layout, config))
+
+    def test_the_sheet_as_planned_is_in_order(self):
+        text = generate(self.program, self.plan, self.cfg)
+        self.assertEqual([str(v) for v in self.check(text)], [])
+
+    def test_cutting_through_before_the_onion_skin_is_refused(self):
+        """Both the plan lists AND the depths swap, so every owed cut is
+        still there — at its own depth — and only the order is wrong."""
+        from dataclasses import replace
+
+        swapped_cfg = replace(
+            self.cfg,
+            perimeter_passes=(
+                self.cfg.perimeter_passes[1],
+                self.cfg.perimeter_passes[0],
+            ),
+        )
+        swapped = CutPlan(
+            panel=self.plan.panel,
+            wdc_slot=self.plan.wdc_slot,
+            openings=self.plan.openings,
+            perimeter=[self.plan.perimeter[1], self.plan.perimeter[0]],
+            detail=self.plan.detail,
+            sections=self.plan.sections,
+        )
+        text = generate(self.program, swapped, swapped_cfg)
+        problems = self.check(text)
+        self.assertTrue(problems, "the multiset still matches, so only order can fail")
+        self.assertEqual({v.code for v in problems}, {"cut-order"})
+        self.assertEqual(len(problems), 3, "one per part on the sheet")
+        first = problems[0]
+        self.assertIn("runs BEFORE the onion-skin pass", first.message)
+        self.assertIn("loose under a moving spindle", first.message)
+        self.assertRegex(first.message, r"line \d+")
+
+    def test_freeing_a_host_before_its_inner_is_refused(self):
+        parts = self.program.flat_parts()
+        canonical = [FeatureRef(i, "perimeter") for i in range(len(parts))]
+        host_first = CutPlan(
+            panel=self.plan.panel,
+            wdc_slot=self.plan.wdc_slot,
+            openings=self.plan.openings,
+            perimeter=[canonical, list(canonical)],
+            detail=self.plan.detail,
+            sections=self.plan.sections,
+        )
+        text = generate(self.program, host_first, self.cfg)
+        problems = self.check(text)
+        self.assertEqual({v.code for v in problems}, {"cut-order"})
+        self.assertEqual(len(problems), 1)
+        self.assertIn("is nested in", problems[0].message)
+        self.assertIn("no longer attached to the sheet", problems[0].message)
+
+    def test_a_cut_after_the_part_is_free_is_refused(self):
+        """The T13 grooves moved to the end: same cuts, part already loose."""
+        late = CutPlan(
+            panel=self.plan.panel,
+            wdc_slot=self.plan.wdc_slot,
+            openings=self.plan.openings,
+            perimeter=self.plan.perimeter,
+            detail=self.plan.detail,
+            sections=(
+                SECTION_OPENINGS,
+                SECTION_DETAIL,
+                SECTION_PERIMETER,
+                SECTION_PANEL,
+            ),
+        )
+        text = generate(self.program, late, self.cfg)
+        problems = [v for v in self.check(text) if v.code == "cut-order"]
+        self.assertEqual(len(problems), 12, "four grooves on each of three parts")
+        self.assertIn("AFTER the full-depth perimeter pass", problems[0].message)
+        self.assertIn("nothing holds it in place", problems[0].message)
+
+    def test_the_manifest_carries_the_structure_the_rules_need(self):
+        parts = {cut.part for cut in self.expected.cuts}
+        self.assertEqual(parts, {0, 1, 2})
+        hosts = {cut.part: cut.host for cut in self.expected.cuts}
+        self.assertEqual(hosts, {0: None, 1: 0, 2: None}, "part 1 is nested in part 0")
+        passes = {
+            cut.pass_position for cut in self.expected.cuts if cut.kind == "perimeter"
+        }
+        self.assertEqual(passes, {0, 1})
+        self.assertEqual(
+            {cut.pass_position for cut in self.expected.cuts if cut.kind != "perimeter"},
+            {None},
+        )
+
+    def test_a_missing_cut_is_not_also_reported_as_an_ordering_problem(self):
+        """One fault, one finding: the relation whose half is gone is skipped."""
+        text = generate(self.program, self.plan, self.cfg)
+        dropped = drop(text, "Z-0.006 F150.")
+        codes = [v.code for v in self.check(dropped)]
+        self.assertIn("missing-cut", codes)
+        self.assertNotIn("cut-order", codes)
+
+    def test_the_dry_run_is_held_to_the_same_order(self):
+        air = dry_run_config(self.cfg)
+        swapped = CutPlan(
+            panel=self.plan.panel,
+            wdc_slot=self.plan.wdc_slot,
+            openings=self.plan.openings,
+            perimeter=[self.plan.perimeter[1], self.plan.perimeter[0]],
+            detail=self.plan.detail,
+            sections=self.plan.sections,
+        )
+        from dataclasses import replace
+
+        swapped_air = replace(
+            air, perimeter_passes=(air.perimeter_passes[1], air.perimeter_passes[0])
+        )
+        text = generate(self.program, swapped, swapped_air)
+        problems = [v for v in self.check(text, air) if v.code == "cut-order"]
+        self.assertTrue(problems, [str(v) for v in self.check(text, air)])
+
+    def test_build_job_refuses_a_sheet_whose_passes_are_out_of_order(self):
+        """The gate, not just the rule: nothing gets written."""
+        real = job_module.plan_sheet
+
+        def swap(*args, **kwargs):
+            program, plan = real(*args, **kwargs)
+            return program, CutPlan(
+                panel=plan.panel,
+                wdc_slot=plan.wdc_slot,
+                openings=plan.openings,
+                perimeter=[plan.perimeter[0], list(reversed(plan.perimeter[1]))],
+                detail=plan.detail,
+                sections=plan.sections,
+            )
+
+        job_module.plan_sheet = swap
+        try:
+            outcome = build_job(
+                self.result,
+                JobOptions(output_dir="unused", prefix="7201", created=CREATED),
+            ).outcomes[0]
+        finally:
+            job_module.plan_sheet = real
+        self.assertEqual(outcome.refusal_kind, "verifier")
+        self.assertIsNone(outcome.text)
+        self.assertTrue(
+            any("[cut-order]" in p for p in outcome.problems), outcome.problems
+        )
+
+
+class ReferenceChronologyTest(unittest.TestCase):
+    """Do the files the shop already cut satisfy the three ordering rules?
+
+    They have no layout behind them, so no manifest — the relations are checked
+    straight off each file instead, from what :func:`reconstruct` recovers:
+    which part each cut belongs to, which frame is nested in which, and the
+    order the sections run in.  This is the "validate first" half of fix 2: a
+    rule the references break is a rule that would have to be weakened, and
+    none of these is.
+    """
+
+    NAMES = ("R710101N", "R720101N", "R730101N")
+
+    def timeline(self, plan):
+        """``[(part index, what, perimeter pass or None)]`` in file order."""
+        out = []
+        for section in plan.sections:
+            if section == SECTION_PANEL:
+                out.extend((r.part, f"T13 groove {r.index}", None) for r in plan.panel)
+            elif section == SECTION_WDC_SLOT:
+                out.extend((r.part, f"T17 slot {r.index}", None) for r in plan.wdc_slot)
+            elif section == SECTION_OPENINGS:
+                out.extend((r.part, f"T11 opening {r.index}", None) for r in plan.openings)
+            elif section == SECTION_DETAIL:
+                out.extend(
+                    (r.part, f"T12 detail {r.index}", None) for r in plan.detail_order()
+                )
+            elif section == SECTION_PERIMETER:
+                for position, refs in enumerate(plan.perimeter):
+                    out.extend((r.part, f"perimeter {position}", position) for r in refs)
+        return out
+
+    def test_every_reference_satisfies_all_three_rules(self):
+        for name in self.NAMES:
+            with self.subTest(name=name):
+                program, plan = reconstruct(os.path.join(NC_DIR, f"{name}.anc"))
+                parts = program.flat_parts()
+                last = len(plan.perimeter) - 1
+                host_of = {
+                    parts.index(child): i
+                    for i, part in enumerate(parts)
+                    for child in part.children
+                }
+                onion, through, others = {}, {}, {}
+                for order, (part, what, position) in enumerate(self.timeline(plan)):
+                    if position == last:
+                        through[part] = order
+                    elif position == 0:
+                        onion[part] = order
+                    else:
+                        others.setdefault(part, []).append((order, what))
+
+                self.assertEqual(len(through), len(parts), "every part is freed")
+                for part, order in onion.items():
+                    self.assertLess(order, through[part], f"(a) part {part}")
+                for part, order in through.items():
+                    if part in host_of:
+                        self.assertLess(
+                            order, through[host_of[part]], f"(b) inner {part}"
+                        )
+                for part, order in through.items():
+                    for when, what in others.get(part, ()):
+                        self.assertLess(when, order, f"(c) part {part}: {what}")
+
+    def test_the_nested_reference_really_exercises_rule_b(self):
+        """R720101N is the sheet with frames inside frames, so rule (b) is
+        not vacuous above."""
+        program, _plan = reconstruct(os.path.join(NC_DIR, "R720101N.anc"))
+        self.assertTrue(any(part.children for part in program.parts))
 
 
 if __name__ == "__main__":

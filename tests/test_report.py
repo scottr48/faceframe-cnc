@@ -30,6 +30,8 @@ import os
 import re
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 from faceframe_cnc.nesting import (
     NestingConfig,
@@ -279,6 +281,23 @@ class PdfWriterTest(unittest.TestCase):
         capped = pdf.wrap_text(text, pdf.HELVETICA, 8.0, 90.0, max_lines=2)
         self.assertEqual(len(capped), 2)
         self.assertTrue(capped[-1].endswith("..."))
+
+    def test_text_centered_in_uses_the_correct_glyph_band(self):
+        """2026-08-04 review, fix 6: the glyph band a baseline anchors is
+        ``(ASCENT + DESCENT) * size`` tall (ASCENT above the baseline,
+        DESCENT below it) -- not ``(ASCENT - DESCENT) * size``, which is
+        what the code used to subtract, riding every centred label about
+        ``DESCENT * size`` too high."""
+        page = pdf.Page(200, 100)
+        page.text_centered_in(0.0, 0.0, 200.0, 100.0, "x", size=20.0)
+        content = page.content().decode("latin-1")
+        match = re.search(r"(-?\d+\.\d{2}(?!\d)) (-?\d+\.\d{2}(?!\d)) Tm", content)
+        self.assertIsNotNone(match, content)
+        baseline = float(match.group(2))
+        correct = (100.0 - (pdf.ASCENT + pdf.DESCENT) * 20.0) / 2.0 + pdf.DESCENT * 20.0
+        buggy = (100.0 - (pdf.ASCENT - pdf.DESCENT) * 20.0) / 2.0 + pdf.DESCENT * 20.0
+        self.assertAlmostEqual(baseline, correct, places=2)
+        self.assertGreater(abs(baseline - buggy), 1.0)
 
 
 class DeterminismTest(unittest.TestCase):
@@ -682,6 +701,193 @@ class RefusalTest(unittest.TestCase):
         self.assertNotIn("REFUSED", parsed.text())
 
 
+class PartialFailureTest(unittest.TestCase):
+    """2026-08-04 review, fix 5: in one-file-per-physical-sheet mode, one
+    bad file among a picture's run used to mark the WHOLE picture "REFUSED
+    - NO NC PROGRAM WAS WRITTEN FOR THIS SHEET", which can be false (7 of
+    8 written).  A write failure is a fact about ONE file at a time --
+    real verification judges every (identical) copy of a repeated
+    picture the same way, so build_job alone can never produce this
+    scenario; it is the LATER, per-file disk write that can fail for just
+    one of several copies (exactly how :func:`~faceframe_cnc.post.job.write_job`
+    behaves).  A duck-typed job stands in for that, so this test is a
+    fact about the REPORT's wording, not a re-test of the post pipeline's
+    own verifier.
+    """
+
+    def test_a_partial_run_failure_says_how_many_failed_not_that_none_wrote(self):
+        result, _config = known_sheet()  # one picture, run = 3
+        job = _fake_job(result, per_physical_sheet=True, prefix="41")
+        self.assertEqual(len(job.outcomes), 3)
+
+        job.outcomes[1].problems = ["disk write failed: simulated for the test"]
+        job.outcomes[1].ok = False
+
+        reports = cutsheet.sheet_reports(result, job)
+        self.assertEqual(len(reports), 1)
+        report = reports[0]
+        self.assertTrue(report.refused)
+        self.assertEqual(report.failed_files, 1)
+        self.assertEqual(len(report.files), 3)
+
+        page = report_for(result, job).text(1)
+        self.assertIn("1 OF 3 FILES IN THIS RUN FAILED", page)
+        self.assertIn("DO NOT MACHINE THIS SHEET UNTIL RESOLVED", page)
+        self.assertNotIn("NO NC PROGRAM WAS WRITTEN", page)
+
+    def test_a_total_failure_still_says_no_program_was_written(self):
+        """The old wording is still correct, and still used, when it is
+        actually true -- every file in the run failed."""
+        result, _config = known_sheet()
+        job = _fake_job(result, per_physical_sheet=True, prefix="41", refused=True)
+        report = cutsheet.sheet_reports(result, job)[0]
+        self.assertEqual(report.failed_files, len(report.files))
+        page = report_for(result, job).text(1)
+        self.assertIn("REFUSED - NO NC PROGRAM WAS WRITTEN FOR THIS SHEET", page)
+        self.assertNotIn("FILES IN THIS RUN FAILED", page)
+
+
+class ContentsCrossCheckTest(unittest.TestCase):
+    """2026-08-04 review, fix 8: pictures and outcomes are paired by count
+    and POSITION only.  A stale job re-paired against a freshly
+    re-optimized layout of the same length would mispair silently,
+    putting one sheet's filenames over another sheet's drawing.
+    :attr:`~faceframe_cnc.post.job.SheetOutcome.contents` carries an
+    independent part-count manifest, which is now cross-checked."""
+
+    def test_a_mismatched_outcome_is_refused_rather_than_silently_paired(self):
+        result, _config = known_sheet()
+        job = _fake_job(result, prefix="7201")
+        job.outcomes[0].contents = {"SOMETHING_ELSE": 9}
+        with self.assertRaises(ReportError) as caught:
+            cutsheet.sheet_reports(result, job)
+        self.assertIn("drifted apart", str(caught.exception))
+
+    def test_a_matching_outcome_is_unaffected(self):
+        result, _config = known_sheet()
+        job = _fake_job(result, prefix="7201")
+        reports = cutsheet.sheet_reports(result, job)
+        self.assertEqual(len(reports), 1)
+        self.assertFalse(reports[0].refused)
+
+
+class RefusedSummaryWrapTest(unittest.TestCase):
+    """2026-08-04 review, fix 3: the cover's refused-sheet summary was one
+    unwrapped ``", ".join`` of filenames that ran off the page for ~5+
+    refusals.  It is now capped at a sane number of names, with an
+    "and N more" tail, and the whole thing is wrapped."""
+
+    def test_a_handful_of_refusals_are_all_named(self):
+        refused = [SimpleNamespace(filename=f"R990{n}N.anc") for n in range(1, 4)]
+        text = cutsheet._refused_summary_text(refused)
+        for report in refused:
+            self.assertIn(report.filename, text)
+        self.assertNotIn("more", text)
+
+    def test_five_or_more_refusals_are_capped_with_an_and_n_more_tail(self):
+        refused = [SimpleNamespace(filename=f"R99{n:02d}N.anc") for n in range(1, 9)]
+        text = cutsheet._refused_summary_text(refused)
+        shown, hidden = refused[: cutsheet._REFUSED_NAMES_SHOWN], refused[cutsheet._REFUSED_NAMES_SHOWN :]
+        self.assertTrue(hidden, "the fixture must have more names than the cap")
+        for report in shown:
+            self.assertIn(report.filename, text)
+        for report in hidden:
+            self.assertNotIn(report.filename, text)
+        self.assertIn(f"and {len(hidden)} more", text)
+
+    def test_the_summary_is_wrapped_rather_than_running_off_the_page(self):
+        for line in pdf.wrap_text(
+            cutsheet._refused_summary_text(
+                [SimpleNamespace(filename=f"R99{n:02d}N.anc") for n in range(1, 9)]
+            ),
+            cutsheet.BOLD,
+            9,
+            cutsheet.CONTENT_WIDTH,
+            max_lines=cutsheet._REFUSED_SUMMARY_MAX_LINES,
+        ):
+            self.assertLessEqual(pdf.text_width(line, cutsheet.BOLD, 9), cutsheet.CONTENT_WIDTH)
+
+    def test_a_real_cover_with_many_refusals_wraps_onto_more_than_one_line(self):
+        result, _config = many_refused_pictures(8)
+        job = _fake_job(result, prefix="99", refused=True)
+        parsed = report_for(result, job)
+        cover = parsed.text(0)
+        self.assertIn("and 2 more", cover)
+        # Every sheet's filename legitimately appears once already, in the
+        # per-sheet TABLE above the summary line -- what must be capped is
+        # the SUMMARY sentence specifically, so the check is scoped to the
+        # text that follows it, not the whole cover.
+        marker = "have no NC program:"
+        self.assertIn(marker, cover)
+        summary = cover[cover.index(marker) + len(marker) :]
+        for name in [o.filename for o in job.outcomes[:6]]:
+            self.assertIn(name, summary)
+        for name in [o.filename for o in job.outcomes[6:]]:
+            self.assertNotIn(name, summary)
+
+
+def many_refused_pictures(count: int) -> tuple[NestingResult, NestingConfig]:
+    """``count`` distinct, entirely refused unique pictures -- a fixture
+    for the cover's refused-list wrapping, cheap enough not to need a
+    real NC generation pass (every sheet here is refused by fiat)."""
+    config = NestingConfig(part_gap=0.455)
+    unique_sheets = []
+    demand = []
+    for index in range(count):
+        name = f"W20{index:02d}"
+        unique_sheets.append((SheetLayout([Placement(name, 1.0, 1.0, 20.0, 36.0)]), 1))
+        demand.append(PartSpec(name, 20.0, 36.0, 1))
+    return (
+        NestingResult(
+            unique_sheets=unique_sheets, total_sheets=count, demand=demand, config=config
+        ),
+        config,
+    )
+
+
+def _fake_job(
+    result,
+    *,
+    prefix: str = "1",
+    dry_run: bool = False,
+    refused: bool = False,
+    per_physical_sheet: bool = False,
+):
+    """A minimal duck-typed job, decoupled from the real NC post pipeline.
+
+    Used to exercise the REPORT layer's own pagination and text logic in
+    isolation -- for fixtures (many distinct part numbers, deliberately
+    unrealistic dimensions, a picture repeated many times) that have
+    nothing to do with whether a real program would verify, and so a real
+    :func:`~faceframe_cnc.post.job.build_job` pass would only be slow and
+    fragile noise.  Every field the report code actually reads is
+    present; nothing else is.  ``contents`` always matches its picture,
+    so :func:`cutsheet.sheet_reports`'s own cross-check (fix 8) never
+    rejects this fixture by accident.  Outcomes are :class:`SimpleNamespace`,
+    so a test can mutate one in place to simulate a specific failure.
+    """
+    outcomes = []
+    index = 1
+    for layout, run in result.unique_sheets:
+        copies = int(run) if per_physical_sheet else 1
+        for _ in range(copies):
+            outcomes.append(
+                SimpleNamespace(
+                    filename=f"R{prefix}{index:02d}N.anc",
+                    problems=["simulated refusal for the test"] if refused else [],
+                    contents=dict(layout.part_counts()),
+                    ok=not refused,
+                )
+            )
+            index += 1
+    options = SimpleNamespace(
+        per_physical_sheet=per_physical_sheet, app_name="Faceframe Optimizer", prefix=prefix
+    )
+    return SimpleNamespace(
+        outcomes=outcomes, options=options, dry_run=dry_run, output_dir="unused"
+    )
+
+
 class DryRunTest(unittest.TestCase):
     def test_every_page_of_a_dry_run_is_marked(self):
         result, _config = nested_sample()
@@ -694,6 +900,77 @@ class DryRunTest(unittest.TestCase):
     def test_a_production_report_is_not_marked(self):
         result, _config = nested_sample()
         parsed = report_for(result, job_for(result))
+        self.assertNotIn("DRY RUN", parsed.text())
+
+
+def many_sheet_pictures(count: int) -> tuple[NestingResult, NestingConfig]:
+    """``count`` copies of :func:`known_sheet`'s layout, as distinct unique
+    pictures -- enough (comfortably past the review's ">42" figure) to
+    push the cover's unique-sheets table onto a continuation page, so the
+    "dry runs marked on every page" invariant actually exercises the
+    overflow path rather than just page 1.
+    """
+    config = NestingConfig(inside_nesting=True, part_gap=0.455)
+
+    def one_layout() -> SheetLayout:
+        return SheetLayout(
+            [
+                Placement(
+                    "W2742",
+                    0.5,
+                    1.0,
+                    27.0,
+                    42.0,
+                    children=[Placement("W3012", 8.0, 7.0, 12.0, 30.0, rotated=True)],
+                ),
+                Placement("3DB24", 0.5, 44.0, 24.0, 30.0),
+            ]
+        )
+
+    unique_sheets = [(one_layout(), 1) for _ in range(count)]
+    demand = [
+        PartSpec("W2742", 27.0, 42.0, count),
+        PartSpec("W3012", 30.0, 12.0, count),
+        PartSpec("3DB24", 24.0, 30.0, count),
+    ]
+    result = NestingResult(
+        unique_sheets=unique_sheets, total_sheets=count, demand=demand, config=config
+    )
+    return result, config
+
+
+class DryRunCoverContinuationTest(unittest.TestCase):
+    """2026-08-04 review, fix 1: the cover's continuation page was written
+    but never exercised (RESUME's own follow-up note) -- a dry-run job
+    with enough unique pictures to spill the table onto a second cover
+    page used to leave that whole page unmarked, with rows saying
+    "written" and nothing on the page to say otherwise."""
+
+    def test_the_cover_continuation_page_of_a_dry_run_is_marked(self):
+        result, _config = many_sheet_pictures(45)
+        job = _fake_job(result, dry_run=True)
+        parsed = report_for(result, job)
+
+        cover_pages = parsed.page_count - result.unique_sheet_count
+        self.assertGreaterEqual(
+            cover_pages,
+            2,
+            "the fixture must actually overflow the cover onto a "
+            "continuation page for this test to mean anything",
+        )
+        for index in range(cover_pages):
+            with self.subTest(cover_page=index):
+                self.assertIn("DRY RUN", parsed.text(index))
+        self.assertIn(
+            "UNIQUE SHEETS (continued)", parsed.text(cover_pages - 1)
+        )
+
+    def test_a_production_jobs_continuation_page_says_nothing_about_dry_runs(self):
+        result, _config = many_sheet_pictures(45)
+        job = _fake_job(result)
+        parsed = report_for(result, job)
+        cover_pages = parsed.page_count - result.unique_sheet_count
+        self.assertGreaterEqual(cover_pages, 2)
         self.assertNotIn("DRY RUN", parsed.text())
 
 
@@ -857,6 +1134,122 @@ class CutListTest(unittest.TestCase):
         self.assertEqual(config.sheet_width, 49.0)
 
 
+class DimFormattingTest(unittest.TestCase):
+    """2026-08-04 review, fix 4: ``%g`` keeps only 6 SIGNIFICANT digits, so
+    an exact 32nd -- the machine's own grid -- at typical sheet-size
+    magnitude printed as "47.0312", no longer exact.  Rounding to 5
+    DECIMAL places instead keeps every 32nd exact regardless of how many
+    digits are in front of the point, while still swallowing float noise
+    left over from earlier arithmetic."""
+
+    def test_an_exact_32nd_prints_exactly_at_typical_magnitude(self):
+        self.assertEqual(cutsheet._dim(47.03125), "47.03125")
+        self.assertEqual(cutsheet._dim(33.46875), "33.46875")
+
+    def test_float_noise_is_still_swallowed(self):
+        self.assertEqual(cutsheet._dim(19.099999999999998), "19.1")
+
+    def test_integers_print_without_a_trailing_point(self):
+        self.assertEqual(cutsheet._dim(21.0), "21")
+        self.assertEqual(cutsheet._dim(0.0), "0")
+
+    def test_the_old_percent_g_rounding_is_gone(self):
+        self.assertNotEqual(cutsheet._dim(47.03125), f"{47.03125:g}")
+
+
+class LongPartNumberTest(unittest.TestCase):
+    """2026-08-04 review, fix 2: the cut list's fixed "xN" count column
+    sits at ``x0 + 78``; an untruncated part number of ~15+ characters
+    prints UNDER it -- an unreadable glyph pile."""
+
+    LONG_NAME = "W2036CUSTOMLONGNAME"
+
+    def long_name_sheet(self):
+        config = NestingConfig(part_gap=0.455)
+        layout = SheetLayout([Placement(self.LONG_NAME, 1.0, 1.0, 20.0, 36.0)])
+        demand = [PartSpec(self.LONG_NAME, 20.0, 36.0, 1)]
+        result = NestingResult(
+            unique_sheets=[(layout, 1)], total_sheets=1, demand=demand, config=config
+        )
+        return result
+
+    def test_a_long_part_number_is_truncated_clear_of_the_count_column(self):
+        result = self.long_name_sheet()
+        job = _fake_job(result, prefix="88")
+        parsed = report_for(result, job)
+        texts = parsed.texts(1)
+        occurrences = [t for t in texts if t.startswith(self.LONG_NAME[:10])]
+        self.assertTrue(occurrences, "the part number must appear on the page")
+        # The drawing's own label may print the full name (shrunk, not
+        # truncated -- that machinery is unaffected by this fix); the cut
+        # list draws its copy LAST, so it is the final occurrence.
+        cutlist_text = occurrences[-1]
+        self.assertNotEqual(cutlist_text, self.LONG_NAME)
+        self.assertTrue(cutlist_text.endswith("..."), cutlist_text)
+        self.assertLessEqual(
+            pdf.text_width(cutlist_text, pdf.HELVETICA_BOLD, 9.5),
+            cutsheet._CUTLIST_NUMBER_MAX_WIDTH,
+        )
+        self.assertIn("x1", texts, "the count column must still be there, untouched")
+
+
+class CutListBudgetTest(unittest.TestCase):
+    """2026-08-04 review, fix 7: the per-row page-budget check assumed one
+    wrapped detail line where wrap_text can produce two -- a worst-case
+    row could spill past the region floor onto the drawing beneath it --
+    and the overflow pointer sent the operator to the cover's contents
+    list, which is capped at 3 lines and never carries a size."""
+
+    def test_the_budget_accounts_for_every_wrapped_detail_line(self):
+        row = cutsheet.CutListRow(
+            part_number="W2436",
+            count=1,
+            width=24.0,
+            height=36.0,
+            frame_type="wall",
+            openings=(
+                "a deliberately long opening description engineered to wrap "
+                "onto two full lines at the cut list's own font and column width"
+            ),
+            hosts=("SOMEHOST",),
+        )
+        width = cutsheet.CUTLIST_REGION[2]
+        needed, is_wdc, detail_lines = cutsheet._cut_list_row_plan(row, width)
+        self.assertGreaterEqual(len(detail_lines), 2, "the fixture must actually wrap")
+        self.assertFalse(is_wdc)
+        self.assertEqual(needed, 10.0 + len(detail_lines) * 8.5 + 8.5 + 6.0)
+
+    def test_a_sheet_with_more_rows_than_one_column_holds_continues_the_list(self):
+        count = 30
+        config = NestingConfig(part_gap=0.455)
+        placements = [
+            Placement(
+                f"W20{index:02d}", 1.0 + (index % 9) * 5.0, 1.0 + (index // 9) * 5.0, 4.0, 4.0
+            )
+            for index in range(count)
+        ]
+        layout = SheetLayout(placements)
+        demand = [PartSpec(f"W20{index:02d}", 4.0, 4.0, 1) for index in range(count)]
+        result = NestingResult(
+            unique_sheets=[(layout, 1)], total_sheets=1, demand=demand, config=config
+        )
+        job = _fake_job(result, prefix="55")
+        parsed = report_for(result, job)
+
+        self.assertGreaterEqual(
+            parsed.page_count, 3, "the cut list must have spilled onto its own page"
+        )
+        self.assertEqual(parsed.problems, [])
+        sheet_text = "\n".join(parsed.text(i) for i in range(1, parsed.page_count))
+        for index in range(count):
+            with self.subTest(part=index):
+                self.assertIn(f"W20{index:02d}", sheet_text)
+        self.assertIn("4 x 4", sheet_text)
+        self.assertIn(job.outcomes[0].filename, sheet_text)
+        self.assertIn("CUT LIST (continued)", sheet_text)
+        self.assertNotIn("cover page contents list", parsed.text())
+
+
 # --------------------------------------------------------------------------
 # Writing
 # --------------------------------------------------------------------------
@@ -889,6 +1282,44 @@ class WriteReportTest(unittest.TestCase):
     def test_the_file_name_follows_the_job_prefix(self):
         self.assertEqual(cutsheet.report_filename("7201"), "R7201_report.pdf")
         self.assertEqual(cutsheet.report_filename("62"), "R62_report.pdf")
+
+    def test_a_successful_write_leaves_no_partial_file_behind(self):
+        """2026-08-04 review, fix 9: the write now goes through
+        ``<path>.partial`` and :func:`os.replace` -- the exact discipline
+        :func:`faceframe_cnc.post.job.write_job` was fixed to use in the
+        previous review, for a bare ``open(path, "wb")`` in this same
+        shape.  A successful write must not leave the intermediate file
+        sitting next to the report."""
+        result, _config = nested_sample()
+        job = job_for(result)
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, cutsheet.report_filename("7201"))
+            cutsheet.write_report(result, job, path, created=CREATED)
+            self.assertEqual(os.listdir(folder), ["R7201_report.pdf"])
+            self.assertFalse(os.path.exists(path + cutsheet.PARTIAL_SUFFIX))
+
+    def test_a_failed_write_does_not_touch_an_existing_report(self):
+        """The whole point: a crash mid-write must never leave a half
+        report at the name an operator would actually open."""
+        result, _config = nested_sample()
+        job = job_for(result)
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, cutsheet.report_filename("7201"))
+            original = b"an old report that must survive a failed rewrite"
+            with open(path, "wb") as handle:
+                handle.write(original)
+
+            with mock.patch("os.replace", side_effect=OSError("disk full")):
+                with self.assertRaises(ReportError):
+                    cutsheet.write_report(result, job, path, created=CREATED)
+
+            with open(path, "rb") as handle:
+                self.assertEqual(handle.read(), original, "the old report must survive intact")
+            self.assertEqual(
+                os.listdir(folder),
+                [os.path.basename(path)],
+                "the failed .partial must not be left behind either",
+            )
 
 
 if __name__ == "__main__":

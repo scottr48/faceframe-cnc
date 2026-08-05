@@ -43,6 +43,12 @@ from .summary_panel import SummaryPanel
 #: the button writes NC today.
 GENERATE_TOOLTIP = "Write one verified .anc program per sheet"
 
+#: File-dialog filter for orders.  .xls ONLY, on purpose: the parser is
+#: pandas + xlrd, which cannot open a modern .xlsx at all, so listing one
+#: (as this filter used to) turned a perfectly good spreadsheet into a bare
+#: "Could not read order" (2026-08-04 review).
+ORDER_FILE_FILTER = "Excel 97-2003 order files (*.xls);;All files (*)"
+
 
 class MainWindow(QMainWindow):
     """The whole app, minus the event loop."""
@@ -164,8 +170,13 @@ class MainWindow(QMainWindow):
 
     def open_order(self) -> None:
         start = self.session.settings.last_order_path or os.getcwd()
+        # .xls ONLY: the parser is pandas + xlrd, which cannot read a modern
+        # .xlsx at all, and offering one in the filter turned a perfectly
+        # valid spreadsheet into a blank "Could not read order" (2026-08-04
+        # review).  A user who picks one anyway through "All files" gets the
+        # specific message the session raises.
         path, _filter = QFileDialog.getOpenFileName(
-            self, "Open order spreadsheet", start, "Excel files (*.xls *.xlsx);;All files (*)"
+            self, "Open order spreadsheet", start, ORDER_FILE_FILTER
         )
         if not path:
             return
@@ -181,29 +192,56 @@ class MainWindow(QMainWindow):
         self.order_panel.reload()
         self.refresh()
         attention = len(self.session.needs_attention_rows())
+        invalid = len(self.session.invalid_rows())
         self.statusBar().showMessage(
             f"Loaded {len(self.session.rows)} lines from {os.path.basename(path)}"
             + (f" - {attention} need attention" if attention else "")
+            + (f" - {invalid} cannot be cut (red)" if invalid else "")
         )
 
     def optimize(self) -> None:
-        if self.session.edited:
-            answer = QMessageBox.question(
-                self,
-                "Discard manual edits?",
-                "Re-optimizing throws away the layout changes you made by hand. "
-                "Continue?",
-            )
-            if answer != QMessageBox.StandardButton.Yes:
-                return
+        if self.session.edited and not self._confirm_discard_edits():
+            return
+        self._run_optimize()
+
+    def _confirm_discard_edits(self) -> bool:
+        """Ask before throwing away hand edits.  ``True`` = go ahead."""
+        answer = QMessageBox.question(
+            self,
+            "Discard manual edits?",
+            "Re-optimizing throws away the layout changes you made by hand. "
+            "Continue?",
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _run_optimize(self, *, layout_already_invalid: bool = False) -> bool:
+        """Re-nest and redraw.  ``False`` when the optimizer refused.
+
+        A refusal ALWAYS ends with a refresh (2026-08-04 review): the button
+        states are only recomputed there, and after a failed re-nest the
+        session has no layout, so Generate has to go grey with it.  When the
+        caller had already invalidated the layout on purpose (a settings
+        change), the message says so, because "cannot optimize" plus a blank
+        preview otherwise looks like the app lost the work for no reason.
+        """
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             self.session.optimize()
+            error = None
         except SessionError as exc:
-            QMessageBox.warning(self, "Cannot optimize", str(exc))
-            return
+            error = str(exc)
         finally:
             QApplication.restoreOverrideCursor()
+        if error is not None:
+            self.refresh()
+            if layout_already_invalid:
+                error += (
+                    "\n\nThe layout that was on screen was packed with the "
+                    "previous settings, so it has been cleared and Generate NC "
+                    "is switched off. Fix this and press Optimize."
+                )
+            QMessageBox.warning(self, "Cannot optimize", error)
+            return False
         self.canvas.show_sheet(0)
         self.refresh()
         summary = self.session.summary()
@@ -212,6 +250,7 @@ class MainWindow(QMainWindow):
             f"{summary['total_sheets']} sheets, {summary['unique_sheets']} unique"
             + (f", {saved} saved by inside nesting" if saved is not None else "")
         )
+        return True
 
     def generate_nc(self) -> None:
         """Write one verified .anc per sheet (spec sections 5 and 6)."""
@@ -302,6 +341,18 @@ class MainWindow(QMainWindow):
         )
 
     def edit_settings(self) -> None:
+        """Change the optimizer settings — all of it, or none of it.
+
+        2026-08-04 review: this used to store the new settings and then lean
+        on :meth:`optimize` to rebuild the layout, which had two ways out —
+        the "Discard manual edits?" prompt answered No, and a re-nest that
+        failed — and both left the OLD layout on screen, generate-able, under
+        the NEW settings (a 49x97 layout still writable after switching to
+        40x60 stock).  So the order is now: ask about the hand edits FIRST,
+        then hand the settings to the session, which invalidates the layout
+        itself; a failed re-nest can no longer leave anything behind to
+        generate.
+        """
         dialog = SettingsDialog(self.session.settings, self)
         if dialog.exec() != int(SettingsDialog.DialogCode.Accepted):
             return
@@ -310,12 +361,32 @@ class MainWindow(QMainWindow):
         if problems:
             QMessageBox.warning(self, "Invalid settings", "; ".join(problems))
             return
-        self.session.settings = new_settings
-        save_settings(new_settings, self.settings_path)
-        if self.session.result is not None or self.session.included_rows():
-            self.optimize()
+        if self.session.edited and not self._confirm_discard_edits():
+            # Nothing has been touched yet: not the session, not the disk.
+            self.statusBar().showMessage(
+                "Settings unchanged - your manual layout edits are still there"
+            )
+            return
+        try:
+            self.session.set_settings(new_settings)
+        except SessionError as exc:
+            QMessageBox.warning(self, "Invalid settings", str(exc))
+            return
+        if not save_settings(new_settings, self.settings_path):
+            # The session is running on the new numbers either way; the user
+            # needs to know they will not survive a restart.
+            QMessageBox.warning(
+                self,
+                "Settings not saved",
+                f"The new settings are in use now, but they could not be "
+                f"written to {self.settings_path}, so they will be back to the "
+                f"old values next time the program starts.",
+            )
+        if self.session.included_rows():
+            self._run_optimize(layout_already_invalid=True)
         else:
             self.refresh()
+            self.statusBar().showMessage("Settings updated - press Optimize (Ctrl+R)")
 
     # -- navigation ------------------------------------------------------
 
