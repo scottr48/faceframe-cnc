@@ -500,8 +500,9 @@ def dry_run_config(config: PostConfig | None = None) -> PostConfig:
     top = cfg.stock_top_z
     lifted = replace(
         cfg,
-        openings_pass=replace(
-            cfg.openings_pass, z_cut=_mirror(cfg.openings_pass.z_cut, top)
+        openings_passes=tuple(
+            replace(spec, z_cut=_mirror(spec.z_cut, top))
+            for spec in cfg.openings_passes
         ),
         detail_pass=replace(cfg.detail_pass, z_cut=_mirror(cfg.detail_pass.z_cut, top)),
         perimeter_passes=tuple(
@@ -523,7 +524,7 @@ def dry_run_config(config: PostConfig | None = None) -> PostConfig:
         dry_run=True,
     )
     depths = [
-        lifted.openings_pass.z_cut,
+        *(spec.z_cut for spec in lifted.openings_passes),
         lifted.detail_pass.z_cut,
         lifted.panel.z_cut,
         *lifted.wdc_slot.z_cuts,

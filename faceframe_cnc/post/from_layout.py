@@ -13,8 +13,13 @@ What the sequence is, and why
 -----------------------------
 ``panel`` (T13)
     Every standard frame gets its four measured grooves — 0.5625 in from
-    each stile edge running the full part length with the 0.375 overrun,
-    0.9375 in from each rail running between the two stile centre lines.
+    each stile edge running the full part length, 0.9375 in from each rail
+    running between the two stile centre lines.  The stile pair's measured
+    0.375 overrun past the part ends is CLAMPED away since the 2026-08-05
+    amendment (:func:`~.generator.groove_segment`): the cut ends flush with
+    the part edge, which is why this module adds no groove spacing rule (spec
+    §8 — Scott chose the clamp over a nesting clearance, and the clamp makes
+    the clearance unnecessary by construction).
     Order: parts in canonical (depth-first, host before its passengers)
     order, and within a part **stiles then rails** (groove indices 0, 2, 1,
     3).  The reference files' groove order is arbitrary — R720101N
@@ -38,7 +43,7 @@ What the sequence is, and why
     amendment says so ("the T13 and T17 groove routing runs FIRST"), and
     because that is where T17 sits in ``RFK0101N.anc``.
 
-``openings`` (T11 at Z0.15) and ``detail`` (T12 through)
+``openings`` (T11, the max-bite ladder down to Z0.15) and ``detail`` (T12 through)
     EVERY opening on the sheet, including the openings of frames nested
     inside another frame — those are routed while the inner's slab is still
     part of its host's interior waste, exactly as in R720101N.  Order:
@@ -52,16 +57,86 @@ What the sequence is, and why
     ``detail`` is left as ``None``, i.e. "repeat the opening order" — which
     is what all four reference files do, cut for cut.
 
-``perimeter`` (T11, two depth passes) — the 2026-08-03 onion-skin amendment
-    Pass 1 (Z0.06, the skin that still holds every part to the sheet) runs
-    EVERY part in canonical order.  Pass 2 (Z-0.006, through) runs **all
-    nested inner frames first, across the whole sheet**, then the
-    non-nested parts and the hosts — same ``(-depth, index)`` key as the
-    openings.  :class:`~.model.CutPlan` already carries one ordered list
-    per depth pass, so this is pure sequencing.
+    **2026-08-05 amendment (Scott): the T11 roughing pass is a LADDER.**  The
+    measured pass takes 0.60 of material in one bite (Z0.75 surface down to
+    Z0.15), which is more than the 0.4 the 3/8 compression bit is now allowed
+    (:data:`T11_MAX_BITE`), so a generated sheet cuts every opening in two equal
+    0.3 bites — Z0.45 then Z0.15 — at the measured 0.1975 offset and the
+    measured feeds (:func:`generated_opening_passes`).  Both bites of one opening
+    are emitted back to back, exactly as the two bites of one T17 slot are: they
+    are the same rectangle at two depths, so splitting them would only add a
+    reposition, and neither bite frees anything (the T12 detail pass is what cuts
+    through), so nothing about the sheet's stability depends on interleaving
+    them.  The T12 detail pass is a different tool and is untouched.
 
-Lead-in edges are left to :func:`~.generator.default_entry_side` (openings
-wider than tall lead in on the bottom edge, everything else on the right).
+``perimeter`` (T11) — the max-bite ladder, ending on the through pass
+    The last configured pass (Z-0.006, through) runs **all nested inner
+    frames first, across the whole sheet**, then the non-nested parts and
+    the hosts — same ``(-depth, index)`` key as the openings.  Any pass
+    before it runs EVERY part in canonical order.
+    :class:`~.model.CutPlan` carries one ordered list per depth pass, so
+    this is pure sequencing, and the sequence is built from however many
+    passes the post table in hand configures
+    (:func:`generated_post_passes`).
+
+    **2026-08-05 amendment (Scott, job R0805): the onion skin goes.**  The
+    2026-08-03 onion-skin order put a Z0.06 skin pass first so that 0.06" of
+    material still held every part while the rest of the sheet was cut; job
+    R0805 broke two frames anyway (a freed opening dropout beside a thin MDF
+    ring), the answer to that is tabs (spec §3, milestones 2b/3), and Scott's
+    decision on 2026-08-05 was that once parts are tab-held the skin has no
+    holding job left — "don't need it anymore".
+
+    **2026-08-05, second amendment the same day (Scott): 0.4 of material per
+    T11 pass, to reduce the load on the 3/8 compression bit.**  Dropping the
+    skin left the through pass taking the whole 0.756 in one go, which is what
+    Scott saw and ruled on: *"when the 3/8 comp (T11) is being used, only let it
+    take a maximum of 0.4 inch of material per pass. That will help reduce the
+    load on it."*  0.756 "basically cuts in half", so a generated perimeter runs
+    **two equal 0.378 bites** — an intermediate pass at Z0.372 in canonical
+    order, then the through pass at Z-0.006 inners-first.  That is not the old
+    onion skin back under another name: the skin was a 0.06 holding rib at the
+    bottom of the cut, this is a depth-of-cut ladder whose rungs are
+    :data:`T11_MAX_BITE` apart, the holding is done by the tabs either way, and
+    the intermediate pass runs at the measured pass-1 offset (0.1895, leaving
+    0.002 of spring stock for the through pass to shave) and the measured
+    perimeter feeds.  :func:`generated_post_passes` builds the ladder and
+    :func:`post_config_for` is the one place it is turned on.
+
+    The measured table in :func:`~.model.default_config` keeps BOTH passes:
+    the reference ``.anc`` files were cut with the two-pass dialect and
+    :mod:`~.reconstruct` and :func:`~.verifier.verify` must go on reading
+    and judging them exactly as before.  This module's sequencing works for
+    either.
+
+``release`` (T12) — the last section, since the 2026-08-05 amendment
+    One straight cut per holding tab, flush with the finished profile, at the
+    ratified release feeds (spec §3c).  Order: every OPENING's tabs first, then
+    every perimeter's, inners before hosts within each — so the last motions in
+    the program free an outermost part, and nothing on the sheet is fully
+    separated until this section runs.  :func:`hold_profile` decides where the
+    tabs are; this module only sequences them, and the geometry of a release cut
+    belongs to :func:`~.generator.release_path` and :func:`~.tabs.release_span`.
+
+    The section exists only when the post table configures a release pass
+    (:attr:`~.model.PostConfig.release`, which :func:`post_config_for` sets and
+    the measured table leaves ``None``) — and so, therefore, do the tabs: a tab
+    with nothing to release it is a part that never comes off the sheet.
+
+Lead-in edges: PINNED, one per profile (2026-08-05 amendment)
+------------------------------------------------------------
+:func:`~.generator.default_entry_side` still says which edge is preferred
+(openings wider than tall lead in on the bottom edge, everything else on the
+right), but a tabbed profile can no longer let each pass answer for itself:
+tab placement excludes exactly one lead-in span, so every pass over one profile
+has to enter on the same edge.  :func:`hold_profile` therefore pins ONE edge per
+profile against the worst case over all of that profile's passes
+(:func:`~.generator.pinned_entry_side`) and every :class:`~.model.FeatureRef`
+this module builds carries it explicitly — openings, detail (which repeats the
+opening refs), perimeter and release alike.  For every sheet the shop actually
+cuts that is the same edge the per-pass rule chose, so nothing moved; what
+changed is that it can no longer differ by pass.
+
 The two per-feature overrides that exist in the references are replication
 quirks with no stated rule behind them and are deliberately NOT carried
 into generated sheets.
@@ -95,6 +170,7 @@ expecting to lose.
 
 from __future__ import annotations
 
+import math
 from dataclasses import replace
 
 from ..geometry import (
@@ -104,7 +180,7 @@ from ..geometry import (
     FrameType,
     infer_frame_type,
 )
-from .generator import wdc_slot_segment
+from .generator import pinned_entry_side, profile_cuts, wdc_slot_segment
 from .model import (
     Box,
     CutPlan,
@@ -112,18 +188,24 @@ from .model import (
     FeatureRef,
     PanelSpec,
     PartProgram,
+    PassSpec,
     PostConfig,
     ProgramHeader,
+    ReleaseSpec,
+    SECTION_OPENINGS,
+    SECTION_PERIMETER,
     SheetProgram,
     T17,
     default_config,
     program_from_placements,
 )
+from .tabs import TabZone, place_tabs
 
 __all__ = [
     "SheetPlanError",
     "WdcNotSupportedError",
     "T17",
+    "T11_MAX_BITE",
     "WDC_SLOT_DEPTH",
     "WDC_SLOT_END_REACH",
     "WDC_SLOT_INSET_FROM_INSIDE_EDGE",
@@ -133,12 +215,38 @@ __all__ = [
     "cut_plan_for",
     "sheet_program_from_layout",
     "plan_sheet",
+    "bite_ladder",
+    "max_bite_for",
+    "generated_post_passes",
+    "generated_opening_passes",
+    "generated_tools",
     "post_config_for",
+    "hold_profile",
     "is_wdc",
     "wdc_slot_z",
 ]
 
 EPS = 1e-9
+
+#: How much material a T11 pass may remove on a GENERATED sheet, in inches of
+#: depth.  **RATIFIED POLICY — Scott, 2026-08-05**, in his own words: *"When the
+#: 3/8 comp (T11) is being used, only let it take a maximum of 0.4 inch of
+#: material per pass. That will help reduce the load on it."*  He had just seen a
+#: perimeter take the full 0.756 in a single pass (the onion skin having been
+#: dropped earlier the same day) and noted that 0.4 "basically cuts that in
+#: half".
+#:
+#: Not a measurement.  Every Z level, offset and feed in this post came off the
+#: reference ``.anc`` files (rule zero); this number came off the owner, like
+#: :class:`~.model.TabSpec` and :class:`~.model.ReleaseSpec`, and like them it
+#: lives in exactly one place so a shop that re-times the bit has one line to
+#: change.  It is applied to the two T11 sections of a GENERATED sheet's post
+#: table by :func:`generated_tools`, read back off that table by
+#: :func:`max_bite_for`, and turned into a pass ladder by
+#: :func:`generated_post_passes` / :func:`generated_opening_passes`.  The
+#: measured table declares no limit, so the reference programs are read and
+#: judged exactly as they were cut.
+T11_MAX_BITE = 0.4
 
 
 class SheetPlanError(ValueError):
@@ -456,6 +564,53 @@ def _inners_first(depths: list[int]) -> list[int]:
     return sorted(range(len(depths)), key=lambda i: (-depths[i], i))
 
 
+def hold_profile(
+    part: PartProgram,
+    kind: str,
+    finished: Box,
+    config: PostConfig,
+) -> tuple[str, tuple[TabZone, ...]]:
+    """``(entry side, tab zones)`` for one profile — the 2026-08-05 amendment.
+
+    The two decisions that have to be made TOGETHER, made in one place:
+
+    *   which edge every pass over this profile leads in on
+        (:func:`~.generator.pinned_entry_side`, worst case over
+        :func:`~.generator.profile_cuts`).  One edge per profile, pinned onto
+        every :attr:`~.model.FeatureRef.entry` that cuts it, because tab
+        placement excludes exactly ONE lead-in span and a second pass entering
+        elsewhere would ramp through a tab (spec §3b);
+    *   where the tabs are (:func:`~.tabs.place_tabs`), which is answered
+        against that edge and against those same passes — so a pass at or above
+        the tab top gets no vote and an AIR-CUT table (every depth mirrored
+        above the stock, :func:`~.job.dry_run_config`) places nothing.
+
+    No tabs at all when the post table configures no release pass
+    (:attr:`~.model.PostConfig.release` — which the MEASURED table leaves
+    ``None``).  That is not a shortcut, it is the safety rule: a tab nothing
+    releases is a part that never comes off the sheet, so the two are one
+    decision and :func:`post_config_for` makes it.  The entry side is still
+    pinned, because pinning it costs nothing and is what the amendment asks for.
+
+    Raises :class:`SheetPlanError`, naming the part, when no edge fits the sheet
+    for all of this profile's passes: at that point the sheet needs re-nesting
+    and the operator has to be told which frame is the problem.
+    """
+    try:
+        side = pinned_entry_side(finished, kind, profile_cuts(kind, config), config)
+    except ValueError as exc:
+        where = "footprint" if kind == "perimeter" else "opening"
+        raise SheetPlanError(
+            f"{part.part_number} @({part.box.x0:.4f},{part.box.y0:.4f}) cannot be "
+            f"cut on this sheet: its {where} {exc}",
+            part_number=part.part_number,
+            box=part.box,
+        ) from exc
+    if config.release is None:
+        return side, ()
+    return side, place_tabs(finished, side, profile_cuts(kind, config), config)
+
+
 def cut_plan_for(
     program: SheetProgram,
     sections: tuple[str, ...] = DEFAULT_SECTIONS,
@@ -483,25 +638,59 @@ def cut_plan_for(
     if slots:
         _check_wdc_clearance(program, cfg)
 
+    #: Where the holding tabs are, per profile, and the one edge every pass over
+    #: that profile leads in on (:func:`hold_profile`).
+    zones: dict[tuple[int, str, int], tuple[TabZone, ...]] = {}
+    release: list[FeatureRef] = []
+
     openings: list[FeatureRef] = []
     for index in inners_first:
-        for opening in range(len(parts[index].openings)):
-            openings.append(FeatureRef(index, "opening", opening))
+        part = parts[index]
+        for opening in range(len(part.openings)):
+            side, tabs_here = hold_profile(
+                part, "opening", part.openings[opening], cfg
+            )
+            ref = FeatureRef(index, "opening", opening, entry=side)
+            openings.append(ref)
+            if tabs_here:
+                zones[ref.profile] = tabs_here
+                # Spec §3c: opening tabs first, and the openings are already in
+                # inners-before-hosts order, so this list inherits it.
+                release.append(ref)
     if not openings:
         raise SheetPlanError(
             "no part on this sheet has a routed opening — the geometry engine "
             "produced nothing to cut"
         )
 
-    perimeter = [
-        [FeatureRef(index, "perimeter") for index in canonical],
-        [FeatureRef(index, "perimeter") for index in inners_first],
-    ]
-    if len(perimeter) != len(cfg.perimeter_passes):
+    if not cfg.perimeter_passes:
         raise SheetPlanError(
-            f"the onion-skin sequence needs exactly {len(perimeter)} perimeter "
-            f"depth passes but the post table has {len(cfg.perimeter_passes)}"
+            "the post table configures no perimeter depth pass, so nothing would "
+            "cut any part free"
         )
+    # One ordered list per configured depth pass (module docstring): the LAST
+    # pass is the one that cuts a part's outline right through, so it runs inners
+    # first; anything before it only scores, so canonical order will do.  Two
+    # passes give the 2026-08-03 onion-skin sequence on the measured table and
+    # the 2026-08-05 max-bite ladder on a generated one, one gives a table with
+    # neither, and the shape of the loop is why none of them is written down
+    # twice.
+    footprint: dict[int, FeatureRef] = {}
+    for index in canonical:
+        side, tabs_here = hold_profile(parts[index], "perimeter", parts[index].box, cfg)
+        footprint[index] = FeatureRef(index, "perimeter", entry=side)
+        if tabs_here:
+            zones[footprint[index].profile] = tabs_here
+    perimeter = [
+        [footprint[index] for index in canonical] for _ in cfg.perimeter_passes[:-1]
+    ]
+    perimeter.append([footprint[index] for index in inners_first])
+    # Spec §3c: the perimeter tabs come after every opening tab, inners before
+    # hosts — the same order the freeing pass itself runs in, so the last
+    # motions in the whole program free an outermost part.
+    release.extend(
+        footprint[index] for index in inners_first if footprint[index].profile in zones
+    )
 
     return CutPlan(
         panel=panel,
@@ -510,6 +699,8 @@ def cut_plan_for(
         perimeter=perimeter,
         detail=None,
         sections=sections,
+        tabs=zones or None,
+        release=release,
     )
 
 
@@ -566,16 +757,211 @@ def plan_sheet(
     return program, plan
 
 
+def bite_ladder(
+    final: PassSpec, template: PassSpec, max_bite: float | None, stock_top_z: float
+) -> tuple[PassSpec, ...]:
+    """``final`` split into equal bites no deeper than ``max_bite``.
+
+    The arithmetic of Scott's 2026-08-05 rule, written once and used by both
+    ladders (:func:`generated_post_passes`, :func:`generated_opening_passes`):
+
+    *   the cut is ``stock_top_z - final.z_cut`` deep (Z0 is the spoilboard, so
+        the depth of cut is measured down from the surface — see
+        :mod:`~.model`'s Z table);
+    *   ``n = ceil(depth / max_bite)`` bites, each ``depth / n``.  EQUAL bites,
+        not "as much as allowed then the remainder": Scott's own words for the
+        0.756 perimeter were that 0.4 "basically cuts that in half", i.e. two
+        passes of 0.378 rather than 0.4 + 0.356.  Equal bites also mean the
+        machine sees the same load twice instead of a heavy pass followed by a
+        light one;
+    *   the LAST rung is ``final`` itself, unchanged — same Z, same offset, same
+        feeds, same lateral lead — because that is the measured pass that cuts
+        the feature to size and nothing about it may move;
+    *   every rung above it is ``template`` at the ladder's Z.  ``template``
+        carries the offset and the feeds a non-final pass runs at, which are
+        measured values the CALLER picks out of its own table (the perimeter's
+        pass-1 spec, the opening pass itself); this function never invents one.
+
+    ``max_bite`` of ``None`` — a table that declares no limit, which is every
+    measured table — returns ``(final,)``: one pass, exactly as before, which is
+    what keeps the reference dialect and its round-trips untouched.
+    """
+    depth = stock_top_z - final.z_cut
+    if max_bite is None or max_bite <= 0 or depth <= max_bite + EPS:
+        return (final,)
+    count = math.ceil(depth / max_bite - EPS)
+    bite = depth / count
+    return (
+        *(
+            replace(template, z_cut=round(stock_top_z - bite * step, 9))
+            for step in range(1, count)
+        ),
+        final,
+    )
+
+
+def max_bite_for(cfg: PostConfig, section: str) -> float | None:
+    """The deepest bite the tool in ``section`` may take, or ``None``.
+
+    One accessor so that every ladder in this module asks the same question of
+    the same place — the TOOL's own :attr:`~.model.ToolSpec.max_bite`, which is
+    where a rule about a bit belongs (:class:`~.model.ToolSpec`) and what the
+    verifier reads back off the finished config.
+    """
+    tool = cfg.tools.get(section)
+    return None if tool is None else tool.max_bite
+
+
+def generated_post_passes(cfg: PostConfig) -> tuple[PassSpec, ...]:
+    """The perimeter depth passes a GENERATED sheet is cut with.
+
+    Both halves of the 2026-08-05 amendment, in the order Scott made them:
+
+    1.  **the onion skin goes.**  The measured table carries two perimeter
+        passes — the Z0.06 onion skin that held every part while the sheet was
+        finished, then the Z-0.006 pass that cuts through — because that is what
+        the reference programs do.  A generated sheet no longer runs the skin:
+        the parts are held by tabs (spec §3), so the skin's holding job is over.
+        Everything below is built on the LAST configured pass, the through one.
+    2.  **0.4 of material per pass** (:data:`T11_MAX_BITE`, Scott: "that will
+        help reduce the load on it").  The through pass alone would cut 0.756
+        deep, so :func:`bite_ladder` splits it into two equal 0.378 bites: an
+        intermediate pass at **Z0.372**, then the measured through pass at
+        Z-0.006, untouched.
+
+    Where the intermediate pass's offset and feeds come from, and why
+    ----------------------------------------------------------------
+    From the measured table's own FIRST perimeter pass — offset 0.1895 (0.1875
+    tool radius plus 0.002 of spring stock) and the measured 150/498.2 feeds.
+    Nothing here is invented: the shop's own two-pass wall treatment is a
+    roughing lap 0.002 proud of the finished line followed by a through lap
+    tangent to it, and that is exactly the relationship a max-bite ladder wants
+    — the deep bite takes the wall down to 0.002 over size and the through pass
+    finish-shaves it at full depth.  It also restores the verifier's backstop for
+    a too-tight part gap: the intermediate lap sweeps 0.377 past the part edge
+    (0.1895 + 0.1875), so two parts 0.375 apart are refused again, which the
+    single tangent through pass could not see.
+
+    A table whose T11 declares no ``max_bite`` (:func:`~.model.default_config`,
+    and any base a caller hands in unchanged) gets the single through pass this
+    function returned before the ladder existed.
+
+    This is all a SCHEDULING policy, not a change to the measured table: the
+    reference files keep their two-pass dialect forever and
+    :func:`~.model.default_config` keeps describing it, which is what lets
+    :mod:`~.reconstruct` read them and :func:`~.verifier.verify` judge them
+    exactly as it did before the amendment.
+    """
+    through = cfg.perimeter_passes[-1]
+    # The roughing template is the measured pass 1 when the table has one; on a
+    # table that carries the through pass alone there is nothing else measured to
+    # reach for, so the ladder repeats the through pass's own offset and feeds.
+    template = cfg.perimeter_passes[0] if len(cfg.perimeter_passes) > 1 else through
+    return bite_ladder(
+        through, template, max_bite_for(cfg, SECTION_PERIMETER), cfg.stock_top_z
+    )
+
+
+def generated_opening_passes(cfg: PostConfig) -> tuple[PassSpec, ...]:
+    """The T11 opening roughing passes a GENERATED sheet is cut with.
+
+    The same rule as :func:`generated_post_passes`, on the other T11 operation,
+    and this one is a straight application of it with nothing to undo first: the
+    measured opening pass takes 0.60 in one bite (Z0.75 down to Z0.15), which is
+    over the ratified 0.4, so it becomes **two equal 0.3 bites — Z0.45 then
+    Z0.15**.
+
+    Both rungs run at the measured opening pass's OWN offset (-0.1975: the 0.1875
+    tool radius plus the 0.010 of finish stock T12 takes) and its own measured
+    feeds, so the template and the final pass are the same spec at two depths.
+    There is no equivalent of the perimeter's 0.002 spring stock here because the
+    T12 detail pass is what finishes an opening to size, and it is a different
+    tool with no bite limit of its own.
+
+    FLAGGED FOR RATIFICATION (2026-08-05): Scott's instruction named the
+    perimeter, because the perimeter is what he had just watched cut 0.756 in one
+    go.  The rule he stated is about the TOOL — "when the 3/8 comp is being
+    used" — and the opening pass is the same bit taking 0.60, so it is inside the
+    rule as worded and is split here.  If he meant the perimeter only, the change
+    is to declare the limit on a perimeter-only T11 rather than on the tool.
+    """
+    final = cfg.openings_passes[-1]
+    return bite_ladder(
+        final, final, max_bite_for(cfg, SECTION_OPENINGS), cfg.stock_top_z
+    )
+
+
+def generated_tools(cfg: PostConfig) -> dict:
+    """``cfg.tools`` with the ratified T11 bite limit declared on it.
+
+    RATIFIED POLICY, **Scott, 2026-08-05** — see :data:`T11_MAX_BITE`.  It is
+    stamped on the tools of the two T11 sections here, and only here, so that
+    every reader of a generated sheet's post table (the ladders above, the
+    emitter's own config check, and the verifier re-deriving the ladder from the
+    text) reads ONE number from one place.  A table whose section already
+    declares a limit keeps it: a caller who has re-tuned the bit is not
+    overruled.
+
+    The measured table is not touched: :func:`~.model.default_config` declares
+    no limit anywhere, which is why a reference program is judged by exactly the
+    rules it was cut under.
+    """
+    tools = dict(cfg.tools)
+    for section in (SECTION_OPENINGS, SECTION_PERIMETER):
+        tool = tools.get(section)
+        if tool is not None and tool.max_bite is None:
+            tools[section] = replace(tool, max_bite=T11_MAX_BITE)
+    return tools
+
+
 def post_config_for(
     nesting_config, base: PostConfig | None = None
 ) -> PostConfig:
-    """A post table whose sheet size matches the optimizer's.
+    """The post table a GENERATED sheet is cut with.
 
-    The emitter refuses a program whose sheet differs from its configured
-    one (a mismatch means the coordinates were computed for another sheet),
-    so the two settings are tied together here rather than left to callers.
+    Every generated-sheet policy is decided here, and this is the only place any
+    of them is decided, because :func:`faceframe_cnc.post.job.build_job` and
+    :meth:`faceframe_cnc.gui.session.Session.simulation_inputs` — every route
+    from an optimizer layout to emitted code — come through it:
+
+    *   the sheet size matches the optimizer's.  The emitter refuses a program
+        whose sheet differs from its configured one (a mismatch means the
+        coordinates were computed for another sheet), so the two settings are
+        tied together here rather than left to callers;
+    *   the 3/8 compression bit takes at most :data:`T11_MAX_BITE` of material
+        per pass (:func:`generated_tools` — Scott, 2026-08-05, "reduce the load
+        on it").  The limit is declared on the tool FIRST, so that the two
+        ladders below and everything downstream read one number from the finished
+        table rather than from a constant of their own;
+    *   the perimeter runs that ladder, ending on the measured through pass —
+        two 0.378 bites, Z0.372 then Z-0.006 (:func:`generated_post_passes`,
+        which also drops the 2026-08-03 onion skin);
+    *   the openings run the same ladder — two 0.3 bites, Z0.45 then Z0.15
+        (:func:`generated_opening_passes`);
+    *   the sheet is TAB-HELD and released by a final slow T12 pass
+        (:class:`~.model.ReleaseSpec`).  This and the dropped onion skin are one
+        decision: the skin's holding job went to the tabs, so the pass that goes
+        and the section that arrives are turned off and on in the same line of
+        code.  The measured table (:func:`~.model.default_config`) carries none
+        of it, which is what lets the reference programs go on reconstructing and
+        verifying exactly as before.
+
+    ``base`` is where a caller's own post table joins in (``JobOptions``); every
+    rule applies to it, since what it is being used for is cutting a generated
+    sheet.
     """
     cfg = base or default_config()
+    # The bite limit lands on the tools before either ladder is built: both read
+    # it back off the config in hand (:func:`max_bite_for`), so there is one
+    # source for the number and no way for a ladder to be built against a limit
+    # the finished table does not declare.
+    cfg = replace(cfg, tools=generated_tools(cfg))
+    cfg = replace(
+        cfg,
+        openings_passes=generated_opening_passes(cfg),
+        perimeter_passes=generated_post_passes(cfg),
+        release=cfg.release if cfg.release is not None else ReleaseSpec(),
+    )
     if nesting_config is None:
         return cfg
     return replace(

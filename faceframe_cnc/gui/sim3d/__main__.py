@@ -13,11 +13,13 @@ own, so "does it open without a traceback" is answerable without anybody
 sitting in front of it (the same flag ``python -m faceframe_cnc.gui`` has).
 
 The two demo sheets are built through the planner
-(:func:`~faceframe_cnc.post.from_layout.plan_sheet`), so what is animated is a
-sheet the optimizer could actually produce: ``wdc`` puts a WDC2436 (the frame
-with the T17 stile slots) beside an ordinary W2436, and ``nested`` puts a
-W3012 inside a W2742's opening (spec 4b), which is the sheet where a host slab
-must not come loose before its passenger.
+(:func:`~faceframe_cnc.post.from_layout.plan_sheet`) and the post table Generate
+itself uses (:func:`~faceframe_cnc.post.from_layout.post_config_for` — one
+perimeter pass since the 2026-08-05 amendment, not the measured table's two), so
+what is animated is a sheet the shop could actually be handed: ``wdc`` puts a
+WDC2436 (the frame with the T17 stile slots) beside an ordinary W2436, and
+``nested`` puts a W3012 inside a W2742's opening (spec 4b), which is the sheet
+where a host slab must not come loose before its passenger.
 """
 
 from __future__ import annotations
@@ -27,7 +29,7 @@ import sys
 from typing import Optional, Sequence
 
 from ...nesting import NestingConfig, PartSpec, Placement, SheetLayout
-from ...post import ProgramHeader, default_config, plan_sheet
+from ...post import ProgramHeader, plan_sheet, post_config_for
 from ...sim import SimTimeline
 
 DEMO_CREATED = "01 JAN 27 - 08:00"
@@ -42,13 +44,15 @@ def wdc_sheet() -> SimTimeline:
         ]
     )
     demand = [PartSpec("WDC2436", 18.0, 36.0, 1), PartSpec("W2436", 24.0, 36.0, 1)]
+    config = post_config_for(NestingConfig())
     program, plan = plan_sheet(
         layout,
         ProgramHeader(name="R990102N", created=DEMO_CREATED),
         demand,
         NestingConfig(),
+        config,
     )
-    return SimTimeline.build(program, plan, default_config())
+    return SimTimeline.build(program, plan, config)
 
 
 def nested_sheet() -> SimTimeline:
@@ -68,13 +72,15 @@ def nested_sheet() -> SimTimeline:
         ]
     )
     demand = [PartSpec("W2742", 27.0, 42.0, 1), PartSpec("W3012", 30.0, 12.0, 2)]
+    config = post_config_for(NestingConfig())
     program, plan = plan_sheet(
         layout,
         ProgramHeader(name="R990103N", created=DEMO_CREATED),
         demand,
         NestingConfig(),
+        config,
     )
-    return SimTimeline.build(program, plan, default_config())
+    return SimTimeline.build(program, plan, config)
 
 
 DEMOS = {"wdc": wdc_sheet, "nested": nested_sheet}

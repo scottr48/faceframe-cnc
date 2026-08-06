@@ -6,14 +6,15 @@ the whole point, so what is checked instead is
 
   (a) the real 7-21-26 order, nested at the default 0.455 gap, generates a
       verified program for EVERY unique sheet -- zero refusals -- and the
-      0.375 gap the spec asks for still cannot (the finding is pinned, not
-      hidden);
+      0.375 gap the spec asks for still cannot be cut (the finding is pinned,
+      not hidden: since the 2026-08-05 amendment it is 9 of the 17 sheets
+      rather than all of them, and WHY is pinned too);
   (b) WDC sheets carry their T17 stile slot, in the right section, on the
       right centreline, with the right per-pass depth and overrun; a WDC
       whose slot would reach a neighbour or the sheet edge is refused;
-  (c) the 2026-08-03 onion-skin order is really in the emitted text: pass 1
-      on every part before any pass-2 cut, and every nested inner cut free
-      before its host;
+  (c) the perimeter order is really in the emitted text: ONE pass per part
+      since the 2026-08-05 amendment (no 0.06 skin lap anywhere), and every
+      nested inner cut free before its host;
   (d) openings (including nested inners' own openings) are all cut before
       any perimeter;
   (e) naming, O-numbers and the banner;
@@ -96,6 +97,27 @@ def nested_order(part_gap: float = 0.455) -> tuple[NestingResult, NestingConfig]
     return nest(ORDER_7_21_26, config), config
 
 
+#: A part gap no perimeter pass can honour, whichever way the neighbour lies.
+#: The through pass's at-depth loop sweeps exactly 0.375 past a part edge, so
+#: 0.375 is tangent to a neighbour and (since the 2026-08-05 amendment removed
+#: the 0.377 onion-skin pass) only refused where the lead-in ramp points at it.
+#: 0.25 is 0.125 INSIDE the neighbour on every side — an unambiguously
+#: uncuttable sheet, which is what a fixture about refusals needs.
+UNCUTTABLE_GAP = 0.25
+
+
+def mixed_order() -> "NestingResult":
+    """An order that produces one sheet the verifier passes and one it refuses.
+
+    A test about what happens to the REST of a job when one sheet is refused
+    needs a job with a rest: a 48x90 frame gets a sheet to itself and has no
+    neighbour to cut into, while the pair of 30x30s share one at
+    :data:`UNCUTTABLE_GAP` and cannot be cut.
+    """
+    demand = [PartSpec("W4890", 48.0, 90.0, 1), PartSpec("W3030", 30.0, 30.0, 2)]
+    return nest(demand, NestingConfig(part_gap=UNCUTTABLE_GAP))
+
+
 def has_wdc(contents: dict) -> bool:
     return any(name.upper().startswith("WDC") for name in contents)
 
@@ -157,20 +179,55 @@ class RealOrderTest(unittest.TestCase):
     def test_the_only_non_wdc_refusal_is_the_gap_being_too_narrow(self):
         """The 0.375 finding, pinned rather than hidden.
 
-        A perimeter lead-in ramp stands 0.05 off the profile, the profile is
-        0.1875 outside the part edge and the tool radius is 0.1875, so the
-        swept tool reaches 0.425 past the part edge.  Two parts 0.375 apart
-        are 0.05 short of that, and the verifier says so.  Nothing is
+        A perimeter lead-in ramp stands 0.05 off the profile and closes that
+        gap as it descends, so where it breaks the surface the swept tool still
+        reaches 0.3938 past the part edge (0.425 at the ramp plane, where it is
+        cutting nothing).  Two parts 0.375 apart with the ramp pointing at the
+        gap are 0.019 short of that, and the verifier says so.  Nothing is
         written for those sheets.  This is why 0.455 is the default.
+
+        It is EVERY sheet of this order, and it is worth saying which pass makes
+        that true.  For half of 2026-08-05 it was a majority only: dropping the
+        onion skin left the through pass's at-depth loop reaching exactly 0.375 —
+        tangent, taking nothing out of a neighbour — so a sheet whose parts
+        neighbour each other away from the lead-in edge verified clean.  The
+        max-bite amendment later that day (Scott: at most 0.4 of material per T11
+        pass) put a roughing rung back at the measured 0.1895 offset, whose loop
+        sweeps 0.377, so the backstop is back and the whole order is refused
+        again at 0.375 (``tests/test_r0805_regression.SweptWidthBoundariesTest``
+        pins all three reaches).  The part gap itself is still enforced by
+        :data:`faceframe_cnc.nesting.MIN_PART_GAP` at optimize time, because a
+        pass ladder is a machining decision and could move again.
         """
         _result, _config, job = self.jobs[0.375]
         refused = [o for o in job.outcomes if not o.ok]
         self.assertTrue(refused, "0.375 cannot be cut; that is the whole finding")
+        self.assertEqual(
+            [o.filename for o in job.outcomes if o.ok],
+            [],
+            "every sheet of this order is refused at 0.375",
+        )
         for outcome in refused:
             with self.subTest(sheet=outcome.filename):
                 self.assertEqual(outcome.refusal_kind, "verifier")
                 self.assertTrue(
                     all("foreign-cut" in p for p in outcome.problems),
+                    outcome.problems,
+                )
+
+    def test_a_gap_tighter_than_the_through_pass_refuses_every_sheet(self):
+        """Below 0.375 the loop itself is inside the neighbour, not tangent.
+
+        The backstop that is left, stated on the fixture that needs no
+        assumptions about which way a neighbour lies (:data:`UNCUTTABLE_GAP`).
+        """
+        job = job_for(mixed_order())
+        refused = [o for o in job.outcomes if not o.ok]
+        self.assertTrue(refused)
+        for outcome in refused:
+            with self.subTest(sheet=outcome.filename):
+                self.assertTrue(
+                    any("foreign-cut" in p for p in outcome.problems),
                     outcome.problems,
                 )
 
@@ -247,7 +304,7 @@ class WdcSlotSectionTest(unittest.TestCase):
     def test_the_section_sits_after_t13_and_before_the_first_t11(self):
         heads = [line for line in self.lines if line.startswith("(ROUTE TOOL")]
         numbers = [int(re.match(r"\(ROUTE TOOL #(\d+)", h).group(1)) for h in heads]
-        self.assertEqual(numbers, [13, 17, 11, 12, 11])
+        self.assertEqual(numbers, [13, 17, 11, 12, 11, 12])
 
     def test_the_tool_block_is_verbatim_rfk0101n(self):
         body = self.section(17)
@@ -618,6 +675,16 @@ def nested_sample() -> tuple[NestingResult, NestingConfig]:
 
 
 class CuttingOrderTest(unittest.TestCase):
+    """The order in the emitted text, read back out of it.
+
+    Everything here is read against ``post_config_for(config)`` — the post
+    table the job was actually generated with, one perimeter pass since the
+    2026-08-05 amendment — and not against the measured table, which still
+    describes the references' two-pass dialect.  ``reconstruct_text`` needs
+    the same table for the same reason: a file's perimeter loops are matched
+    to the passes the table configures, and it refuses to guess.
+    """
+
     @classmethod
     def setUpClass(cls):
         cls.result, cls.config = nested_sample()
@@ -626,29 +693,54 @@ class CuttingOrderTest(unittest.TestCase):
         assert cls.outcome.ok, cls.outcome.describe()
         cls.text = cls.outcome.text
         cls.lines = cls.text.split("\r\n")
+        cls.post = post_config_for(cls.config)
+
+    def replan(self):
+        """``(program, plan)`` read back out of the emitted text."""
+        return reconstruct_text(self.text, self.post)
 
     def test_the_layout_used_here_is_itself_legal(self):
         self.assertEqual(validate_layouts(self.result, self.config), [])
 
-    def test_section_order_is_panel_openings_detail_perimeter(self):
+    def test_section_order_is_panel_openings_detail_perimeter_release(self):
+        """T13 -> T11 openings -> T12 detail -> T11 perimeter -> T12 RELEASE.
+
+        The last section is the 2026-08-05 amendment's tab release (spec §3c):
+        the same T12 as the detail pass, in the spindle a second time, and always
+        last because everything on the sheet is held until it has run.
+        """
         heads = [line for line in self.lines if line.startswith("(ROUTE TOOL")]
         numbers = [int(re.match(r"\(ROUTE TOOL #(\d+)", h).group(1)) for h in heads]
-        self.assertEqual(numbers, [13, 11, 12, 11])
+        self.assertEqual(numbers, [13, 11, 12, 11, 12])
 
     def test_every_opening_is_cut_before_any_perimeter(self):
         """Sections do it structurally; this checks the emitted Z words."""
-        cfg = default_config()
-        opening_z = f"Z{_fmt(cfg.openings_pass.z_cut)} "
+        cfg = self.post
+        opening_z = f"Z{_fmt(cfg.openings_passes[-1].z_cut)} "
         detail_z = f"Z{_fmt(cfg.detail_pass.z_cut)} "
-        skin_z = f"Z{_fmt(cfg.perimeter_passes[0].z_cut)} "
-        last_opening = max(
-            i for i, line in enumerate(self.lines) if opening_z in line or detail_z in line
+        perimeter_z = f"Z{_fmt(cfg.perimeter_passes[0].z_cut)} "
+        # Lead-in lines only (they start with G1): since the 2026-08-05
+        # amendment a tab lift's descent restates the same Z and feed as the
+        # lead-in, and the T12 RELEASE section plunges to the detail depth after
+        # the perimeter on purpose (spec §3c), so "the last line mentioning the
+        # detail Z" is no longer the last opening cut.
+        release_head = max(
+            i for i, line in enumerate(self.lines) if line.startswith("(ROUTE TOOL")
         )
-        first_perimeter = min(i for i, line in enumerate(self.lines) if skin_z in line)
+        last_opening = max(
+            i
+            for i, line in enumerate(self.lines[:release_head])
+            if line.startswith("G1 ") and (opening_z in line or detail_z in line)
+        )
+        first_perimeter = min(
+            i
+            for i, line in enumerate(self.lines)
+            if line.startswith("G1 ") and perimeter_z in line
+        )
         self.assertLess(last_opening, first_perimeter)
 
     def test_the_first_t11_section_cuts_the_nested_inners_own_openings(self):
-        program, plan = reconstruct_text(self.text)
+        program, plan = self.replan()
         parts = program.flat_parts()
         depths = part_depths(program)
         inners = {i for i, d in enumerate(depths) if d > 0}
@@ -666,7 +758,7 @@ class CuttingOrderTest(unittest.TestCase):
         )
 
     def test_openings_run_deepest_nesting_first(self):
-        program, plan = reconstruct_text(self.text)
+        program, plan = self.replan()
         depths = part_depths(program)
         order = [ref.part for ref in plan.openings]
         seen_shallow = False
@@ -676,47 +768,91 @@ class CuttingOrderTest(unittest.TestCase):
             elif seen_shallow:
                 self.fail("a nested inner's opening was cut after a host's")
 
-    def test_onion_skin_pass_one_finishes_before_pass_two_starts(self):
-        cfg = default_config()
-        skin = f"Z{_fmt(cfg.perimeter_passes[0].z_cut)} "
-        through = f"Z{_fmt(cfg.perimeter_passes[1].z_cut)} "
-        skin_lines = [i for i, line in enumerate(self.lines) if skin in line]
-        through_lines = [i for i, line in enumerate(self.lines) if through in line]
-        self.assertTrue(skin_lines and through_lines)
-        self.assertLess(
-            max(skin_lines),
-            min(through_lines),
-            "every part must be taken to the onion skin before any is cut free",
+    def test_the_perimeter_runs_the_max_bite_ladder_and_no_onion_skin(self):
+        """Both 2026-08-05 amendments, read off the emitted text.
+
+        Scott's decision at the milestone-1 check-in (spec §3b): the 0.06 skin
+        pass held every part while the rest of the sheet was cut, the parts are
+        tab-held from milestone 2b on, so the skin has no job left.  His decision
+        later the same day: the 3/8 comp may take at most 0.4 of material per
+        pass, "to reduce the load on it", so the 0.756 the through pass was left
+        with becomes two equal 0.378 bites — Z0.372 then Z-0.006.
+
+        So a generated sheet cuts each perimeter TWICE, but at neither of the
+        measured two-pass dialect's depths, and the skin's Z0.06 appears nowhere.
+        The measured table still carries both of its passes for the reference
+        programs, which is why every number below is read off the table the job
+        used.
+        """
+        cfg = self.post
+        self.assertEqual([spec.z_cut for spec in cfg.perimeter_passes], [0.372, -0.006])
+        depth = cfg.stock_top_z - cfg.perimeter_passes[-1].z_cut
+        limit = cfg.tool("perimeter").max_bite
+        self.assertEqual(limit, 0.4)
+        for position, spec in enumerate(cfg.perimeter_passes):
+            floor = cfg.stock_top_z if position == 0 else cfg.perimeter_passes[
+                position - 1
+            ].z_cut
+            with self.subTest(perimeter_pass=position + 1):
+                self.assertAlmostEqual(floor - spec.z_cut, depth / 2.0, 9)
+                self.assertLessEqual(floor - spec.z_cut, limit)
+        skin = default_config().perimeter_passes[0]
+        self.assertNotIn(
+            f"Z{_fmt(skin.z_cut)} ",
+            self.text,
+            "no cutting move may be made at the old skin depth",
         )
 
-    def test_pass_two_frees_every_inner_before_any_host(self):
-        program, plan = reconstruct_text(self.text)
+        program, plan = self.replan()
+        self.assertEqual(len(plan.perimeter), 2)
+        for refs in plan.perimeter:
+            self.assertEqual(len(refs), len(program.flat_parts()))
+        # Lead-ins only: a tab lift descends back to the same depth at the same
+        # entry feed (spec §3b), so the bare string appears once per tab too.
+        for spec in cfg.perimeter_passes:
+            needle = f"Z{_fmt(spec.z_cut)} F150."
+            lead_ins = [
+                line
+                for line in self.lines
+                if line.startswith("G1 ") and needle in line
+            ]
+            with self.subTest(z_cut=spec.z_cut):
+                self.assertEqual(
+                    len(lead_ins),
+                    len(program.flat_parts()),
+                    "one lead-in per part per rung, and only one",
+                )
+
+    def test_the_through_pass_frees_every_inner_before_any_host(self):
+        """The onion-skin order's pass-2 rule, now the ladder's last rung.
+
+        Whatever the ladder is, the LAST pass is the one that cuts an outline
+        right through, so it is the one that has to take every nested inner
+        before any host; the rungs above it only score, and run canonically.
+        """
+        program, plan = self.replan()
         depths = part_depths(program)
         self.assertEqual(len(plan.perimeter), 2)
+        self.assertEqual(
+            [ref.part for ref in plan.perimeter[0]],
+            list(range(len(program.flat_parts()))),
+            "the roughing rung runs in canonical order",
+        )
 
-        first = [ref.part for ref in plan.perimeter[0]]
-        second = [ref.part for ref in plan.perimeter[1]]
-        self.assertEqual(sorted(first), list(range(len(program.flat_parts()))))
-        self.assertEqual(sorted(second), sorted(first))
+        order = [ref.part for ref in plan.perimeter[-1]]
+        self.assertEqual(sorted(order), list(range(len(program.flat_parts()))))
 
-        inner_positions = [i for i, part in enumerate(second) if depths[part] > 0]
-        host_positions = [i for i, part in enumerate(second) if depths[part] == 0]
+        inner_positions = [i for i, part in enumerate(order) if depths[part] > 0]
+        host_positions = [i for i, part in enumerate(order) if depths[part] == 0]
         self.assertTrue(inner_positions and host_positions)
         self.assertLess(
             max(inner_positions),
             min(host_positions),
-            "pass 2 must free every nested frame before any outer part",
-        )
-
-    def test_pass_one_uses_the_plain_canonical_order(self):
-        program, plan = reconstruct_text(self.text)
-        self.assertEqual(
-            [ref.part for ref in plan.perimeter[0]],
-            list(range(len(program.flat_parts()))),
+            "the freeing pass must free every nested frame before any outer part",
         )
 
     def test_grooves_are_stiles_then_rails_per_part_in_canonical_order(self):
-        program, plan = reconstruct_text(self.text)
+        program, plan = self.replan()
         parts = program.flat_parts()
         got = [(ref.part, ref.index) for ref in plan.panel]
         want = [
@@ -728,7 +864,7 @@ class CuttingOrderTest(unittest.TestCase):
         self.assertFalse(any(ref.reverse for ref in plan.panel))
 
     def test_no_lead_in_override_leaks_out_of_the_reference_files(self):
-        _program, plan = reconstruct_text(self.text)
+        _program, plan = self.replan()
         overrides = [ref for ref in plan.openings if ref.entry is not None]
         overrides += [
             ref for refs in plan.perimeter for ref in refs if ref.entry is not None
@@ -766,13 +902,12 @@ class NamingAndBannerTest(unittest.TestCase):
         """The sheet index is on the operator's paperwork, so a refusal
         leaves a gap in the FILES rather than shifting every later sheet.
 
-        The default gap generates everything, so this needs the 0.375 job,
-        which the verifier refuses sheet by sheet.
+        The default gap generates everything, so this needs a job with both
+        kinds of sheet in it (:func:`mixed_order`).
         """
-        tight, _config = nested_order(0.375)
-        job = job_for(tight)
+        job = job_for(mixed_order())
         refused = [o.sheet_index for o in job.outcomes if not o.ok]
-        self.assertTrue(refused, "0.375 must still be refused")
+        self.assertTrue(refused, "the too-tight pair must still be refused")
         indices = [o.sheet_index for o in job.outcomes]
         self.assertEqual(indices, list(range(1, len(indices) + 1)))
         self.assertTrue(any(o.ok for o in job.outcomes))
@@ -803,7 +938,13 @@ class NamingAndBannerTest(unittest.TestCase):
         self.assertTrue(any(line.startswith("(CONTENTS:") for line in banner))
         for name, count in outcome.contents.items():
             self.assertIn(f"{count}x{name}", " ".join(banner))
-        self.assertEqual([str(v) for v in verify(outcome.text)], [])
+        # Against the table the sheet was GENERATED with: a generated sheet runs
+        # one perimeter pass and a T12 release section since the 2026-08-05
+        # amendment, and the verifier judges depths and feeds against the table
+        # in its hand (post_config_for), not against the measured reference one.
+        self.assertEqual(
+            [str(v) for v in verify(outcome.text, post_config_for(self.config))], []
+        )
 
     def test_the_banner_reports_nested_frames(self):
         job = job_for(self.result)
@@ -880,6 +1021,32 @@ class NamingAndBannerTest(unittest.TestCase):
 # --------------------------------------------------------------------------
 
 
+
+def feed_word(line: str) -> float | None:
+    """The F value on ``line``, or ``None`` when it states no feed."""
+    match = re.search(r"\bF(\d+(?:\.\d*)?)", line)
+    return None if match is None else float(match.group(1))
+
+
+def without_tab_lifts(text: str) -> list[str]:
+    """``text``'s lines with every tab lift taken out (2026-08-05 amendment §3b).
+
+    A lift is four moves — cut on to the foot of the climb, climb to the tab top,
+    traverse it, descend back to depth — and the CLIMB is the only line in the
+    program that commands the tab top's Z, which makes the block findable without
+    re-deriving where any tab is.  Used to compare an air cut against its
+    production twin: an air cut lifts over nothing, because every one of its
+    depths is above the stock and there is no standing material up there.
+    """
+    top = f" Z{_fmt(default_config().tabs.top_z)}"
+    lines = text.split("\r\n")
+    drop: set[int] = set()
+    for index, line in enumerate(lines):
+        if line.endswith(top):
+            drop.update({index - 1, index, index + 1, index + 2})
+    assert drop, "no tab lift found: this helper is measuring the wrong thing"
+    return [line for index, line in enumerate(lines) if index not in drop]
+
 class DryRunTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -927,8 +1094,22 @@ class DryRunTest(unittest.TestCase):
         codes = {v.code for v in verify(sabotaged, air)}
         self.assertIn("dry-run", codes)
 
-    def test_only_the_z_words_and_ramp_lengths_move(self):
-        """Same tools, feeds, speeds and section structure as production."""
+    def test_only_the_z_words_ramp_lengths_and_the_tab_lifts_move(self):
+        """Same tools, feeds, speeds and section structure as production.
+
+        Two things the lift changes, and no others.  The Z words (and the ramp
+        lengths those imply) are the point of an air cut.  The TAB LIFTS are the
+        second, and they are gone rather than lifted: a tab is 0.25" of standing
+        material and every cut in this program is a foot and a half above the
+        stock, so there is nothing to rise over and rising would mean DESCENDING
+        (:func:`~faceframe_cnc.post.tabs.lifts_over_tabs`).  The release section
+        itself is lifted like every other one and traces exactly the production
+        XY path, which the slot-path test below states for the whole order.
+
+        So the feed counts are compared against the production program re-emitted
+        from the SAME plan with the tabs taken out — an exact statement, rather
+        than a looser assertion that would stop noticing a feed that moved.
+        """
         def skeleton(text):
             return [
                 line
@@ -940,12 +1121,84 @@ class DryRunTest(unittest.TestCase):
             ]
 
         self.assertEqual(skeleton(self.air.text), skeleton(self.production.text))
-        for feed in ("F150.", "F545.", "F490.", "F498.2", "F293.", "F100."):
-            self.assertEqual(
-                self.air.text.count(feed),
-                self.production.text.count(feed),
-                feed,
+
+        # The tab lifts, stated as the difference they are: the tab top's Z is
+        # the only Z0.25 in the program, so its presence in one text and absence
+        # from the other IS the second difference, and there is no third.
+        top = f" Z{_fmt(default_config().tabs.top_z)}"
+        self.assertIn(top, self.production.text, "production stands its tabs up")
+        self.assertNotIn(
+            top,
+            self.air.text,
+            "an air cut lifts over nothing: every depth is above the stock, so "
+            "rising to the tab top would be a DESCENT",
+        )
+
+        # Line for line against the production program with its lift blocks taken
+        # out.  The air cut carries one extra line, its own banner; every other
+        # line pairs up, and the only feed difference allowed is a cutting feed a
+        # tab's descent forced the production file to restate.
+        flat = without_tab_lifts(self.production.text)
+        air = [line for line in self.air.text.split("\r\n") if "DRY RUN" not in line]
+        self.assertEqual(len(flat), len(air), "line for line, the lifts aside")
+        feeds = {
+            spec.cut_feed
+            for spec in (
+                *default_config().openings_passes,
+                default_config().detail_pass,
+                *post_config_for(self.config).perimeter_passes,
             )
+        }
+        restated = 0
+        for lifted, lifted_air in zip(flat, air):
+            here, there = feed_word(lifted), feed_word(lifted_air)
+            with self.subTest(production=lifted, air=lifted_air):
+                if there is not None:
+                    self.assertEqual(here, there, "the air cut invents no feed")
+                elif here is not None:
+                    self.assertIn(here, feeds, "and adds only a restated cut feed")
+                    restated += 1
+        self.assertTrue(restated, "the restatements are what the lifts leave behind")
+
+    def test_the_release_section_traces_the_production_xy_exactly(self):
+        """Spec §3c/§3d: the lift moves the release section's Z and nothing else.
+
+        The release span is derived from the tab top and the post's Z FLOOR
+        (:func:`~faceframe_cnc.post.tabs.release_ramp`) rather than from the
+        depths of the passes that lifted, precisely so that this holds: an air
+        table has no lifting pass at all, and a release cut sized from one would
+        come out shorter than the production cut it is rehearsing.
+        """
+        from faceframe_cnc.post.generator import emit
+        from faceframe_cnc.post.model import SECTION_RELEASE
+
+        post = post_config_for(self.config)
+        air = dry_run_config(post)
+        layout = self.result.unique_sheets[0][0]
+        program, plan = plan_sheet(
+            layout,
+            ProgramHeader(name="R990101N", created=CREATED),
+            self.result.demand,
+            self.config,
+            post,
+        )
+        self.assertTrue(plan.release, "the sheet has a release section to compare")
+
+        def cuts(cfg):
+            return [
+                (round(m.to_x, 4), round(m.to_y, 4), m.feed)
+                for m in emit(program, plan, cfg).motions
+                if m.section == SECTION_RELEASE
+            ]
+
+        self.assertEqual(cuts(post), cuts(air))
+        depths = {
+            m.to_z
+            for m in emit(program, plan, air).motions
+            if m.section == SECTION_RELEASE and m.feed == air.release.cut_feed
+        }
+        self.assertEqual(depths, {air.release_z})
+        self.assertGreater(air.release_z, air.stock_top_z, "and it is an air cut")
 
     def test_the_depths_are_derived_from_the_measured_table(self):
         cfg = default_config()
@@ -953,7 +1206,7 @@ class DryRunTest(unittest.TestCase):
         top = cfg.stock_top_z
         for real, lifted in (
             (cfg.panel.z_cut, air.panel.z_cut),
-            (cfg.openings_pass.z_cut, air.openings_pass.z_cut),
+            (cfg.openings_passes[-1].z_cut, air.openings_passes[-1].z_cut),
             (cfg.detail_pass.z_cut, air.detail_pass.z_cut),
         ):
             self.assertAlmostEqual(lifted, 2 * top - real)
@@ -980,8 +1233,17 @@ class DryRunTest(unittest.TestCase):
 
 
 def crowded_sheet() -> tuple[NestingResult, NestingConfig]:
-    """Two parts exactly 0.375 apart: legal to the packer, too tight for the
-    perimeter lead-in's swept tool (0.425)."""
+    """Two parts exactly 0.375 apart, side by side in X: legal to the packer,
+    too tight for the perimeter lead-in.
+
+    The order of the two placements matters and is not incidental: the lead-in
+    enters on the RIGHT edge by default, so the left part's ramp is what
+    reaches into the gap (0.3938 where it breaks the surface, vs the 0.375 the
+    at-depth loop sweeps).  Since the 2026-08-05 amendment removed the
+    onion-skin pass, that ramp is the only thing that refuses this sheet —
+    stacking the same two parts in Y would verify clean at 0.375
+    (``tests/test_r0805_regression.SweptWidthBoundariesTest``).
+    """
     config = NestingConfig(part_gap=0.375)
     layout = SheetLayout(
         [
@@ -1870,19 +2132,25 @@ class PlanShapeTest(unittest.TestCase):
         )
 
     def test_grooves_use_the_measured_insets(self):
+        """The insets are measured and unchanged; the stile groove's ENDS are
+        clamped inside the part (2026-08-05 amendment, job R0805) so the swept
+        cut finishes flush with the part edge instead of 0.69 past it."""
         from faceframe_cnc.post.generator import groove_segment
+        from faceframe_cnc.post.model import SECTION_PANEL
 
         program = self.program()
         part = program.flat_parts()[0]
-        panel = default_config().panel
-        stile_low, _ = groove_segment(part, 0, panel)
-        rail_low, rail_high = groove_segment(part, 1, panel)
+        config = default_config()
+        panel = config.panel
+        radius = config.tool(SECTION_PANEL).radius
+        stile_low, stile_low_end = groove_segment(part, 0, panel, radius)
+        rail_low, rail_high = groove_segment(part, 1, panel, radius)
         self.assertAlmostEqual(stile_low[0], part.box.x0 + 0.5625)
         self.assertAlmostEqual(rail_low[1], part.box.y0 + 0.9375)
         self.assertAlmostEqual(rail_low[0], part.box.x0 + 0.5625)
         self.assertAlmostEqual(rail_high[0], part.box.x1 - 0.5625)
-        _, stile_high_end = groove_segment(part, 0, panel)
-        self.assertAlmostEqual(stile_high_end[1], part.box.y1 + 0.375)
+        self.assertAlmostEqual(stile_low[1], part.box.y0 + radius)
+        self.assertAlmostEqual(stile_low_end[1], part.box.y1 - radius)
 
     def test_every_part_gets_four_grooves_and_every_opening_is_planned(self):
         program = self.program()
@@ -1983,9 +2251,9 @@ class MilestoneAcceptanceTest(unittest.TestCase):
                     for m in re.findall(r"\(ROUTE TOOL #(\d+):", outcome.text)
                 ]
                 if has_wdc(outcome.contents):
-                    self.assertEqual(heads, [13, 17, 11, 12, 11])
+                    self.assertEqual(heads, [13, 17, 11, 12, 11, 12])
                 else:
-                    self.assertEqual(heads, [13, 11, 12, 11])
+                    self.assertEqual(heads, [13, 11, 12, 11, 12])
 
     def test_every_wdc_frame_on_every_sheet_gets_two_slots_of_two_passes(self):
         job = job_for(self.result)

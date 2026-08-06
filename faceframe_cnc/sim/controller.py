@@ -265,7 +265,9 @@ class SimController:
             self._state_cuts = 0
         while self._state_cuts < target:
             self._state = self._state.apply(
-                timeline.cuts[self._state_cuts], timeline.last_perimeter_pass
+                timeline.cuts[self._state_cuts],
+                timeline.last_perimeter_pass,
+                timeline.tab_held,
             )
             self._state_cuts += 1
         return self._state

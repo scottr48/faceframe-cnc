@@ -54,21 +54,28 @@ What is checked
 ``bounds``        every commanded X/Y lies within the sheet plus the
                   measured 0.375 trim overhang.
 ``part-bounds``   every recovered part footprint lies on the sheet.
-``foreign-cut``   no cutting move's tool CENTRE enters another part's solid
-                  (footprint minus its openings, so a nested inner cut free
-                  inside its host's opening is legal), and no THROUGH cut's
-                  swept tool width does either.  The swept rule is limited
-                  to through cuts because the references do not respect it
-                  for shallow ones: R710101N line 44-47 runs a T13 groove
-                  0.375 past a part edge, which puts 0.235 of the 0.6299
-                  tool body over the neighbour's stile at 0.20 depth.
+``foreign-cut``   no cutting move's SWEPT WIDTH (its tool centre grown by the
+                  tool's radius) enters another part's solid (footprint minus
+                  its openings, so a nested inner cut free inside its host's
+                  opening is legal), and a cut that goes right THROUGH the
+                  sheet may not enter ANY part's solid, its own included.
+                  See "The shallow-cut waiver, and why it is gone" below —
+                  this rule changed on 2026-08-05 and it is the change that
+                  now refuses two of the reference files.
 ``v-slot``        the 45-degree T17 slot, judged on the cone it actually
                   sweeps rather than on its centreline (see below).  V-bit
                   moves are excluded from ``foreign-cut`` so that one rule
                   owns them.
 ``geometry``      every cut happens at a Z the post knows (panel groove,
-                  WDC slot pass, opening, detail or a configured perimeter
-                  pass) and every closed loop closes.
+                  WDC slot pass, a configured opening or perimeter depth
+                  pass, or the detail pass) and every closed loop closes.
+``max-bite``      no pass removes more material than its tool is allowed to
+                  in one bite — the 2026-08-05 ratified policy for the 3/8
+                  compression bit (0.4", Scott: "that will help reduce the
+                  load on it").  Judged both on the configured pass ladder
+                  and on the ladder the FILE cuts, re-derived from the text
+                  (see "The bite limit" below).  Silent for a table that
+                  declares no limit, which is every measured one.
 ``missing-cut``   a cut the sheet's layout calls for is not in the file.
 ``extra-cut``     a cut is in the file that the layout does not call for.
 ``cut-order``     the cuts are in the file but in an order that would drop a
@@ -76,7 +83,15 @@ What is checked
                   three are checked ONLY when the caller hands :func:`verify`
                   an :class:`ExpectedWork` manifest (see below); with
                   ``expected=None`` the file is judged entirely on its own,
-                  exactly as it always was.
+                  exactly as it always was.  The RELEASE section's own three
+                  ordering rules are the exception — they need no manifest,
+                  because the file states everything they are about.
+``hold``          the hold invariant of the 2026-08-05 amendment: on a
+                  tab-held sheet nothing may be fully separated before the
+                  final T12 release section, and the release must then free
+                  every remaining bridge exactly once, flush with the
+                  finished profile, at the ratified release feeds.  See
+                  "Nothing is freed early" below.  Needs no manifest.
 
 Rapids (2026-08-04 review, fix 1)
 ---------------------------------
@@ -111,13 +126,95 @@ verified clean before this check.
 Three relations, all derived from the manifest (which is derived from the
 layout), all judged on the line the matched cut appears on:
 
-a)  per part, the onion-skin perimeter pass before the through pass;
+a)  per part, the onion-skin perimeter pass before the through pass — for a
+    config that HAS a skin pass.  The measured two-pass table does (and the
+    reference programs are judged against it); a generated sheet's table has
+    carried one through pass and no skin since the 2026-08-05 amendment
+    (Scott, job R0805 — :func:`~.from_layout.generated_post_passes`), and then
+    there is no such pair and this rule has nothing to demand.  Rules (b) and
+    (c) are unaffected either way, so the order of a single-pass program is
+    still checked, just not for a pass it does not run;
 b)  per host/inner pair, the inner's through pass before the host's;
 c)  per part, its through perimeter pass is the LAST cut of that part —
     once a part is free, nothing may cut it again.
 
 All three hold in R710101N, R720101N and R730101N (checked from the files,
 not assumed) and in every sheet the planner generates.
+
+Rule (c) is worth restating since the 2026-08-05 amendment, because its old
+name for the through pass — "the pass that frees the part" — is no longer true
+of a tab-held sheet: there the through pass cuts the outline right through and
+the part is still held by its tabs, and what frees it is the release section.
+The rule itself is unchanged and still worth having (nothing in the MANIFEST may
+touch a part after its outline has been cut through, whether or not tabs are
+still holding it), and the release cuts are deliberately not among the cuts it
+judges — they come after by design, which is the next section.
+
+Nothing is freed early (2026-08-05 amendment, Scott, job R0805, spec §3d)
+------------------------------------------------------------------------
+Two frames came off the machine broken on 05 AUG 26 because the sheet came apart
+as it was cut: every opening dropout was fully freed before the perimeter was
+touched, so the T11 finished the job on a thin, loose MDF ring.  The fix is that
+a generated sheet is held everywhere by 0.25" tabs and cut free by a final slow
+T12 release section, and this is the rule that proves a finished program really
+does that.
+
+``hold`` re-derives the tabs INDEPENDENTLY, which is the whole point.  It does
+not ask :mod:`~.tabs` where they were placed (an AST test forbids the import),
+does not count them and does not reproduce a line of the placement arithmetic.
+It asks one question per side of every profile the program cuts right through:
+*which parts of this side did the tool take below the tab top?*  Each move is
+split at the Z where it crosses :attr:`~.model.TabSpec.top_z` — the same
+:func:`_z_span` the material rules split a descending ramp with — projected onto
+the side it runs along and clipped to it; the union of those intervals is the
+boundary that pass severed, and every GAP in it is material still holding the
+piece on.  A loop that lifted nowhere reports no gaps, which is exactly the
+"freed early" case, and the traverse along a tab's crest is commanded at exactly
+the tab top, which is why the comparison is strictly below it.
+
+Then, per bridge: exactly one release cut must remove it, that cut must run on
+the profile's FLUSH path (the finished edge offset into the waste by the release
+tool's radius — checked numerically, which is what refuses the centreline release
+spec §8 forbids), reach the through depth, and run at the release pass's own
+feeds.  The feeds need their own check because :func:`_check_feeds` judges a tool
+against the whole set of feeds its table gives it, deliberately, and T12 now has
+two operations: a release cut at the detail pass's 293 ipm would pass that rule
+and is exactly what "very slowly" rules out.
+
+Three ordering rules come with it, all judged on line numbers and all
+manifest-free: the release section is LAST, every opening's tabs are released
+before any perimeter's, and a nested inner frame's before its host's.
+
+When the rule is silent, and why that is not a hole: an untabbed post table
+(:attr:`~.model.PostConfig.release` unset — the MEASURED table, which is what
+the reference programs are judged against) has no release pass, no tabs and no
+bridges, and judging R710101N by a rule its own CAM never had would refuse three
+files this repo keeps as evidence.  An AIR cut is silent for a more literal
+reason: every one of its depths is above the stock, so it removes nothing, holds
+nothing and frees nothing.  A generated sheet's table always configures the
+release pass, so a generated program is always judged — and the manifest adds
+the one fact the file cannot know on its own, that this sheet OWES a release
+section at all (:attr:`ExpectedWork.release`).
+
+The bite limit (2026-08-05, Scott, ratified policy)
+--------------------------------------------------
+"When the 3/8 comp (T11) is being used, only let it take a maximum of 0.4 inch
+of material per pass.  That will help reduce the load on it."  The generated
+post table declares that on the tool
+(:attr:`~.model.ToolSpec.max_bite`, set in one place —
+:func:`~.from_layout.generated_tools`) and builds its perimeter and opening
+passes as ladders of equal bites underneath it.
+
+``max-bite`` is the independent half.  It reads the limit off the table in hand
+and then re-derives, from the FILE, how much material each pass actually took:
+loops are grouped by the feature they leave behind (each loop's own path taken
+back by its own pass offset), the group's depths are walked down from the stock
+surface, and every step has to be inside the limit.  A dropped rung, a ladder
+emitted in the wrong order so the deep pass cuts alone, or a post table that
+asks for a 0.756 bite in the first place are all refusals; a table that declares
+no limit — :func:`~.model.default_config`, and so every reference program — is
+not judged, because the rule is a decision about a bit and not a fact measured
+off those files.
 
 Foreign cuts and MISSING cuts (2026-08-04 review)
 -------------------------------------------------
@@ -126,10 +223,11 @@ of them can answer "does this file do everything it must?", because a
 re-parse only ever sees what is there.  Three ways a program can be
 catastrophically wrong and still pass every rule above, all real:
 
-*   drop each part's full-depth perimeter pass but keep the onion-skin
-    pass.  Every part is still recovered (from the shallow loop), every
-    coordinate is still legal, and the machine leaves the whole sheet
-    attached at 0.06 of skin;
+*   drop each part's full-depth perimeter pass.  With the measured two-pass
+    table the onion-skin pass still recovers every part (from the shallow
+    loop), every coordinate is still legal, and the machine leaves the whole
+    sheet attached at 0.06 of skin; with the one-pass table a generated sheet
+    now uses, the perimeter section is simply gone and nothing else notices;
 *   drop one opening's T11 and T12 loops.  The verifier then reads that
     area as solid frame — and agrees with itself about it;
 *   drop a WDC's T17 slots, or a frame's T13 groove.  Nothing is out of
@@ -194,10 +292,43 @@ cutting into its neighbour by a ramp segment physically above it.
 So a move is now split along its own Z profile.  Z varies linearly with
 travel, so "the part of this move at or below the stock top" and "the part of
 it through the stock" are each one contiguous sub-segment, and each is judged
-on its own: the through part with the tool's swept width, the part in the
-material but not through on its tool centre (the shallow-cut waiver above),
-and the part above the stock not at all, because up there the bit is not
+on its own — both on the tool's swept width since 2026-08-05 (below) — while
+the part above the stock is not judged at all, because up there the bit is not
 touching anything.
+
+The shallow-cut waiver, and why it is gone (2026-08-05, Scott, job R0805)
+------------------------------------------------------------------------
+Until 05 AUG 26 the sub-segment that was in the material but NOT through the
+sheet was judged on its tool CENTRE only.  The stated reason was that the
+reference files do not respect a swept-width rule for shallow cuts:
+``R710101N`` lines 44-47 run a T13 groove the measured 0.375 past a part edge,
+which puts 0.235 of the 0.6299 panel cutter over the neighbour's stile at 0.20
+depth.  That was recorded as a deliberate design decision — "it mirrors the
+reference files and current production" — and it was wrong.
+
+Job **R0805** (sheet ``R080501N.anc``, one W3330 beside one WDC2436, the parts
+0.455 apart) proved it: the W3330's stile groove overran 0.375 at the
+centreline, the cut reached 0.690 past the part, and the panel cutter took two
+half-round bites 0.235 deep into the WDC frame's right stile.  This verifier
+returned NO findings on that sheet, which is the only reason it reached the
+machine.  So the waiver is closed: every sub-segment that reaches the material
+is now judged on the swept width, against every FOREIGN part's solid.
+
+The own part stays exempt for a shallow cut — that exemption is what lets a
+T13 groove cut its own part, which is the whole reason it exists — and stays
+NOT exempt for a through cut (2026-08-04, fix 12).  Nothing else about the
+rule moved: the narrowest change that refuses R0805 is the one made, because a
+swept width entering a finished neighbour is the thing that cut the divots.
+
+The cost, stated plainly rather than papered over: ``R710101N`` and
+``R730101N`` contain the same cut with the same numbers, so this rule now
+refuses BOTH of them (five findings each; ``R720101N`` is unaffected, its
+parts being nested rather than shoulder to shoulder).  They are pre-amendment
+files and they are documentation, not output — the shop has been taking a
+0.235 x 0.63 divot 0.20 deep out of a neighbour's outer stile on every one of
+those sheets.  ``tests/test_post.py`` pins exactly which cuts in which files
+(``LEGACY_GROOVE_FOREIGN_CUTS``) so that nothing else on a reference file can
+regress unnoticed behind this.
 
 Feeds and spindle speeds (2026-08-04, owner-approved follow-up)
 --------------------------------------------------------------
@@ -273,6 +404,7 @@ one tool, one set of its own feeds, is the rule the owner approved.
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 
@@ -282,7 +414,9 @@ from .model import (
     SECTION_OPENINGS,
     SECTION_PANEL,
     SECTION_PERIMETER,
+    SECTION_RELEASE,
     SECTION_WDC_SLOT,
+    SIDES,
     Box,
     PostConfig,
     default_config,
@@ -462,9 +596,17 @@ def verify(
 
     parts, found, geometry_problems = _recover_parts(moves, cfg)
     problems.extend(geometry_problems)
+    # The bite limit is judged against the table in hand, like every other rule
+    # here, and is silent for a table that declares none (every measured one).
+    problems.extend(_check_bites(found, cfg))
     problems.extend(_check_part_bounds(parts, cfg))
     problems.extend(_check_foreign_cuts(moves, parts, cfg))
     problems.extend(_check_v_slot_cuts(moves, parts, cfg))
+    # The hold invariant, when the post table in hand runs a release pass.  An
+    # AIR cut is exempt: it removes nothing, so it holds nothing and frees
+    # nothing, and there is no bridge up there to re-derive.
+    if cfg.release is not None and not cfg.dry_run:
+        problems.extend(_check_hold(moves, cfg))
     if expected is not None:
         problems.extend(_check_expected_work(found, expected))
 
@@ -1091,6 +1233,7 @@ _OPERATION_NAMES = {
     SECTION_OPENINGS: "opening through-cut",
     SECTION_DETAIL: "opening finish pass",
     SECTION_PERIMETER: "perimeter pass",
+    SECTION_RELEASE: "tab release cut",
 }
 
 
@@ -1117,11 +1260,27 @@ def _operations(cfg: PostConfig) -> list[tuple[int, str, object]]:
 
     add(SECTION_PANEL, cfg.panel)
     add(SECTION_WDC_SLOT, cfg.wdc_slot)
-    add(SECTION_OPENINGS, cfg.openings_pass)
+    # Both T11 operations can be a ladder of depth passes (the 2026-08-05
+    # max-bite amendment), and every rung is an operation with its own two
+    # feeds — which in practice are the same two on every rung, since a ladder
+    # reuses a measured pass's feeds rather than inventing one.
+    openings_total = len(cfg.openings_passes)
+    for position, spec in enumerate(cfg.openings_passes):
+        add(
+            SECTION_OPENINGS,
+            spec,
+            "" if openings_total == 1 else f" {position + 1} of {openings_total}",
+        )
     add(SECTION_DETAIL, cfg.detail_pass)
     total = len(cfg.perimeter_passes)
     for position, spec in enumerate(cfg.perimeter_passes):
         add(SECTION_PERIMETER, spec, f" {position + 1} of {total}")
+    # The 2026-08-05 release pass, and only when the table configures one: the
+    # measured table names T12 for the section (one tool, named once) but runs no
+    # release, and a rule that read the tool alone would quietly allow the
+    # release feeds in a reference program that has no release section.
+    if cfg.release is not None:
+        add(SECTION_RELEASE, cfg.release)
     return out
 
 
@@ -1410,6 +1569,149 @@ def _cut_runs(moves: list[_Move]) -> list[list[_Move]]:
     return runs
 
 
+def _known_depths(cfg: PostConfig) -> dict[float, tuple[str, float]]:
+    """``{machine Z -> (what a cut at it is, that pass's tool-centre offset)}``.
+
+    The only thing a re-parse has to go on when it meets a cutting run is the Z
+    word, so this is the table that turns a Z into a kind — and, for the profile
+    kinds, into the offset that takes the cut path back to the feature it was
+    cutting.  Straight cuts (the T13 groove, the T17 slot passes) carry no
+    footprint to recover and so no offset; where they are allowed to REACH is
+    :func:`_check_v_slot_cuts` / :func:`_check_foreign_cuts`.
+
+    Both T11 operations can be a LADDER of depth passes since the 2026-08-05
+    max-bite amendment, so both are walked; the rungs of one ladder never share a
+    Z with the rungs of the other (openings 0.45/0.15, perimeters 0.372/-0.006),
+    which is what lets one flat mapping name them all.
+    """
+    known = {round(cfg.panel.z_cut, 9): ("groove", 0.0)}
+    for z_cut in cfg.wdc_slot.z_cuts:
+        known[round(z_cut, 9)] = ("slot", 0.0)
+    for spec in cfg.openings_passes:
+        known[round(spec.z_cut, 9)] = ("opening", spec.offset)
+    known[round(cfg.detail_pass.z_cut, 9)] = ("detail", cfg.detail_pass.offset)
+    for spec in cfg.perimeter_passes:
+        known[round(spec.z_cut, 9)] = ("perimeter", spec.offset)
+    return known
+
+
+#: Which post-table section a recovered profile cut belongs to, and so whose
+#: tool (and whose :attr:`~.model.ToolSpec.max_bite`) judges it.
+_SECTION_OF_KIND = {
+    "opening": SECTION_OPENINGS,
+    "detail": SECTION_DETAIL,
+    "perimeter": SECTION_PERIMETER,
+}
+
+
+def _check_bites(
+    found: list[_FoundCut], cfg: PostConfig
+) -> list[Violation]:
+    """No cutting pass may remove more material than its tool is allowed to.
+
+    RATIFIED POLICY, Scott 2026-08-05: the 3/8 compression bit takes at most
+    :attr:`~.model.ToolSpec.max_bite` (0.4) of material per pass, "to reduce the
+    load on it" — see :data:`~.from_layout.T11_MAX_BITE`.  A tool whose table
+    entry declares no limit is not judged here at all, which is every tool in
+    the MEASURED table and so every reference program.
+
+    Two halves, and the second is the one that matters:
+
+    *   the CONFIGURED ladder.  Each of a tool's configured depth passes must be
+        within the limit of the floor the pass before it left, starting from the
+        top of the stock.  A post table that asks for a 0.756 bite is refused
+        before its geometry is even looked at, once, globally;
+    *   the ladder the FILE actually cuts, re-derived from the text: every
+        closed loop is grouped with the other loops that cut the SAME feature
+        (its own path taken back by its own pass offset — the same recovery
+        :func:`_recover_parts` does), and the group is then walked IN THE ORDER
+        THE FILE CUTS IT, each rung's bite measured from the floor the ones
+        before it left.  That is what catches an emitter that dropped a rung, or
+        emitted the ladder deep-rung-first so that one pass takes the whole cut
+        and the other takes nothing.
+
+    A pass ABOVE the floor it starts from has a negative bite and so can never
+    exceed the limit, which is what makes an air cut
+    (:func:`~.job.dry_run_config`, every depth mirrored above the surface) silent
+    here without this rule needing to know it is one: up there the bit removes
+    nothing, and there is no load to reduce.
+    """
+    problems: list[Violation] = []
+    top = cfg.stock_top_z
+
+    ladders = [
+        (SECTION_OPENINGS, "opening", cfg.openings_passes),
+        (SECTION_PERIMETER, "perimeter", cfg.perimeter_passes),
+        (SECTION_DETAIL, "opening finish", (cfg.detail_pass,)),
+        (SECTION_PANEL, "panel groove", (cfg.panel,)),
+    ]
+    for section, what, passes in ladders:
+        tool = cfg.tools.get(section)
+        if tool is None or tool.max_bite is None:
+            continue
+        floor = top
+        for position, spec in enumerate(passes):
+            bite = floor - spec.z_cut
+            if bite > tool.max_bite + TOL:
+                problems.append(
+                    Violation(
+                        "max-bite",
+                        f"the post table's {what} pass {position + 1} of "
+                        f"{len(passes)} cuts from Z{_zword(floor)} to "
+                        f"Z{_zword(spec.z_cut)}, a bite of {bite:g} - T{tool.number} "
+                        f"is allowed at most {tool.max_bite:g} of material per pass, "
+                        f"so this table would have to be cut in more passes",
+                    )
+                )
+            floor = min(floor, spec.z_cut)
+
+    known = _known_depths(cfg)
+    #: ``(kind, recovered feature) -> [(z, line)]``.  Two loops belong to one
+    #: feature when the rectangles they leave behind are the same, which is the
+    #: only sense in which the FILE says two passes are the same cut.
+    groups: dict[tuple[str, str], list[tuple[float, int]]] = {}
+    for item in found:
+        # A straight cut (groove, slot) is one bite by construction, and a
+        # RELEASE cut mills a tab that earlier passes already cut round — neither
+        # is a rung of a depth ladder, so only the profile kinds are grouped.
+        if item.kind not in _SECTION_OF_KIND:
+            continue
+        tool = cfg.tools.get(_SECTION_OF_KIND[item.kind])
+        if tool is None or tool.max_bite is None:
+            continue
+        entry = known.get(round(item.z, 9))
+        if entry is None:
+            continue  # ``geometry`` has already refused this depth
+        feature = item.path.grow(-entry[1]).rounded()
+        groups.setdefault((item.kind, repr(feature)), []).append((item.z, item.line))
+
+    for (kind, feature), rungs in sorted(groups.items()):
+        tool = cfg.tools[_SECTION_OF_KIND[kind]]
+        floor = top
+        # In the order the FILE cuts them, not in depth order: how much material
+        # a pass removes is decided by what was already gone when it ran, so a
+        # ladder emitted deep-rung-first has one pass taking the whole cut and
+        # one taking nothing.  Line number is the only sense in which a re-parse
+        # sees time, and it is the same sense ``cut-order`` uses.
+        for z_cut, line in sorted(rungs, key=lambda pair: pair[1]):
+            bite = floor - z_cut
+            if bite > tool.max_bite + TOL:
+                problems.append(
+                    Violation(
+                        "max-bite",
+                        f"a {_KIND_NAMES.get(kind, kind)} takes {bite:g} of material "
+                        f"in one pass (from Z{_zword(floor)} down to "
+                        f"Z{_zword(z_cut)} on {feature}) - T{tool.number} is allowed "
+                        f"at most {tool.max_bite:g} per pass, so this cut owes "
+                        f"{math.ceil(bite / tool.max_bite)} passes and the program "
+                        f"makes fewer",
+                        line,
+                    )
+                )
+            floor = min(floor, z_cut)
+    return problems
+
+
 def _recover_parts(
     moves: list[_Move], cfg: PostConfig
 ) -> tuple[list[_RecoveredPart], list[_FoundCut], list[Violation]]:
@@ -1426,16 +1728,7 @@ def _recover_parts(
     before this was split in two.
     """
     problems: list[Violation] = []
-    # Straight cuts (the T13 groove, the T17 slot passes) carry no footprint
-    # to recover, so they contribute to the inventory only; where they are
-    # ALLOWED to reach is _check_v_slot_cuts / _check_foreign_cuts below.
-    known = {round(cfg.panel.z_cut, 9): ("groove", 0.0)}
-    for z_cut in cfg.wdc_slot.z_cuts:
-        known[round(z_cut, 9)] = ("slot", 0.0)
-    known[round(cfg.openings_pass.z_cut, 9)] = ("opening", cfg.openings_pass.offset)
-    known[round(cfg.detail_pass.z_cut, 9)] = ("detail", cfg.detail_pass.offset)
-    for spec in cfg.perimeter_passes:
-        known[round(spec.z_cut, 9)] = ("perimeter", spec.offset)
+    known = _known_depths(cfg)
 
     found: list[_FoundCut] = []
     boxes: dict[str, Box] = {}
@@ -1454,6 +1747,15 @@ def _recover_parts(
             )
             continue
         kind, offset = known[key]
+        if kind == "detail" and cfg.release is not None and _is_release_run(run):
+            # A RELEASE cut (2026-08-05 amendment §3c) runs at the T12 detail
+            # pass's own through depth — they are one number
+            # (:attr:`~.model.PostConfig.release_z`) — so the Z word cannot tell
+            # the two apart and the SHAPE does: a detail pass is a closed
+            # eight-move loop and a release cut is a plunge plus one straight
+            # move.  Nothing else in this post writes that shape at that depth.
+            found.append(_FoundCut("release", depth, _straight_extent(run), run[0].line))
+            continue
         if kind in ("groove", "slot"):
             found.append(_FoundCut(kind, depth, _straight_extent(run), run[0].line))
             continue
@@ -1518,6 +1820,698 @@ def _straight_extent(run: list[_Move]) -> Box:
     return Box(min(xs), min(ys), max(xs), max(ys))
 
 
+# --------------------------------------------------------------------------
+# the hold invariant (2026-08-05 amendment, Scott, job R0805, spec §3d/§6)
+# --------------------------------------------------------------------------
+#
+# See the module docstring's "Nothing is freed early" section for what this
+# proves and why it re-derives the tabs instead of asking where they are.
+
+#: Z slack for "did this move cut BELOW the tab top?".  The traverse along a
+#: tab's crest is commanded at exactly :attr:`~.model.TabSpec.top_z`, so the
+#: comparison has to exclude it while still counting the ramps either side; a
+#: hundred-thousandth is a tenth of the 0.0001 grid the post prints on, which
+#: makes the answer the same for every coordinate a program can state.
+_HOLD_Z_SLACK = 1e-5
+
+#: How far off a profile's own edge line a move may be and still count as
+#: running ALONG that edge.  The one thing that legitimately stands off the
+#: line is a perimeter lead-in/lead-out ramp, which is displaced by
+#: :attr:`~.model.PassSpec.lateral_lead` (0.05 measured); 0.2 leaves room for
+#: that and is far under the distance between two different edges of a real
+#: frame.
+_HOLD_SIDE_SLACK = 0.2
+
+#: The shortest gap in a profile's cut boundary that counts as material.  A
+#: tab is 0.75 long; anything under this is float noise or a corner artefact,
+#: not something that holds a frame.  Erring this way is the safe direction:
+#: too small a bridge reads as NO bridge, which is a refusal.
+_HOLD_MIN_BRIDGE = 0.05
+
+#: Tolerance for comparing a release cut's span and offset against a bridge.
+#: Coordinates reach this module printed to four decimals, and every quantity
+#: being compared is a tenth of an inch or more.
+_HOLD_TOL = 1e-3
+
+
+def _is_release_run(run: list[_Move]) -> bool:
+    """Is this cutting run the release grammar — plunge, then one straight move?
+
+    :meth:`~.generator._Emitter._straight`'s shape, re-read off the text: the
+    first move changes Z only and the second moves along exactly one axis at a
+    constant Z.  Written here rather than shared with the emitter for the reason
+    every template in this module is a second copy.
+    """
+    if len(run) != 2:
+        return False
+    plunge, cut = run
+    if abs(plunge.x1 - plunge.x0) > TOL or abs(plunge.y1 - plunge.y0) > TOL:
+        return False
+    if abs(cut.z1 - cut.z0) > TOL:
+        return False
+    return (abs(cut.x1 - cut.x0) > TOL) != (abs(cut.y1 - cut.y0) > TOL)
+
+
+@dataclass(frozen=True)
+class _Span:
+    """One stretch of a profile's boundary: which side, and where along it.
+
+    ``lo``/``hi`` are measured from the side's MIDPOINT along the side's own
+    axis (X for the bottom and top sides, Y for the left and right ones).
+    Midpoint-relative because a profile's several paths — the T11 kerf, the T12
+    kerf, the flush release path — are concentric rectangles of different sizes,
+    so an absolute coordinate means a different place on each of them while a
+    midpoint offset means the same place on all of them.
+    """
+
+    side: str
+    lo: float
+    hi: float
+
+    @property
+    def length(self) -> float:
+        return self.hi - self.lo
+
+
+@dataclass
+class _ThroughProfile:
+    """One profile this program cuts RIGHT THROUGH, and how it is held.
+
+    ``path`` is the tool-centre rectangle the file states, ``flush`` the
+    rectangle a release cut has to run on (see :meth:`describe`'s docstring on
+    :func:`~.generator.release_path` for the rule this re-derives), and
+    ``bridges`` the stretches of the boundary the through pass left standing.
+    """
+
+    kind: str
+    #: Machine Z the pass that cut this loop reached.
+    z_cut: float
+    path: Box
+    flush: Box
+    bridges: tuple[_Span, ...]
+    line: int
+    #: Signed offset of ``path`` from the FINISHED edge, so the finished profile
+    #: is ``path.grow(-offset)`` — which is what a refusal has to name, because
+    #: it is the rectangle the operator sees on the sheet.
+    offset: float
+    #: Which of :attr:`bridges` a release cut has been matched to, by index.
+    released: list[int]
+
+    def edge(self) -> Box:
+        return self.path.grow(-self.offset)
+
+    def describe(self) -> str:
+        edge = self.edge()
+        what = "opening" if self.kind == "detail" else "part footprint"
+        return (
+            f"the {edge.width:g}x{edge.height:g} {what} at "
+            f"({edge.x0:.4f}, {edge.y0:.4f})"
+        )
+
+
+def _side_lines(box: Box) -> dict[str, float]:
+    """The fixed coordinate of each side of ``box``."""
+    return {"bottom": box.y0, "top": box.y1, "left": box.x0, "right": box.x1}
+
+
+def _side_axis(side: str) -> str:
+    return "x" if side in ("bottom", "top") else "y"
+
+
+def _side_midpoint(box: Box, side: str) -> float:
+    return box.mid_x if _side_axis(side) == "x" else box.mid_y
+
+
+def _side_half(box: Box, side: str) -> float:
+    return (box.width if _side_axis(side) == "x" else box.height) / 2.0
+
+
+def _classify_segment(box: Box, x0: float, y0: float, x1: float, y1: float):
+    """``(side, lo, hi)`` for a segment running along one side of ``box``.
+
+    ``None`` when the segment is not on the boundary at all (it stands further
+    off the line than :data:`_HOLD_SIDE_SLACK`) or has no length to speak of.
+    The interval comes back clipped to the side's own extent, so an overshoot
+    that runs past a corner contributes only the part of it that is on the side.
+    """
+    dx, dy = abs(x1 - x0), abs(y1 - y0)
+    if max(dx, dy) <= TOL:
+        return None
+    if dx >= dy:
+        candidates = ("bottom", "top")
+        across = (y0 + y1) / 2.0
+        lo, hi = min(x0, x1), max(x0, x1)
+    else:
+        candidates = ("left", "right")
+        across = (x0 + x1) / 2.0
+        lo, hi = min(y0, y1), max(y0, y1)
+    lines = _side_lines(box)
+    side = min(candidates, key=lambda name: abs(across - lines[name]))
+    if abs(across - lines[side]) > _HOLD_SIDE_SLACK:
+        return None
+    half = _side_half(box, side)
+    mid = _side_midpoint(box, side)
+    lo, hi = max(lo - mid, -half), min(hi - mid, half)
+    if hi - lo <= TOL:
+        return None
+    return side, lo, hi
+
+
+def _merge(intervals: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """The union of closed intervals, in order."""
+    out: list[tuple[float, float]] = []
+    for lo, hi in sorted(intervals):
+        if out and lo <= out[-1][1] + TOL:
+            out[-1] = (out[-1][0], max(out[-1][1], hi))
+        else:
+            out.append((lo, hi))
+    return out
+
+
+def _loop_bridges(run: list[_Move], box: Box, cfg: PostConfig) -> tuple[_Span, ...]:
+    """Which stretches of ``box``'s boundary this loop left STANDING.
+
+    Independent re-derivation of the tabs (spec §3d): nothing here knows where
+    :mod:`~.tabs` put them, how long they are or how many there should be.  It
+    reads the commanded motion and asks one question per side — which parts of
+    this side did the tool take below :attr:`~.model.TabSpec.top_z`? — and calls
+    everything else a bridge.
+
+    Each move is split at the Z where it crosses the tab top (the same
+    :func:`_z_span` the material rules split a ramp with, so a ramp counts as
+    cutting only where it is actually below the line), projected onto the side it
+    runs along and clipped to that side.  The union of those intervals is the
+    boundary this pass severed; the gaps in it are the material still holding the
+    piece on.  A loop with no lift anywhere therefore reports NO bridges, which
+    is exactly the "freed early" case.
+    """
+    covered: dict[str, list[tuple[float, float]]] = {side: [] for side in SIDES}
+    for move in run:
+        below = _z_span(move, cfg.tabs.top_z - _HOLD_Z_SLACK)
+        if below is None:
+            continue
+        piece = _span_box(move, *below)
+        # _span_box loses the direction, which does not matter: the interval is
+        # unsigned and the side is decided by the piece's own long axis.
+        found = _classify_segment(box, piece.x0, piece.y0, piece.x1, piece.y1)
+        if found is None:
+            continue
+        side, lo, hi = found
+        covered[side].append((lo, hi))
+
+    bridges: list[_Span] = []
+    for side in SIDES:
+        half = _side_half(box, side)
+        at = -half
+        for lo, hi in _merge(covered[side]):
+            if lo - at >= _HOLD_MIN_BRIDGE:
+                bridges.append(_Span(side, at, lo))
+            at = max(at, hi)
+        if half - at >= _HOLD_MIN_BRIDGE:
+            bridges.append(_Span(side, at, half))
+    return tuple(bridges)
+
+
+def _through_profiles(
+    runs: list[list[_Move]], cfg: PostConfig
+) -> list[_ThroughProfile]:
+    """Every closed loop this program cuts right through the sheet, with its
+    bridges and the flush path a release cut of it has to run on."""
+    bottom = cfg.stock_top_z - cfg.material_thickness
+    radius = cfg.tool(SECTION_RELEASE).radius if SECTION_RELEASE in cfg.tools else 0.0
+    # (kind, offset, which way the WASTE lies).  An opening's waste is the
+    # dropout inside it and a perimeter's is the skeleton outside it, which is
+    # the whole difference between the two flush offsets (spec §3c).
+    shapes = [("detail", cfg.detail_pass.z_cut, cfg.detail_pass.offset, -1.0)]
+    for spec in cfg.perimeter_passes:
+        shapes.append(("perimeter", spec.z_cut, spec.offset, 1.0))
+
+    out: list[_ThroughProfile] = []
+    for run in runs:
+        depth = min(move.z1 for move in run)
+        if depth > bottom + TOL:
+            continue  # not a through cut: it leaves material under it
+        for kind, z_cut, offset, waste in shapes:
+            if abs(depth - z_cut) > TOL:
+                continue
+            box = _closed_loop_box(run)
+            if box is None:
+                break  # ``geometry`` reports this; nothing to hold here
+            out.append(
+                _ThroughProfile(
+                    kind=kind,
+                    z_cut=depth,
+                    path=box,
+                    flush=box.grow(-offset + waste * radius),
+                    bridges=_loop_bridges(run, box, cfg),
+                    line=run[0].line,
+                    offset=offset,
+                    released=[],
+                )
+            )
+            break
+    return out
+
+
+def _shallow_profiles(
+    runs: list[list[_Move]], cfg: PostConfig
+) -> list[_ThroughProfile]:
+    """Loops that cut BELOW the tab top without cutting through the sheet.
+
+    The T11 opening pass at Z0.15 is one, and so is a two-pass perimeter's Z0.06
+    skin: neither frees anything, so neither is a through profile, but both cut
+    0.10-0.19 below the tab top and would take a tab down with them if they did
+    not lift (spec §3b, "every pass that cuts below Z 0.25 lifts over the tab
+    zones").  They are collected with the same machinery and the same
+    :class:`_ThroughProfile` shape — what makes one of these different is only
+    what a missing bridge on it MEANS, which is :func:`_check_shallow_lifts`.
+
+    A pass at or ABOVE the tab top is not one of these and is not required to
+    lift: it cannot damage a tab, because it never reaches one.  The 2026-08-05
+    max-bite ladder's upper rungs are exactly that — Z0.45 on an opening, Z0.372
+    on a perimeter, both well clear of the 0.25 tab top — so they are filtered
+    out below by the same comparison that has always excluded the T13 groove, and
+    a program in which they do not lift is correct rather than refused.
+    """
+    bottom = cfg.stock_top_z - cfg.material_thickness
+    shapes = [
+        ("opening", spec.z_cut, spec.offset, -1.0) for spec in cfg.openings_passes
+    ]
+    for spec in cfg.perimeter_passes:
+        shapes.append(("perimeter", spec.z_cut, spec.offset, 1.0))
+
+    out: list[_ThroughProfile] = []
+    for run in runs:
+        depth = min(move.z1 for move in run)
+        if depth <= bottom + TOL or depth >= cfg.tabs.top_z - _HOLD_Z_SLACK:
+            continue  # through (handled above), or never reaches a tab
+        for kind, z_cut, offset, waste in shapes:
+            if abs(depth - z_cut) > TOL:
+                continue
+            box = _closed_loop_box(run)
+            if box is None:
+                break
+            out.append(
+                _ThroughProfile(
+                    kind=kind,
+                    z_cut=depth,
+                    path=box,
+                    flush=box,  # never released: a release cut is a through cut
+                    bridges=_loop_bridges(run, box, cfg),
+                    line=run[0].line,
+                    offset=offset,
+                    released=[],
+                )
+            )
+            break
+    return out
+
+
+def _check_shallow_lifts(
+    through: list[_ThroughProfile], shallow: list[_ThroughProfile], cfg: PostConfig
+) -> list[Violation]:
+    """A shallower deep pass may not cut away a tab the through pass stands up.
+
+    Spec §3b makes this explicit — "T11 perimeter pass 1 lifts; it must, or the
+    skin pass destroys the tab before pass 2 can preserve it" — and the same is
+    true of the T11 opening pass, which cuts to Z0.15 and would leave 0.15 of tab
+    where 0.25 was ratified.
+
+    Paired by the FINISHED profile the two passes share, which is each one's own
+    path taken back by its own offset: an opening's T11 and T12 loops are
+    different rectangles around the same finished opening, and a part's skin and
+    through loops are different rectangles around the same footprint.  Nothing is
+    paired by position or by order.
+    """
+    problems: list[Violation] = []
+    wanted: dict[tuple[str, str], _ThroughProfile] = {}
+    for profile in through:
+        family = "opening" if profile.kind == "detail" else "perimeter"
+        wanted[(family, repr(profile.edge().rounded(PLACES)))] = profile
+    for profile in shallow:
+        family = "opening" if profile.kind == "opening" else "perimeter"
+        deep = wanted.get((family, repr(profile.edge().rounded(PLACES))))
+        if deep is None:
+            continue  # no through pass on this profile: ``missing-cut``'s to say
+        for bridge in deep.bridges:
+            if any(
+                other.side == bridge.side
+                and abs(other.lo - bridge.lo) <= _HOLD_TOL
+                and abs(other.hi - bridge.hi) <= _HOLD_TOL
+                for other in profile.bridges
+            ):
+                continue
+            problems.append(
+                Violation(
+                    "hold",
+                    f"{deep.describe()} keeps a holding tab on its {bridge.side} "
+                    f"side, but the pass at Z{_zword(profile.z_cut)} — the one "
+                    f"that cut this loop on line {profile.line} — ran straight "
+                    f"through where that tab stands instead of rising over it. A "
+                    f"pass that cuts below the Z{cfg.tabs.top_z} tab top has "
+                    f"to lift over every tab or there is less tab left than the "
+                    f"program believes",
+                    profile.line,
+                )
+            )
+    return problems
+
+
+def _release_cuts(runs: list[list[_Move]], cfg: PostConfig):
+    """Every release cut in the program, as its own two-move run.
+
+    Identified the same way :func:`_recover_parts` identifies one: the release
+    depth (which IS the detail pass's, :attr:`~.model.PostConfig.release_z`) plus
+    the straight plunge-and-move shape that tells it from a detail loop.
+    """
+    out = []
+    for run in runs:
+        depth = min(move.z1 for move in run)
+        if abs(depth - cfg.release_z) > TOL or not _is_release_run(run):
+            continue
+        out.append(run)
+    return out
+
+
+def _check_hold(moves: list[_Move], cfg: PostConfig) -> list[Violation]:
+    """The hold invariant: nothing is separated before the release section.
+
+    The refusals, all of them things spec §3b/§3d/§6 asks for by name:
+
+    ``freed early``
+        a profile is cut right through with no bridge anywhere on it.  The part
+        or the dropout is loose from that moment, which is the failure job R0805
+        came off the machine with;
+    ``never released``
+        a bridge no release cut removes.  The frame leaves the machine still
+        attached to the sheet;
+    ``released twice``
+        two release cuts on one bridge.  Harmless to the part and a sign the
+        program is not what anybody thinks it is, so it is reported;
+    ``not flush`` / ``wrong feed``
+        a release cut that is not on the flush path (spec §8's forbidden
+        centreline release is the case that matters — it would leave a rib of tab
+        on the finished edge) or does not run at the ratified release feeds.  Its
+        DEPTH needs no rule of its own: a cut at any other Z is not recognised as
+        a release cut at all, and then it is an ``extra-cut`` and its bridge is a
+        ``never released``;
+    ``a shallower pass that did not lift``
+        :func:`_check_shallow_lifts` — spec §3b applies to every pass below the
+        tab top, not only the one that cuts through.
+
+    Plus three ordering rules (:func:`_check_release_order`), reported as
+    ``cut-order`` because that is what they are about.
+    """
+    problems: list[Violation] = []
+    runs = _cut_runs(moves)
+    profiles = _through_profiles(runs, cfg)
+    releases = _release_cuts(runs, cfg)
+
+    for run in releases:
+        cut = run[1]
+        problems.extend(_check_release_feeds(run, cfg))
+        target = _match_bridge(profiles, cut)
+        if target is None:
+            problems.append(
+                Violation(
+                    "hold",
+                    _no_bridge_message(profiles, cut, cfg),
+                    cut.line,
+                )
+            )
+            continue
+        profile, bridge_index = target
+        profile.released.append(bridge_index)
+
+    for profile in profiles:
+        if not profile.bridges:
+            problems.append(
+                Violation(
+                    "hold",
+                    f"{profile.describe()} is cut right through with no holding "
+                    f"tab anywhere on it: every part of its boundary is taken "
+                    f"below the Z{cfg.tabs.top_z} tab top by this one pass, so the "
+                    f"piece is loose from here on and the rest of the sheet is cut "
+                    f"with it lying under the spindle. That is the break job R0805 "
+                    f"came off the machine with; a through profile has to keep at "
+                    f"least one bridge until the T12 release section",
+                    profile.line,
+                )
+            )
+            continue
+        for index, bridge in enumerate(profile.bridges):
+            times = profile.released.count(index)
+            if times == 1:
+                continue
+            if times == 0:
+                problems.append(
+                    Violation(
+                        "hold",
+                        f"{profile.describe()} keeps a {bridge.length:.4f} holding "
+                        f"tab on its {bridge.side} side that no release cut ever "
+                        f"removes - the piece would come off the machine still "
+                        f"attached to the sheet"
+                        + (
+                            ""
+                            if releases
+                            else ", and this program has no T12 release section at "
+                            "all"
+                        ),
+                        profile.line,
+                    )
+                )
+            else:
+                problems.append(
+                    Violation(
+                        "hold",
+                        f"{profile.describe()}: the holding tab on its "
+                        f"{bridge.side} side is released {times} times - a tab is "
+                        f"milled away once, at the end, and a second cut over the "
+                        f"same air is not a program anybody wrote on purpose",
+                        profile.line,
+                    )
+                )
+    problems.extend(
+        _check_shallow_lifts(profiles, _shallow_profiles(runs, cfg), cfg)
+    )
+    problems.extend(_check_release_order(profiles, releases, runs, cfg))
+    return problems
+
+
+def _match_bridge(profiles: list[_ThroughProfile], cut: _Move):
+    """Which profile's which bridge this release cut removes, or ``None``.
+
+    A release cut qualifies only if it runs ON the profile's flush path (the
+    finished edge offset into the waste by the release tool's radius — checked
+    numerically, which is what refuses the centreline release spec §8 forbids)
+    and COVERS the whole bridge.  It is allowed to run past the bridge at either
+    end, because it is meant to: the tab's ramps and the release overlap all lie
+    outside the full-height span.
+    """
+    for profile in profiles:
+        found = _classify_segment(profile.flush, cut.x0, cut.y0, cut.x1, cut.y1)
+        if found is None:
+            continue
+        side, lo, hi = found
+        if abs(_across(cut) - _side_lines(profile.flush)[side]) > _HOLD_TOL:
+            continue
+        for index, bridge in enumerate(profile.bridges):
+            if bridge.side != side:
+                continue
+            if lo <= bridge.lo + _HOLD_TOL and hi >= bridge.hi - _HOLD_TOL:
+                return profile, index
+    return None
+
+
+def _across(cut: _Move) -> float:
+    """The coordinate a release cut does NOT move in — its offset from the edge."""
+    if abs(cut.x1 - cut.x0) >= abs(cut.y1 - cut.y0):
+        return (cut.y0 + cut.y1) / 2.0
+    return (cut.x0 + cut.x1) / 2.0
+
+
+def _no_bridge_message(
+    profiles: list[_ThroughProfile], cut: _Move, cfg: PostConfig
+) -> str:
+    """Why this release cut matches nothing — the near miss, if there is one.
+
+    A release cut on the T11 CENTRELINE instead of the flush path is the
+    mistake spec §8 names, and it misses by exactly the difference between the
+    two radii, so the message says so rather than leaving the reader to work out
+    which of the two failures this is.
+    """
+    # A cut running along X has a constant Y, so the sides worth comparing it
+    # against are the ones whose own axis is X — the bottom and the top.
+    along = "x" if abs(cut.x1 - cut.x0) >= abs(cut.y1 - cut.y0) else "y"
+    best: tuple[float, _ThroughProfile, str] | None = None
+    for profile in profiles:
+        for side, line in _side_lines(profile.flush).items():
+            if _side_axis(side) != along:
+                continue
+            miss = abs(_across(cut) - line)
+            if best is None or miss < best[0]:
+                best = (miss, profile, side)
+    detail = ""
+    if best is not None and best[0] > _HOLD_TOL:
+        miss, profile, side = best
+        detail = (
+            f" The nearest flush path is the {side} side of {profile.describe()}, "
+            f"{miss:.4f} away: a release cut runs one release-tool radius from the "
+            f"FINISHED edge, into the waste, so its own edge lands on the finished "
+            f"line. Running it down the T11 kerf's centreline instead leaves a rib "
+            f"of tab standing on the finished edge, which is what the flush offset "
+            f"exists to prevent."
+        )
+    return (
+        f"a T12 release cut at Z{min(cut.z0, cut.z1)} runs "
+        f"x[{min(cut.x0, cut.x1):.4f}, {max(cut.x0, cut.x1):.4f}] "
+        f"y[{min(cut.y0, cut.y1):.4f}, {max(cut.y0, cut.y1):.4f}], which is not "
+        f"flush with any profile's finished edge over a holding tab that pass left "
+        f"standing." + detail
+    )
+
+
+def _check_release_feeds(run: list[_Move], cfg: PostConfig) -> list[Violation]:
+    """The release plunge and cut run at the RELEASE feeds, not T12's others.
+
+    :func:`_check_feeds` judges a tool against the whole set of feeds the table
+    gives it, deliberately (module docstring), and T12 legitimately has two
+    operations now — so a release cut made at the detail pass's 293/100 passes
+    that rule.  It must not pass this one: "very slowly" is the entire point of
+    the release pass (spec §3c), and 293 ipm through a tab at the end of a
+    program is how a finished frame gets torn off its last bridge.
+    """
+    spec = cfg.release
+    if spec is None:  # pragma: no cover - callers gate on this
+        return []
+    problems: list[Violation] = []
+    for move, wanted, what in (
+        (run[0], spec.entry_feed, "plunge"),
+        (run[1], spec.cut_feed, "cut"),
+    ):
+        if move.feed is None or abs(move.feed - wanted) > TOL:
+            got = "no F word at all" if move.feed is None else f"F{_fword(move.feed)}"
+            problems.append(
+                Violation(
+                    "hold",
+                    f"the {what} of a T12 release cut runs at {got} - the release "
+                    f"pass runs at F{_fword(wanted)}, which is the feed Scott "
+                    f"ratified for it on 2026-08-05 precisely because this cut "
+                    f"parts a finished frame from the sheet",
+                    move.line,
+                )
+            )
+    return problems
+
+
+def _check_release_order(
+    profiles: list[_ThroughProfile],
+    releases: list[list[_Move]],
+    runs: list[list[_Move]],
+    cfg: PostConfig,
+) -> list[Violation]:
+    """Where the release cuts sit in the program (spec §3c "Order").
+
+    Three relations, all judged on line numbers, all independent of any plan:
+
+    a)  the release section is LAST — no cut of any other kind comes after one;
+    b)  every OPENING's release comes before every perimeter's.  A dropout is
+        the lighter, more fragile piece and it is released while its frame is
+        still held;
+    c)  a nested inner frame's perimeter release comes before its host's, the
+        same inners-before-hosts rule the freeing pass itself follows: a host
+        released first would leave the inner sitting in a hole in a loose slab.
+    """
+    problems: list[Violation] = []
+    if not releases:
+        return problems
+    release_lines = [run[0].line for run in releases]
+    first_release = min(release_lines)
+    release_set = {id(run) for run in releases}
+
+    late = [run for run in runs if id(run) not in release_set and run[0].line > first_release]
+    if late:
+        problems.append(
+            Violation(
+                "cut-order",
+                f"a cut runs AFTER the T12 release section starts on line "
+                f"{first_release} - the release is the last machining in the "
+                f"program (spec §3c): everything on the sheet is loose once it has "
+                f"run, so anything cut afterwards is cut on a piece nothing is "
+                f"holding",
+                late[0][0].line,
+            )
+        )
+
+    kinds: dict[str, list[int]] = {"detail": [], "perimeter": []}
+    for profile in profiles:
+        for run in releases:
+            found = _match_bridge([profile], run[1])
+            if found is not None:
+                kinds[profile.kind].append(run[0].line)
+    if kinds["detail"] and kinds["perimeter"]:
+        if max(kinds["detail"]) > min(kinds["perimeter"]):
+            problems.append(
+                Violation(
+                    "cut-order",
+                    f"an opening's tab is released on line {max(kinds['detail'])}, "
+                    f"AFTER a part perimeter's on line {min(kinds['perimeter'])} - "
+                    f"spec §3c releases every opening dropout first, while its "
+                    f"frame is still held to the sheet",
+                    max(kinds["detail"]),
+                )
+            )
+
+    #: Nesting, re-derived: a footprint that lies inside another profile's
+    #: opening is that one's passenger.  Read off the recovered rectangles, like
+    #: everything else here.
+    openings = [p for p in profiles if p.kind == "detail"]
+    footprints = [p for p in profiles if p.kind == "perimeter"]
+    for inner in footprints:
+        inner_edge = inner.edge()
+        for opening in openings:
+            void = opening.edge()
+            if not void.contains(inner_edge, TOL):
+                continue
+            host = _footprint_containing(footprints, void)
+            if host is None or host is inner:
+                continue
+            inner_at = _release_lines(inner, releases)
+            host_at = _release_lines(host, releases)
+            if not inner_at or not host_at or max(inner_at) < min(host_at):
+                continue
+            problems.append(
+                Violation(
+                    "cut-order",
+                    f"{inner.describe()} is nested in {host.describe()}, but the "
+                    f"host's tabs are released on line {min(host_at)}, before the "
+                    f"inner's on line {max(inner_at)} - the inner would then be "
+                    f"sitting in a hole in a slab that is already loose",
+                    min(host_at),
+                )
+            )
+    return problems
+
+
+def _release_lines(profile: _ThroughProfile, releases) -> list[int]:
+    return [
+        run[0].line for run in releases if _match_bridge([profile], run[1]) is not None
+    ]
+
+
+def _footprint_containing(footprints: list[_ThroughProfile], void: Box):
+    """The smallest recovered footprint whose own opening ``void`` is."""
+    best = None
+    for candidate in footprints:
+        edge = candidate.edge()
+        if edge.contains(void, TOL):
+            if best is None or (edge.width * edge.height) < (
+                best.edge().width * best.edge().height
+            ):
+                best = candidate
+    return best
+
+
 def _check_part_bounds(parts: list[_RecoveredPart], cfg: PostConfig) -> list[Violation]:
     problems: list[Violation] = []
     for part in parts:
@@ -1548,14 +2542,17 @@ def _check_foreign_cuts(
     bit is doing there:
 
     *   above the stock: nothing, because it is cutting nothing;
-    *   in the material but not through: tool CENTRE against every part's solid
-        except the one the move is attributed to — the part whose footprint,
-        grown by the trim overhang, contains the whole move.  That exemption is
-        what lets a T13 groove cut its own part, which is the whole reason it
-        exists;
-    *   right through the sheet: the tool's full swept width against EVERY
-        part's solid, the attributed one included.  A through cut inside a
-        frame member is that member sawn in half whoever it belongs to, and
+    *   in the material but not through: the tool's full SWEPT WIDTH against
+        every part's solid except the one the move is attributed to — the part
+        whose footprint, grown by the trim overhang, contains the whole move.
+        That one exemption is what lets a T13 groove cut its own part, which is
+        the whole reason it exists.  Swept rather than centre since 2026-08-05:
+        judging a shallow cut on its centreline is what passed job R0805, whose
+        groove sweep bit 0.235 into the neighbouring frame (module docstring,
+        "The shallow-cut waiver, and why it is gone");
+    *   right through the sheet: the same swept width against EVERY part's
+        solid, the attributed one included.  A through cut inside a frame
+        member is that member sawn in half whoever it belongs to, and
         exempting the containing footprint is how an inner frame's runaway cut
         through its host used to go unreported (2026-08-04, fix 12).
     """
@@ -1574,20 +2571,22 @@ def _check_foreign_cuts(
         own = _owner_of(move, parts, cfg)
         through = _z_span(move, through_z)
         # One region per depth regime the move passes through (see the module
-        # docstring's "Ramps have a Z profile"): the part of the move that goes
-        # right through the sheet cuts its full swept width and may not enter
-        # ANY part's solid, its own included -- a through cut inside a part is
-        # the part sawn in half, and attributing it to a containing footprint
-        # is how a runaway cut used to hide (fix 12).  The part that is in the
-        # material but not through is judged on its tool centre only, which is
-        # the shallow-cut waiver above and keeps the T13 groove legal.
+        # docstring's "Ramps have a Z profile").  BOTH regimes are judged on
+        # the tool's full swept width; the only difference between them is who
+        # is exempt.  Through the sheet: nobody -- a through cut inside a part
+        # is the part sawn in half whoever it belongs to, and attributing it to
+        # a containing footprint is how a runaway cut used to hide (fix 12).
+        # In the material but not through: the part the move is attributed to,
+        # and it alone, because that is a T13 groove cutting its own part.
+        # Judging that regime on the tool CENTRE instead -- the shallow-cut
+        # waiver -- is what passed job R0805 on 05 AUG 26 (module docstring).
         regions: list[tuple[Box, float, bool]] = []
         if through is not None:
             regions.append((_span_box(move, *through), move.radius, False))
             for lo, hi in _span_minus(in_stock, through):
-                regions.append((_span_box(move, lo, hi), 0.0, True))
+                regions.append((_span_box(move, lo, hi), move.radius, True))
         else:
-            regions.append((_span_box(move, *in_stock), 0.0, True))
+            regions.append((_span_box(move, *in_stock), move.radius, True))
 
         for centre, radius, owner_cuts_here in regions:
             swept = centre.grow(radius)
@@ -1891,6 +2890,13 @@ class ExpectedWork:
     """
 
     cuts: tuple[ExpectedCut, ...] = ()
+    #: Does this sheet owe a T12 tab-release section (2026-08-05 amendment)?
+    #: Read off the post table the manifest was built with
+    #: (:attr:`~.model.PostConfig.release`), which is the only place that
+    #: decision is made (:func:`~.from_layout.post_config_for`).  It is a
+    #: structural fact, not a list of cuts: WHERE the tabs are is
+    #: :func:`_check_hold`'s to re-derive.
+    release: bool = False
 
     def __len__(self) -> int:
         return len(self.cuts)
@@ -1925,11 +2931,16 @@ def expected_work(layout, config: PostConfig | None = None) -> ExpectedWork:
     *   its T13 panel grooves, all four, or the RAIL pair only for a WDC
         frame whose stiles take the T17 slot instead (2026-08-03 amendment);
     *   both T17 slot passes down each of a WDC frame's two stiles;
-    *   for every opening the frame engine computes: the T11 through-cut
-        (tool centre 0.1975 inside the finished opening edge) and the T12
-        finish pass;
-    *   one perimeter loop per configured depth pass — the onion skin AND
-        the full-depth pass that frees the part (2026-08-03 amendment).
+    *   for every opening the frame engine computes: one T11 roughing loop per
+        configured opening depth pass (tool centre 0.1975 inside the finished
+        opening edge — one loop on the measured table, two on a generated sheet
+        since the 2026-08-05 max-bite amendment) and the T12 finish pass;
+    *   one perimeter loop per configured depth pass, judged against the table
+        the caller handed over and no other: the measured two-pass table owes
+        the onion skin AND the full-depth pass that frees the part (2026-08-03
+        amendment), which is what the reference programs run, while a generated
+        sheet owes the rungs of its max-bite ladder ending on the through pass
+        (2026-08-05, Scott — :func:`~.from_layout.generated_post_passes`).
 
     Raises ``ValueError`` when the sheet is empty or the frame engine cannot
     compute a part's geometry: there is then no honest statement of what the
@@ -1946,7 +2957,7 @@ def expected_work(layout, config: PostConfig | None = None) -> ExpectedWork:
             "this sheet holds no placement, so there is no work to expect of its "
             "program"
         )
-    return ExpectedWork(tuple(cuts))
+    return ExpectedWork(tuple(cuts), release=cfg.release is not None)
 
 
 def _walk_placements(placements, host=None, counter=None):
@@ -2009,7 +3020,9 @@ def _expected_for_placement(
         add(
             "groove",
             cfg.panel.z_cut,
-            _groove_extent(box, rotated, index, cfg.panel),
+            _groove_extent(
+                box, rotated, index, cfg.panel, cfg.tool(SECTION_PANEL).radius
+            ),
             f"the T13 {_GROOVE_NAMES[index]}",
             "The frame would come off the machine without the groove its "
             "cabinet seats in.",
@@ -2040,16 +3053,30 @@ def _expected_for_placement(
                 )
 
     # -- T11 / T12 openings ------------------------------------------------
+    # One T11 loop per configured depth pass (the 2026-08-05 max-bite ladder,
+    # from_layout.generated_opening_passes: two 0.3 bites on a generated sheet,
+    # the one measured 0.60 bite on the references), then the one T12 pass.
     openings = _sheet_openings(placement, box, rotated)
+    rough_total = len(cfg.openings_passes)
     for label, opening in openings:
-        add(
-            "opening",
-            cfg.openings_pass.z_cut,
-            opening.grow(cfg.openings_pass.offset),
-            f"the T11 through-cut of the {label!r} opening",
-            "The frame would be cut free with solid material where that "
-            "opening belongs.",
-        )
+        for position, spec in enumerate(cfg.openings_passes):
+            rung = (
+                ""
+                if rough_total == 1
+                else f", pass {position + 1} of {rough_total} (Z{_zword(spec.z_cut)})"
+            )
+            add(
+                "opening",
+                spec.z_cut,
+                opening.grow(spec.offset),
+                f"the T11 through-cut of the {label!r} opening{rung}",
+                "The frame would be cut free with solid material where that "
+                "opening belongs."
+                if rough_total == 1
+                else "The T11 roughing ladder would take more than the "
+                "ratified bite in one pass, or leave the opening short of "
+                "the depth the T12 pass finishes from.",
+            )
         add(
             "detail",
             cfg.detail_pass.z_cut,
@@ -2060,9 +3087,33 @@ def _expected_for_placement(
         )
 
     # -- T11 perimeter passes ---------------------------------------------
+    # One loop per pass the config in hand carries, and the WORDS follow the same
+    # table, because two different tables run a non-final perimeter pass for two
+    # different reasons and an operator sent looking for the wrong one has been
+    # misled:
+    #
+    #   * the MEASURED table's first pass is the Z0.06 onion skin the reference
+    #     programs were cut with — a holding rib, and named as one;
+    #   * a GENERATED sheet's non-final passes are rungs of the 2026-08-05
+    #     max-bite ladder (Scott: 0.4 per pass on the 3/8 comp), which hold
+    #     nothing — the tabs do that — and are named for what they are.
+    #
+    # Which it is comes off the table itself: a ladder exists because the TOOL
+    # declares a bite limit, so that is the thing to ask (from_layout.T11_MAX_BITE
+    # lands on ToolSpec.max_bite, and default_config declares none).
     total = len(cfg.perimeter_passes)
+    tool = cfg.tools.get(SECTION_PERIMETER)
+    laddered = tool is not None and tool.max_bite is not None
     for position, spec in enumerate(cfg.perimeter_passes):
-        if total > 1 and position == 0:
+        if position < total - 1 and laddered:
+            role = f"perimeter roughing pass {position + 1}"
+            consequence = (
+                f"The remaining passes would then have to take "
+                f"{cfg.stock_top_z - cfg.perimeter_passes[-1].z_cut:g} of "
+                f"material between them in fewer bites than T{tool.number}'s "
+                f"{tool.max_bite:g} limit allows."
+            )
+        elif total > 1 and position == 0:
             role = "the onion-skin perimeter pass"
             consequence = (
                 "The onion skin is what holds every part while the through "
@@ -2073,7 +3124,11 @@ def _expected_for_placement(
             role = "the full-depth perimeter pass"
             consequence = (
                 "The part would come off the machine still attached to the "
-                "sheet by the onion skin - nothing would have cut it free."
+                "sheet by the material the earlier pass(es) left - nothing "
+                "would have cut it free."
+                if total > 1
+                else "The part would come off the machine still attached to "
+                "the sheet: this is the one pass that cuts it free."
             )
         else:
             role = f"perimeter pass {position + 1}"
@@ -2155,32 +3210,55 @@ def _groove_indices(part_number: str) -> tuple[int, ...]:
     return (0, 2, 1, 3)
 
 
-def _groove_extent(box: Box, rotated: bool, index: int, panel) -> Box:
+def _groove_extent(
+    box: Box, rotated: bool, index: int, panel, tool_radius: float
+) -> Box:
     """Where one T13 groove runs, as a degenerate box (measured insets).
 
-    ``index`` 0..3 = stile-low, rail-low, stile-high, rail-high in the
-    part's own orientation: the stile grooves sit ``stile_inset`` in from the
-    two stile edges and run the full part length plus ``overrun`` at both
-    ends; the rail grooves sit ``rail_inset`` in from the rail edges and run
-    between the two stile centre lines.  A rotated part's stiles are its
-    bottom and top edges.  Second copy of
-    :func:`~.generator.groove_segment`, from the same measurements in
-    :class:`~.model.PanelSpec`.
+    ``index`` 0..3 = stile-low, rail-low, stile-high, rail-high in the part's
+    own orientation: the stile grooves sit ``stile_inset`` in from the two
+    stile edges and run the length of the part; the rail grooves sit
+    ``rail_inset`` in from the rail edges and run between the two stile centre
+    lines.  A rotated part's stiles are its bottom and top edges.
+
+    Second copy of :func:`~.generator.groove_segment`, deliberately — the
+    manifest re-derives every cut from the layout and the measured tables and
+    never imports the emitter (module docstring), so this arithmetic is
+    written twice on purpose and the two copies disagreeing is a finding
+    rather than a silence.
+
+    The stile ends carry the 2026-08-05 amendment (Scott, job R0805): the
+    endpoint is the part edge plus ``tool_radius + end_inset``, clamped
+    against the measured ``overrun``, so the swept cut stops flush with the
+    part instead of 0.690 past it.  ``tool_radius`` is read by the CALLER off
+    its own copy of the tool table (:data:`~.model.SECTION_PANEL`), not
+    handed over from anything the emitter touched.
     """
     stile, rail, over = panel.stile_inset, panel.rail_inset, panel.overrun
+    reach = tool_radius + panel.end_inset
     if not rotated:
         stile_lines = (box.x0 + stile, box.x1 - stile)
         rail_lines = (box.y0 + rail, box.y1 - rail)
         if index in (0, 2):
             x = stile_lines[0 if index == 0 else 1]
-            return Box(x, box.y0 - over, x, box.y1 + over)
+            return Box(
+                x,
+                max(box.y0 - over, box.y0 + reach),
+                x,
+                min(box.y1 + over, box.y1 - reach),
+            )
         y = rail_lines[0 if index == 1 else 1]
         return Box(stile_lines[0], y, stile_lines[1], y)
     stile_lines = (box.y0 + stile, box.y1 - stile)
     rail_lines = (box.x0 + rail, box.x1 - rail)
     if index in (0, 2):
         y = stile_lines[0 if index == 0 else 1]
-        return Box(box.x0 - over, y, box.x1 + over, y)
+        return Box(
+            max(box.x0 - over, box.x0 + reach),
+            y,
+            min(box.x1 + over, box.x1 - reach),
+            y,
+        )
     x = rail_lines[0 if index == 1 else 1]
     return Box(x, stile_lines[0], x, stile_lines[1])
 
@@ -2236,8 +3314,40 @@ def _check_expected_work(
     One-for-one: each manifest entry consumes at most one recovered cut, so
     a program that emits one pass twice instead of two passes once fails as
     both a missing cut and an extra one rather than passing on a count.
+
+    Release cuts (2026-08-05 amendment) are the one kind the manifest does NOT
+    hold positionally, and they are held out of the match here.  The manifest is
+    built from the layout and the post table, which say a sheet is tab-held but
+    cannot say WHERE the tabs are without becoming a second copy of
+    :mod:`~.tabs` — and a manifest that copied the placement engine could never
+    catch it being wrong.  So the positional accounting is
+    :func:`_check_hold`'s, span by span against the bridges it re-derives from
+    the motion, and what the manifest adds is the structural fact the file alone
+    cannot know: that this sheet OWES a release section (``released`` is how many
+    release cuts the file made).
     """
     problems: list[Violation] = []
+    released = sum(1 for item in found if item.kind == "release")
+    if expected.release and not released:
+        problems.append(
+            Violation(
+                "missing-cut",
+                "this sheet is cut tab-held (the post table configures a T12 "
+                "release pass), but the program contains no release cut at all - "
+                "every part and every opening dropout would come off the machine "
+                "still attached to the sheet by its tabs",
+            )
+        )
+    elif not expected.release and any(item.kind == "release" for item in found):
+        problems.append(
+            Violation(
+                "extra-cut",
+                "the program contains a T12 tab-release cut, but this sheet's post "
+                "table runs no release pass and its parts are not tab-held - "
+                "nothing on it is standing where that cut goes",
+            )
+        )
+    found = [item for item in found if item.kind != "release"]
     used = [False] * len(found)
     at: dict[int, _FoundCut] = {}
     for index, cut in enumerate(expected.cuts):
@@ -2283,7 +3393,10 @@ def _check_chronology(
     if total_passes is None:
         return problems  # a manifest with no perimeter pass has no chronology
 
-    #: ``part -> (onion index, through index, [every other cut's index])``
+    #: ``part -> (first-pass index, through index, [every other cut's index])``
+    #: The first perimeter pass, whether it is the measured onion skin or the
+    #: first rung of the 2026-08-05 max-bite ladder: either way it must precede
+    #: the pass that cuts the outline through, and for the same reason.
     onion: dict[int, int] = {}
     through: dict[int, int] = {}
     others: dict[int, list[int]] = {}
@@ -2292,9 +3405,12 @@ def _check_chronology(
         host_of[cut.part] = cut.host
         if cut.kind == "perimeter" and cut.pass_position == total_passes:
             through[cut.part] = index
-        elif cut.kind == "perimeter" and cut.pass_position == 0 and total_passes:
-            # Rule (a) owns the onion skin, so it is deliberately not also in
-            # ``others``: one wrong order, one finding.
+        elif cut.kind == "perimeter" and cut.pass_position == 0:
+            # Rule (a) owns the first pass, so it is deliberately not also in
+            # ``others``: one wrong order, one finding.  A manifest built from a
+            # ONE-pass table never gets here — its only perimeter cut is
+            # ``pass_position == total_passes == 0``, so it is the through pass
+            # and rule (a) simply has no pair to relate.
             onion[cut.part] = index
         else:
             others.setdefault(cut.part, []).append(index)
@@ -2307,7 +3423,7 @@ def _check_chronology(
         cut = cuts[index]
         return f"{cut.part_number} @({cut.part_box.x0:.4f},{cut.part_box.y0:.4f})"
 
-    # (a) the onion skin before the pass that frees the part
+    # (a) the first perimeter pass before the pass that cuts through
     for part, skin_index in onion.items():
         cut_index = through.get(part)
         if cut_index is None:
@@ -2319,9 +3435,10 @@ def _check_chronology(
             Violation(
                 "cut-order",
                 f"{name(cut_index)}: the full-depth perimeter pass (line {freed}) "
-                f"runs BEFORE the onion-skin pass (line {skin}). The skin is what "
-                f"holds the part while the rest of the sheet is cut; cutting "
-                f"through first leaves it loose under a moving spindle",
+                f"runs BEFORE {cuts[skin_index].what} (line {skin}). The earlier "
+                f"pass leaves material holding the part while the rest of the sheet "
+                f"is cut, and takes the outline's first bite so the deep pass does "
+                f"not have to take it all; cutting through first gives up both",
                 freed,
             )
         )

@@ -326,6 +326,121 @@ Five milestones, each written by an Opus subagent and reviewed:
   showing).  Cut-list labels carry an em dash — Qt renders it; a cp1252
   console print shows a replacement char (cosmetic, demo/self-test only).
 
+## 2026-08-05 later session: T13 groove clamp + tabbed holding (job R0805)
+
+Spec: `CLAUDE_CODE_PROMPT_Tabs_and_Groove_Clamp.md` (repo root). Two
+production failures on job R0805 (sheet `R080501N.anc`, 1×W3330 rotated +
+1×WDC2436): the W3330's T13 stile grooves overran 0.375 past the part ends
+and the 0.6299 cutter took two bites 0.235" into the WDC 0.455" away (and ran
+0.42 past the sheet edge); and both frames broke during perimeter cutout
+because the opening dropouts were fully freed before the perimeter was
+touched. Scott ratified: clamp all T13 grooves inside the part (over a
+nesting-clearance rule), and hold everything with tabs released by a final
+slow T12 pass. **Tests 1149 → 1216 across the session (from 1046), all green
+except the six golden round-trip methods awaiting the §5 re-blessing below.**
+Each milestone written by an Opus subagent and reviewed; nothing committed.
+
+- **M1 — groove clamp + verifier gap.** Why the verifier passed R0805: the
+  foreign-cut check judged shallow (not-through) cuts at the tool CENTRE
+  only — the deliberate 2026-08-04 "shallow-cut waiver" — and the groove's
+  centre never enters the neighbour, only its swept width does. Waiver
+  closed: every in-material cut is judged on swept width against foreign
+  parts (own part stays exempt; that is what lets a groove cut its own
+  part). `groove_segment` clamps stile-groove endpoints to one T13 radius
+  inside the part ends (`PanelSpec.end_inset = 0.0` = flush, Scott's
+  ratified choice, the single place to adjust); rail grooves and WDC/T17
+  byte-identical. reconstruct matches BOTH shapes (clamped + legacy) so the
+  reference files still read. **R710101N and R730101N are now REFUSED — 5
+  pinned findings each (`LEGACY_GROOVE_FOREIGN_CUTS`): the shop's own CAM
+  made the identical divot cut on those sheets.** Scott ratified the
+  grandfathering. Fixture: `tests/test_r0805_regression.py` + frozen
+  `tests/data/r0805_old_emission.anc` (refused forever); nothing catches a
+  shallow cut running off the sheet edge (recorded open; moot post-clamp).
+- **M2a — onion-skin perimeter pass removed** (Scott: "don't need it
+  anymore" — tabs hold the parts now). Generated sheets run ONE perimeter
+  pass, the through pass (`generated_post_passes`/`post_config_for` in
+  from_layout — the only spot); the measured two-pass dialect stays in
+  `default_config` for reading references. Through pass now cuts 0.756 deep
+  vs the skin's 0.69 (~10% more chip load). The verifier backstop for the
+  part gap at exactly 0.375 is half-gone (through pass sweeps exactly
+  0.375 — tangent; the lead-in ramp still refuses entry-side neighbours at
+  0.3938); the enforcement is `nesting.MIN_PART_GAP = 0.455`. NOTE:
+  `validate_layouts` does not itself enforce the floor (validates against
+  the config's own gap) — the app can't produce a sub-floor layout, but a
+  hand-built one via `Session.set_result` isn't caught there.
+- **M2b — tab model** (`post/tabs.py`, pure/deterministic; `TabSpec` on
+  PostConfig: top_z 0.25, length 0.75, corner clearance 2.0, max_gap 10.0 —
+  ratified policy, not measurement). Zones live on the FINISHED profile
+  (side + midpoint-relative centre) so one tab block spans both opening
+  kerfs; placement per side: symmetric, ≤10" gaps (2 on 14", 4 on 30-36"),
+  ≥2" corner clearance including ramps, lead-in span excluded (derived
+  ≈4.01", never hardcoded), relocate-not-shrink; documented fallback chain
+  for degenerate sides (fewer → one centred → clearance yields → zero).
+  Emitter lifts every pass below 0.25 over every zone (climb+traverse at
+  modal cut feed, descent at entry feed — the loop's own ramp grammar, no
+  new F values).
+- **M3 — release section + wiring + verifier + sim + report.**
+  `ReleaseSpec` (cut 150. / plunge 50., Scott-approved ~50% of T12 detail;
+  overlap 0.1 = proposal pending Scott). Sections: T13 → T17 → openings →
+  detail → perimeter → **T12 release, always last**; per tab: rapid into
+  open kerf, plunge F50, one straight cut F150 through the tab
+  (0.75 + both ramps + overlap), retract. Release path FLUSH with the
+  finished profile (openings: the T12 detail path; perimeters: part edge
+  GROWN by the T12 radius — never the T11 centreline, which would leave a
+  0.09 rib). Order: opening tabs, then perimeters, inners-before-hosts.
+  Verifier `hold` invariant re-derived independently (bridges = gaps in the
+  severed boundary; every bridge released exactly once, flush, at the
+  release feeds; freed-early/never-released/centreline/wrong-feed refusals;
+  too-small bridge reads as NO bridge — safe direction). reconstruct reads
+  tabbed programs (and tabbed output round-trips byte-exact — pinned).
+  Sim: through pass = skinned, release frees (`RevealKind.BRIDGE` draws
+  standing tabs). Report: one-line tab-held note per sheet. 7-21 order: 41
+  sheets / 17 unique, zero refusals, production and dry-run, 3416 tabs.
+- **M4 — goldens, SIGNED OFF.** `reference/goldens/R71/72/73...anc`
+  regenerated; annotated diff in `docs/2026-08-05_golden_reblessing.md`
+  (17/17/16 lines, ALL T13 stile-groove endpoints moved by exactly 0.68995
+  = 0.375 overrun + 0.31495 radius, plus the T11 section head in R71/R72
+  restating the last T13 point; line counts identical, everything else
+  byte-identical; tabs/skin/release deliberately absent — round-trips
+  regenerate the file's own pre-amendment plan). Scott signed off
+  2026-08-05; the six round-trip tests now compare against the goldens via
+  `golden()` helpers in test_post/test_motion (reconstruction still starts
+  from the measured originals). Suite fully green at that point: 1216.
+- **T11 max bite (Scott, 2026-08-05, after the sign-off): the 3/8
+  compression bit takes at most 0.4" of material per pass** on generated
+  sheets, to reduce load. Equal bites (n = ceil(depth/0.4)): perimeter =
+  Z0.372 + Z-0.006 (2 x 0.378), each opening = Z0.45 + Z0.15 (2 x 0.30),
+  emitted back to back like the T17 bites. `ToolSpec.max_bite` (None in the
+  measured table) + `T11_MAX_BITE = 0.4` applied in `post_config_for`;
+  `PostConfig.openings_pass` became `openings_passes` (tuple, mirrors
+  perimeter_passes). The intermediate perimeter pass is the measured skin
+  spec at Z0.372 (offset 0.1895 spring stock, through pass finish-shaves) —
+  so a 0.375 part gap is again refused from every direction. New `max-bite`
+  violation kind: configured ladder validated AND the file's actual ladder
+  re-derived in file order (dropped rung / deep-first refused). Shallow
+  rungs sit above the 0.25 tab top: no lifts, no hold-refusal, tab
+  placement identical (3416 zones). References/goldens byte-untouched
+  (their plans carry the measured depths). Addendum recorded in the
+  re-blessing doc. **Suite: 1246 tests, fully green.**
+
+### Open items from this session
+
+- Ratifications Scott has NOT explicitly seen: the OPENINGS split under the
+  T11 rule (his message named the perimeter; the rule as stated is
+  per-tool, and the opening pass took 0.60 — if he meant perimeter-only,
+  the fix is declaring the limit per-section instead of on the tool); equal
+  bites (0.378+0.378) vs max-first (0.4+0.356); release `overlap = 0.1`;
+  the degenerate-side tab fallback chain; a 12" ENTRY side (e.g. W3012's)
+  holds ONE relaxed tab (min-2 + 2" clearance + 8.4" lead-in don't fit);
+  sim shows one release occurrence per profile; rung cut-list wording
+  ("0.378 deep, 0.372 left").
+- `validate_layouts` doesn't enforce MIN_PART_GAP itself (see M2a note) —
+  mostly moot again now that the 0.1895-offset intermediate pass restores
+  the verifier backstop at 0.375.
+- Cut the R0805 job again for real: acceptance is the sheet coming off the
+  machine whole, with no divots.
+- Nothing committed — Scott commits when he says so.
+
 ## Where the previous session left off (2026-08-03/04)
 
 Session log, in order — commits `91757dd` (Milestone 5 complete),

@@ -64,11 +64,13 @@ from ...post.generator import (
     loop_extent,
     wdc_slot_segment,
 )
+from ...post.tabs import zone_point
 from ...post.model import (
     SECTION_DETAIL,
     SECTION_OPENINGS,
     SECTION_PANEL,
     SECTION_PERIMETER,
+    SECTION_RELEASE,
     SECTION_WDC_SLOT,
     Box,
     CutPlan,
@@ -340,11 +342,35 @@ class RevealKind(StrEnum):
     OPENING = "opening"
     #: The T12 finishing pass on an opening: the rim, cut to the line.
     DETAIL = "detail"
-    #: Perimeter pass 0: the part is scored to size and still held by the
-    #: onion skin.
+    #: Perimeter pass 0: the part is scored to size.  With the measured
+    #: two-pass table that is the Z0.06 onion skin, and the part is still held by
+    #: it; on a generated sheet it is the first rung of the 2026-08-05 max-bite
+    #: ladder at Z0.372 (Scott: 0.4 of material per T11 pass —
+    #: :func:`~faceframe_cnc.post.from_layout.generated_post_passes`), and what
+    #: holds the part there is its tabs.  On a table with a single perimeter pass
+    #: that same occurrence is also the through pass, so this kerf and
+    #: :attr:`FREED` appear together.
     SKIN = "skin"
-    #: The last perimeter pass: the part is loose on the spoilboard.
+    #: The part is loose on the spoilboard.  On a tab-held sheet that is the
+    #: final T12 RELEASE, not the perimeter pass (2026-08-05 amendment §3d).
     FREED = "freed"
+    #: A holding tab still standing in a kerf: the one kind here that is material
+    #: STILL THERE rather than material gone.
+    #:
+    #: It exists because the kerf reveals around it would otherwise be a lie.  A
+    #: perimeter or detail pass that lifted over a tab did NOT cut the profile
+    #: everywhere, and :attr:`SKIN`/:attr:`DETAIL` draw an unbroken ring; the
+    #: bridge is the correction, drawn from the kerf floor up to
+    #: :attr:`~faceframe_cnc.post.model.TabSpec.top_z` where the material really
+    #: is.  It appears when the through pass has run and disappears when the
+    #: release cut takes it, which is what makes "nothing is loose until the very
+    #: end" something the operator can SEE.
+    #:
+    #: Simplification, stated rather than hidden: the block drawn is the tab's
+    #: FULL-HEIGHT length.  The ramp wedges at either end are standing material
+    #: too, and they taper from nothing to the full 0.25, so drawing them would
+    #: mean two prisms per tab for a shape the eye reads as the same bar.
+    BRIDGE = "bridge"
 
 
 @dataclass(frozen=True)
@@ -428,9 +454,18 @@ class Reveal:
 
 
 def reveals(
-    state: "MaterialState", program: SheetProgram, config: PostConfig
+    state: "MaterialState",
+    program: SheetProgram,
+    config: PostConfig,
+    plan: CutPlan | None = None,
 ) -> tuple[Reveal, ...]:
     """Every :class:`Reveal` visible at ``state``, in a deterministic order.
+
+    ``plan`` is only needed for the holding tabs (2026-08-05 amendment): the
+    zones live on the plan (:attr:`~faceframe_cnc.post.model.CutPlan.tabs`), so
+    without one there are no :attr:`RevealKind.BRIDGE` reveals — which is the
+    right answer for every untabbed program and keeps this signature working for
+    callers that had no plan to give.
 
     A fold over the material state, part by part and within a part in a fixed
     kind order, so two calls with equal states return equal tuples — which is
@@ -471,7 +506,7 @@ def reveals(
                     z_cut=panel.z_cut,
                     depth=config.stock_top_z - panel.z_cut,
                     width=tool.diameter,
-                    segment=groove_segment(part, groove, panel),
+                    segment=groove_segment(part, groove, panel, tool.radius),
                 )
             )
 
@@ -495,7 +530,20 @@ def reveals(
             )
 
         rounds = (
-            (RevealKind.OPENING, SECTION_OPENINGS, config.openings_pass, entry.openings_cut),
+            # The T11 rough is drawn at the DEEPEST configured opening pass: on a
+            # generated sheet the roughing is a two-rung max-bite ladder
+            # (2026-08-05) and the state model holds one fact per opening, "T11
+            # has roughed it", so the pocket is drawn at the depth the ladder
+            # finishes at.  Stated rather than hidden: between the two rungs the
+            # drawn pocket is one bite deeper than the machine has actually cut,
+            # for the length of one occurrence — the same eye-level simplification
+            # as the tab ramps in :attr:`RevealKind.BRIDGE`.
+            (
+                RevealKind.OPENING,
+                SECTION_OPENINGS,
+                config.openings_passes[-1],
+                entry.openings_cut,
+            ),
             (RevealKind.DETAIL, SECTION_DETAIL, config.detail_pass, entry.openings_detailed),
         )
         for kind, section, spec, done in rounds:
@@ -517,6 +565,13 @@ def reveals(
                     )
                 )
 
+        # The scored kerf, from whichever pass scored it: perimeter pass 0, which
+        # on the measured table is the Z0.06 onion skin and on a generated sheet
+        # is the first rung of the 2026-08-05 max-bite ladder (Z0.372).  Either
+        # way it is the pass that first puts a kerf round the part, and its own Z
+        # is what the kerf is drawn at.  On a table with a SINGLE perimeter pass
+        # pass 0 is also the last one, so this reveal and the FREED one below are
+        # added for the same occurrence.
         if entry.skinned:
             spec = config.perimeter_passes[0]
             tool = config.tool(SECTION_PERIMETER)
@@ -548,7 +603,93 @@ def reveals(
                 )
             )
 
+        # The tabs still standing (2026-08-05 amendment §3d): drawn last so a
+        # bridge sits on top of the kerf reveal it corrects.
+        out.extend(_bridges(index, part, entry, make, plan, config))
+
     return tuple(out)
+
+
+def _bridges(part_index, part, entry, make, plan: CutPlan | None, config: PostConfig):
+    """The holding tabs of one part that are cut but not yet released.
+
+    A tab is visible exactly between the two facts the material model already
+    holds: the profile has been cut right through (so the kerf around the tab
+    exists) and its release has not run (so the tab does).  Nothing here decides
+    when that is — :class:`~faceframe_cnc.sim.PartState` does — and nothing here
+    decides WHERE a tab is: the zones come off the plan, and the block is drawn
+    on the through pass's own path grown by that pass's tool radius, which is the
+    kerf the tab is standing in.
+    """
+    if plan is None or not plan.tabs:
+        return []
+    out = []
+    profiles = [
+        (
+            ("perimeter", 0),
+            part.box,
+            config.perimeter_passes[-1],
+            config.tool(SECTION_PERIMETER),
+            entry.skinned and not entry.freed,
+        )
+    ]
+    for opening in range(len(part.openings)):
+        profiles.append(
+            (
+                ("opening", opening),
+                part.openings[opening],
+                config.detail_pass,
+                config.tool(SECTION_DETAIL),
+                opening in entry.openings_detailed
+                and opening not in entry.openings_released,
+            )
+        )
+    for (kind, feature), finished, spec, tool, standing in profiles:
+        zones = plan.tabs.get((part_index, kind, feature), ())
+        if not zones or not standing:
+            continue
+        path = finished.grow(spec.offset)
+        for position, zone in enumerate(zones):
+            low, high = zone.span()
+            start = zone_point(path, zone.side, low)
+            end = zone_point(path, zone.side, high)
+            out.append(
+                make(
+                    RevealKind.BRIDGE,
+                    # The feature index has to identify the TAB, not the profile:
+                    # one profile has several, and a reveal key is one entity.
+                    _bridge_feature(kind, feature, position),
+                    pass_index=None,
+                    z_cut=spec.z_cut,
+                    depth=config.stock_top_z - spec.z_cut,
+                    width=tool.diameter,
+                    box=Box(
+                        min(start[0], end[0]) - tool.radius,
+                        min(start[1], end[1]) - tool.radius,
+                        max(start[0], end[0]) + tool.radius,
+                        max(start[1], end[1]) + tool.radius,
+                    ),
+                )
+            )
+    return out
+
+
+#: How many tabs one profile's bridge keys are numbered within.  A key is
+#: ``kind:part:feature:pass``, so a bridge's "feature" number has to encode
+#: which profile AND which tab of it; this is the stride, and 1000 is four
+#: orders of magnitude more tabs than a 97" side could hold.
+BRIDGE_STRIDE = 1000
+
+
+def _bridge_feature(kind: str, feature: int, position: int) -> int:
+    """A bridge's feature number: which profile, and which tab of it.
+
+    Perimeter profiles take the negative half of the range and openings the
+    positive, so a part's perimeter tab and its opening-0 tab can never collide
+    on one key.
+    """
+    base = feature * BRIDGE_STRIDE + position
+    return -1 - base if kind == "perimeter" else base
 
 
 def freed_parts(items: tuple[Reveal, ...]) -> frozenset[int]:
@@ -719,10 +860,22 @@ def lead_in_overlays(
     parts = program.flat_parts()
     out: list[Overlay] = []
 
+    # One round per loop the program cuts: every configured T11 opening depth
+    # pass (two on a generated sheet since the 2026-08-05 max-bite amendment,
+    # one on the references), the T12 detail pass, then every perimeter pass.
+    # The pass index is None where the table configures a single pass, which is
+    # exactly what the emitter tags those motions with.
+    openings_passes = config.openings_passes
     rounds: list[tuple[str, object, list, int | None]] = [
-        (SECTION_OPENINGS, config.openings_pass, list(plan.openings), None),
-        (SECTION_DETAIL, config.detail_pass, list(plan.detail_order()), None),
+        (
+            SECTION_OPENINGS,
+            spec,
+            list(plan.openings),
+            None if len(openings_passes) == 1 else index,
+        )
+        for index, spec in enumerate(openings_passes)
     ]
+    rounds.append((SECTION_DETAIL, config.detail_pass, list(plan.detail_order()), None))
     for pass_index, refs in enumerate(plan.perimeter):
         rounds.append(
             (
@@ -833,6 +986,13 @@ def cut_reveal_key(cut: "CutOccurrence", config: PostConfig) -> str | None:
         return reveal_key(RevealKind.DETAIL, cut.part_index, cut.feature.index, None)
     if section == SECTION_PERIMETER and cut.pass_index == 0:
         return reveal_key(RevealKind.SKIN, cut.part_index, 0, 0)
+    # A RELEASE occurrence (2026-08-05 amendment) leaves no feature entity of its
+    # own either: what it leaves is a loose piece.  An opening's release is drawn
+    # on the DETAIL rim it re-traces — the kerf that release cut belongs to and
+    # the one thing on screen at that place — and a perimeter's on the part,
+    # exactly as the pass that cut the outline through is.
+    if section == SECTION_RELEASE and cut.feature.kind == "opening":
+        return reveal_key(RevealKind.DETAIL, cut.part_index, cut.feature.index, None)
     return None
 
 

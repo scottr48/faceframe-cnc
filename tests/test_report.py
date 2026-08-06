@@ -416,6 +416,22 @@ class SheetPageTest(unittest.TestCase):
     def test_a_nested_frame_says_which_host_it_comes_out_of(self):
         self.assertIn("nested in W2742", self.pdf.text(self.page))
 
+    def test_the_page_says_the_parts_are_tab_held(self):
+        """2026-08-05 amendment (Scott, job R0805, spec §3d).
+
+        The operator has to know that this sheet does NOT come apart as it is
+        cut: two frames broke because one did.  A program that looks finished but
+        has not run its last section yet has every part still attached, and the
+        numbers in the note are the post table's own.
+        """
+        from faceframe_cnc.post.model import default_config
+
+        text = self.pdf.text(self.page)
+        self.assertIn("TAB-HELD", text)
+        self.assertIn(f'{default_config().tabs.top_z:g}" tabs', text)
+        self.assertIn("T12 release pass", text)
+        self.assertIn("Nothing is loose until that last section has run", text)
+
     def test_the_scale_is_stated(self):
         scale, _ox, _oy = cutsheet.sheet_transform(self.config)
         self.assertIn(f"scale 1:{72.0 / scale:.1f}", self.pdf.text(self.page))

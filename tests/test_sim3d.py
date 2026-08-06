@@ -47,6 +47,7 @@ from faceframe_cnc.post import ProgramHeader, default_config, plan_sheet
 from faceframe_cnc.post.generator import groove_segment, wdc_slot_segment
 from faceframe_cnc.post.model import (
     SECTION_DETAIL,
+    SECTION_RELEASE,
     SECTION_OPENINGS,
     SECTION_PANEL,
     SECTION_PERIMETER,
@@ -141,14 +142,54 @@ def nested_timeline() -> SimTimeline:
     return SimTimeline.build(program, plan, default_config())
 
 
+def one_pass_timeline() -> SimTimeline:
+    """The nested sheet with the post table a GENERATED sheet is cut with.
+
+    The two fixtures above use the measured table deliberately: two perimeter
+    passes, which is the dialect the reference programs are in and the only one
+    with a separate onion-skin lap to draw.  This one uses what
+    :func:`~faceframe_cnc.post.from_layout.post_config_for` hands the emitter —
+    the through pass alone since the 2026-08-05 amendment (Scott, job R0805) —
+    so the reveal model's skinned-then-freed pair can be checked where the two
+    coincide.
+    """
+    from faceframe_cnc.post import post_config_for
+
+    config = post_config_for(NestingConfig())
+    layout = SheetLayout(
+        [
+            Placement(
+                "W2742",
+                0.0,
+                0.0,
+                27.0,
+                42.0,
+                False,
+                [Placement("W3012", 5.0, 6.0, 12.0, 30.0, True, [])],
+            ),
+            Placement("W3012", 30.0, 0.0, 12.0, 30.0, True, []),
+        ]
+    )
+    demand = [PartSpec("W2742", 27.0, 42.0, 1), PartSpec("W3012", 30.0, 12.0, 2)]
+    program, plan = plan_sheet(
+        layout,
+        ProgramHeader(name="R990104N", created=CREATED),
+        demand,
+        NestingConfig(),
+        config,
+    )
+    return SimTimeline.build(program, plan, config)
+
+
 _TIMELINES: dict[str, SimTimeline] = {}
 
 
 def timeline(label: str) -> SimTimeline:
-    """Both fixtures, built once: planning two sheets is not free."""
+    """Every fixture, built once: planning three sheets is not free."""
     if not _TIMELINES:
         _TIMELINES["WDC"] = wdc_timeline()
         _TIMELINES["NESTED"] = nested_timeline()
+        _TIMELINES["ONE_PASS"] = one_pass_timeline()
     return _TIMELINES[label]
 
 
@@ -184,7 +225,13 @@ def first_cut(item: SimTimeline, **match):
 
 
 def reveals_at(controller: SimController, item: SimTimeline):
-    return vm.reveals(controller.state, item.program, item.config)
+    """The reveal list at a cursor, plan included.
+
+    The plan is what carries the holding tabs since the 2026-08-05 amendment
+    (:attr:`~faceframe_cnc.post.model.CutPlan.tabs`), and the scene passes it for
+    the same reason: without it the kerf reveals claim more than the pass cut.
+    """
+    return vm.reveals(controller.state, item.program, item.config, item.plan)
 
 
 def of_kind(items, kind):
@@ -336,7 +383,8 @@ class RevealModelTest(unittest.TestCase):
         self.assertIs(reveal.kind, vm.RevealKind.GROOVE)
         self.assertEqual(reveal.part_index, cut.part_index)
         self.assertEqual(
-            reveal.segment, groove_segment(part, cut.feature.index, panel)
+            reveal.segment,
+            groove_segment(part, cut.feature.index, panel, tool.radius),
         )
         self.assertAlmostEqual(reveal.width, tool.diameter, delta=TOL)
         self.assertAlmostEqual(
@@ -404,7 +452,14 @@ class RevealModelTest(unittest.TestCase):
     def test_an_opening_reveals_the_hole_each_pass_actually_leaves(self):
         item = timeline("WDC")
         for section, kind, spec in (
-            (SECTION_OPENINGS, vm.RevealKind.OPENING, item.config.openings_pass),
+            # The T11 rough is drawn at the DEEPEST rung of its ladder
+            # (2026-08-05 max-bite amendment), which is the depth the pocket is
+            # left at once the roughing is done.
+            (
+                SECTION_OPENINGS,
+                vm.RevealKind.OPENING,
+                item.config.openings_passes[-1],
+            ),
             (SECTION_DETAIL, vm.RevealKind.DETAIL, item.config.detail_pass),
         ):
             with self.subTest(section=section):
@@ -441,6 +496,7 @@ class RevealModelTest(unittest.TestCase):
         self.assertEqual(reveal.box.rounded(6), opening.rounded(6))
 
     def test_the_skin_appears_after_pass_zero_and_freed_after_the_last(self):
+        """The measured two-pass table, where the two are separate events."""
         item = timeline("NESTED")
         last = len(item.config.perimeter_passes) - 1
         controller = SimController(item)
@@ -483,8 +539,67 @@ class RevealModelTest(unittest.TestCase):
                     "the scored outline is the kerf's own centre path",
                 )
 
+    def test_the_perimeter_ladder_scores_the_part_and_leaves_it_tab_held(self):
+        """The kerf appears, the part does NOT come loose (2026-08-05 §3d).
+
+        The kerf drawn is perimeter pass 0's own centre path — on a generated
+        sheet the first rung of the max-bite ladder (offset 0.1895 at Z0.372) —
+        and it is drawn with the standing tabs still in it through the through
+        pass too, which is the honest picture: the outline is cut and the piece
+        has not moved.  The loose part arrives with the release section, in the
+        test below.
+        """
+        item = timeline("ONE_PASS")
+        self.assertEqual(len(item.config.perimeter_passes), 2, "the max-bite ladder")
+        spec = item.config.perimeter_passes[0]
+        controller = SimController(item)
+        for cut in [c for c in item.cuts if c.section == SECTION_PERIMETER]:
+            with self.subTest(part=cut.part_number, pass_index=cut.pass_index):
+                controller.seek(cut.end)
+                mine = [
+                    r
+                    for r in reveals_at(controller, item)
+                    if r.part_index == cut.part_index
+                ]
+                skin = of_kind(mine, vm.RevealKind.SKIN)
+                freed = of_kind(mine, vm.RevealKind.FREED)
+                self.assertEqual(len(skin), 1)
+                self.assertEqual(len(freed), 0, "tab-held, not loose")
+                self.assertEqual(skin[0].pass_index, 0)
+                part = item.program.flat_parts()[cut.part_index]
+                self.assertEqual(
+                    skin[0].box.rounded(6), part.box.grow(spec.offset).rounded(6)
+                )
+
+    def test_the_release_section_is_what_shows_a_part_loose(self):
+        item = timeline("ONE_PASS")
+        controller = SimController(item)
+        release = [
+            c
+            for c in item.cuts
+            if c.section == SECTION_RELEASE and c.feature.kind == "perimeter"
+        ]
+        self.assertTrue(release, "a generated sheet has a release section")
+        for cut in release:
+            with self.subTest(part=cut.part_number):
+                controller.seek(cut.end)
+                mine = [
+                    r
+                    for r in reveals_at(controller, item)
+                    if r.part_index == cut.part_index
+                ]
+                freed = of_kind(mine, vm.RevealKind.FREED)
+                self.assertEqual(len(freed), 1)
+                part = item.program.flat_parts()[cut.part_index]
+                self.assertEqual(freed[0].box, part.box)
+                self.assertEqual(
+                    of_kind(mine, vm.RevealKind.BRIDGE),
+                    [],
+                    "and its holding tabs are gone",
+                )
+
     def test_a_host_is_revealed_loose_only_after_its_passengers(self):
-        """The 2026-08-03 onion-skin order, read off the reveal model."""
+        """Inners before hosts, read off the reveal model (two-pass table)."""
         item = timeline("NESTED")
         families = hosts_and_children(item)
         self.assertTrue(families, "the fixture must nest something")
@@ -1345,6 +1460,107 @@ class DeterminismTest(unittest.TestCase):
         self.assertEqual(first.scene.snapshot(), second.scene.snapshot())
         self.assertEqual(first.controller.step_index, second.controller.step_index)
         self.assertAlmostEqual(first.fraction, second.fraction, delta=TOL)
+
+
+class BridgeRevealTest(unittest.TestCase):
+    """The holding tabs, visible in the kerf (2026-08-05 amendment §3d).
+
+    A kerf reveal draws an unbroken ring, and on a tabbed sheet that is not what
+    the pass cut: it rose over every tab instead of cutting through it.  The
+    BRIDGE reveal is the correction — the one kind in the model that is material
+    still THERE — and it is what makes "nothing is loose until the very end"
+    something the operator can see rather than something a docstring claims.
+    """
+
+    def setUp(self):
+        self.item = timeline("ONE_PASS")
+        self.controller = SimController(self.item)
+
+    def bridges(self, part_index=None):
+        items = reveals_at(self.controller, self.item)
+        return [
+            r
+            for r in items
+            if r.kind is vm.RevealKind.BRIDGE
+            and (part_index is None or r.part_index == part_index)
+        ]
+
+    def test_nothing_stands_before_anything_is_cut(self):
+        self.assertEqual(self.bridges(), [])
+
+    def test_the_through_pass_leaves_one_bridge_per_tab(self):
+        for cut in [c for c in self.item.cuts if c.section == SECTION_PERIMETER]:
+            self.controller.seek(cut.end)
+            zones = self.item.plan.tabs[(cut.part_index, "perimeter", 0)]
+            with self.subTest(part=cut.part_number):
+                mine = [
+                    r
+                    for r in self.bridges(cut.part_index)
+                    if r.feature_index < 0  # the perimeter half of the key space
+                ]
+                self.assertEqual(len(mine), len(zones))
+
+    def test_a_detailed_opening_keeps_its_dropout_hanging(self):
+        cut = first_cut(self.item, section=SECTION_DETAIL)
+        self.controller.seek(cut.end)
+        zones = self.item.plan.tabs[(cut.part_index, "opening", cut.feature.index)]
+        mine = [r for r in self.bridges(cut.part_index) if r.feature_index >= 0]
+        self.assertEqual(len(mine), len(zones))
+
+    def test_the_release_takes_them_away(self):
+        self.controller.to_end()
+        self.assertEqual(self.bridges(), [], "the program ends with nothing standing")
+
+    def test_a_bridge_stands_in_its_own_kerf_and_is_a_tab_tall(self):
+        cut = first_cut(self.item, section=SECTION_PERIMETER)
+        self.controller.seek(cut.end)
+        spec = self.item.config.perimeter_passes[-1]
+        tool = self.item.config.tool(SECTION_PERIMETER)
+        part = self.item.program.flat_parts()[cut.part_index]
+        kerf = part.box.grow(spec.offset)
+        mine = [r for r in self.bridges(cut.part_index) if r.feature_index < 0]
+        self.assertTrue(mine, "the perimeter half of the key space")
+        for bridge in mine:
+            with self.subTest(key=bridge.key):
+                self.assertAlmostEqual(bridge.z_cut, spec.z_cut, places=9)
+                self.assertAlmostEqual(bridge.width, tool.diameter, places=9)
+                # the block sits across the kerf: one tool wide, and the tab's
+                # full-height length along the profile
+                short, long = sorted((bridge.box.width, bridge.box.height))
+                self.assertAlmostEqual(short, tool.diameter, places=9)
+                self.assertAlmostEqual(
+                    long, self.item.config.tabs.length + tool.diameter, places=9
+                )
+                self.assertTrue(kerf.grow(tool.radius + 1e-9).contains(bridge.box, 1e-9))
+
+    def test_every_bridge_has_a_key_of_its_own(self):
+        self.controller.seek(
+            first_cut(self.item, section=SECTION_PERIMETER).end
+        )
+        keys = [r.key for r in self.bridges()]
+        self.assertEqual(len(keys), len(set(keys)))
+        self.assertTrue(all(key.startswith("bridge:") for key in keys))
+
+    def test_an_untabbed_program_has_no_bridges(self):
+        """Every reference file, and anything emitted before the amendment."""
+        item = timeline("NESTED")
+        controller = SimController(item)
+        controller.to_end()
+        self.assertEqual(
+            [r for r in reveals_at(controller, item) if r.kind is vm.RevealKind.BRIDGE],
+            [],
+        )
+
+    def test_a_reveal_list_built_without_a_plan_has_no_bridges(self):
+        """The plan is where the zones live, so no plan means no claim."""
+        self.controller.seek(first_cut(self.item, section=SECTION_PERIMETER).end)
+        self.assertTrue(self.bridges(), "there are bridges to be missed")
+        plainer = vm.reveals(
+            self.controller.state, self.item.program, self.item.config
+        )
+        self.assertEqual(
+            [r for r in plainer if r.kind is vm.RevealKind.BRIDGE], []
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -33,7 +33,12 @@ T11 opening           a dark through-pocket
 T12 detail            a rim ring around that pocket, in the 2D preview's
                       opening-edge colour
 perimeter pass 0      a bright scored outline lying on the part's face: the
-                      part is cut to size and the onion skin still holds it
+                      part is cut to size.  On the measured two-pass table
+                      the onion skin still holds it; on a generated sheet's
+                      max-bite ladder (2026-08-05) that pass is the first
+                      0.378 bite and the tabs hold it; on a table with a
+                      single perimeter pass the same occurrence also frees
+                      it, so both rows below apply at once
 last perimeter pass   the whole part group LIFTS by :data:`FREED_LIFT` and
                       an edge highlight comes on — a freed part must be
                       unmistakable
@@ -155,6 +160,10 @@ SPINDLE_BODY_RADIUS = 0.85
 #: machined channel, a V slot (deliberately unlike the channel), a void, and
 #: the spindle.
 GROOVE_COLOR = QColor("#54636e")
+#: VISUAL ONLY.  A holding tab standing in a kerf (2026-08-05 amendment §3d):
+#: the stock's own tone, a shade brighter so a bar across a kerf reads as
+#: material rather than as a gap in the drawing.
+BRIDGE_COLOR = QColor("#c8b48c")
 SLOT_COLOR = QColor("#8a6a3a")
 VOID_COLOR = QColor("#232a30")
 SPINDLE_COLOR = QColor("#41474d")
@@ -169,6 +178,10 @@ FEATURE_COLORS = {
     RevealKind.OPENING: VOID_COLOR,
     RevealKind.DETAIL: OPENING_EDGE,
     RevealKind.SKIN: SELECT_EDGE,
+    # A holding tab is the one "reveal" that is material still THERE
+    # (:attr:`~.viewmodel.RevealKind.BRIDGE`), so it is drawn in the stock's own
+    # colour: what the operator sees is the sheet showing through its own kerf.
+    RevealKind.BRIDGE: BRIDGE_COLOR,
 }
 
 #: VISUAL ONLY.  Bit colours, keyed by the tool NUMBER the post table names —
@@ -620,6 +633,19 @@ class SimScene:
             return _outline(
                 parent, reveal.box, floor, top, reveal.width, color, reveal.key
             )
+        if reveal.kind is RevealKind.BRIDGE:
+            # From the kerf floor UP to the tab top: the material the pass that
+            # cut this kerf rose over instead of cutting (spec §3b).  It goes
+            # away when the release cut takes it, which the enable/disable pass
+            # in :meth:`update` does for free.
+            return _slab(
+                parent,
+                reveal.box,
+                floor,
+                min(self.config.tabs.top_z, top),
+                color,
+                reveal.key,
+            )
         if reveal.kind is RevealKind.SKIN:
             face = self.config.stock_top_z
             return _outline(
@@ -892,7 +918,12 @@ class SimScene:
         """
         step = None if controller.current_motion is None else controller.step_index
         self.update(
-            reveals(controller.state, self.program, self.config),
+            reveals(
+                controller.state,
+                self.program,
+                self.config,
+                controller.timeline.plan,
+            ),
             controller.tool,
             tip_at(controller, fraction, self.config),
             step,

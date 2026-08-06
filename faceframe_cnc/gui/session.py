@@ -277,9 +277,19 @@ class AppSettings:
         elif self.part_gap < MIN_PART_GAP - 1e-12:
             # Hard machine floor (2026-08-03): the T11 perimeter lead-in
             # sweeps 0.425 past the part edge, so a closer neighbour gets
-            # cut into and the NC verifier refuses the sheet.  Refusing here
-            # is the backstop for any path that dodges the settings dialog
-            # and the load-time migration.
+            # cut into.  Refusing here is the backstop for any path that
+            # dodges the settings dialog and the load-time migration.
+            #
+            # The 2026-08-05 amendments moved this twice and it ends up where it
+            # started: dropping the onion skin left the through pass reaching
+            # exactly 0.375 at depth (tangent, and tangent is not an overlap), so
+            # for part of that day a 0.375 gap away from the lead-in edge verified
+            # clean; the max-bite ladder then put a pass back at the measured
+            # 0.1895 offset, whose at-depth loop sweeps 0.377 past the part edge
+            # again.  So the verifier does refuse a 0.375 gap on its own — but
+            # this floor is what keeps such a layout off the machine whether or
+            # not the pass ladder happens to catch it.  See
+            # tests/test_r0805_regression.SweptWidthBoundariesTest.
             problems.append(
                 f"part gap must be at least {MIN_PART_GAP:g} in - the NC "
                 f"perimeter lead-in sweeps 0.425 in past the part edge, so "
@@ -503,12 +513,15 @@ _OPENING_INSET: Optional[float] = None
 def opening_tool_inset() -> float:
     """How far inside each opening edge the NC post runs its tool centre.
 
-    READ-ONLY from :func:`faceframe_cnc.post.model.default_config`: the T11
+    READ-ONLY from :func:`faceframe_cnc.post.model.default_config`: every T11
     opening pass runs 0.1975 inside the finished edge (0.1875 tool radius +
     0.010 of finish stock left for T12) and the T12 detail pass 0.1.  The
     deepest of those insets decides whether an opening has any tool path
-    left at all.  Imported lazily and cached — this is the only number the
-    order model needs out of the post package.
+    left at all — which is why every configured pass is walked rather than one
+    of them named: the 2026-08-05 max-bite ladder made the T11 roughing several
+    passes, and they share this offset only because the table says so.
+    Imported lazily and cached — this is the only number the order model needs
+    out of the post package.
     """
     global _OPENING_INSET
     if _OPENING_INSET is None:
@@ -516,7 +529,9 @@ def opening_tool_inset() -> float:
 
         post = default_config()
         _OPENING_INSET = max(
-            -float(post.openings_pass.offset), -float(post.detail_pass.offset), 0.0
+            0.0,
+            -float(post.detail_pass.offset),
+            *(-float(spec.offset) for spec in post.openings_passes),
         )
     return _OPENING_INSET
 

@@ -67,6 +67,7 @@ from ..geometry import (
 )
 from ..gui.session import sheet_openings
 from ..post.job import APP_BANNER_NAME, DRY_RUN_BANNER, PARTIAL_SUFFIX, now_created
+from ..post.model import SECTION_RELEASE, default_config
 from . import pdf
 
 __all__ = [
@@ -801,6 +802,13 @@ def _sheet_header(page, job, report, total) -> None:
             color=MUTED,
         )
         y -= 12.0
+    # 2026-08-05 amendment (Scott, job R0805, spec §3d): the operator has to know
+    # that this sheet does NOT come apart as it is cut.  Two frames broke because
+    # they did; now nothing is loose until a final slow T12 pass, and a program
+    # that looks finished on the screen but has not run that section yet has
+    # every part still attached.
+    page.text(CONTENT_LEFT, y, _tab_hold_note(), size=8.5, color=MUTED)
+    y -= 12.0
     if job.dry_run:
         page.text(
             CONTENT_LEFT, y, DRY_RUN_BANNER, font=BOLD, size=9, color=DRY_RUN_COLOR
@@ -1158,6 +1166,22 @@ def _dim(value: float) -> str:
     if "." in text:
         text = text.rstrip("0").rstrip(".")
     return text if text not in ("", "-", "-0") else "0"
+
+
+def _tab_hold_note() -> str:
+    """The one-liner that says this sheet is tab-held (2026-08-05 amendment).
+
+    Built from the post table's own numbers — the tab height and the release
+    tool — so the paperwork cannot drift from what the program does, the same way
+    :func:`_wdc_cutlist_note` reads the geometry engine's stile width.
+    """
+    post = default_config()
+    tool = post.tool(SECTION_RELEASE)
+    return (
+        f'Parts are TAB-HELD: {_dim(post.tabs.top_z)}" tabs hold every frame and '
+        f"every opening dropout until a final slow T{tool.number} release pass. "
+        f"Nothing is loose until that last section has run."
+    )
 
 
 def _wdc_cutlist_note() -> str:

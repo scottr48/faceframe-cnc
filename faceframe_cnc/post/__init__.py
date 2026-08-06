@@ -16,6 +16,11 @@ Modules
 ``generator``
     Emits ``.anc`` text from a ``SheetProgram`` + ``CutPlan``.  Purely
     table-driven: every line comes from the templates in ``model``.
+``tabs``
+    WHERE the holding tabs on a profile are (2026-08-05 amendment §3a):
+    pure, deterministic geometry in profile terms — a side and an offset from
+    its midpoint, never a coordinate.  ``generator`` turns a zone into the
+    lift that forms it (§3b).
 ``motion``
     The same emission as a typed event stream — :class:`~.motion.Motion`
     records tagged with section, feature and depth pass, paired with the
@@ -31,10 +36,14 @@ Modules
     integrity.
 ``from_layout``
     Turns an OPTIMIZER sheet (:class:`faceframe_cnc.nesting.SheetLayout`)
-    into a ``SheetProgram`` + ``CutPlan``, implementing the 2026-08-03
-    onion-skin cutting order and the T17 WDC stile slot — and refusing a
-    sheet where that slot's 45-degree cone would reach a neighbouring part
-    or run off the sheet.
+    into a ``SheetProgram`` + ``CutPlan``, decides the cutting order and the
+    post table a generated sheet is cut with (``post_config_for``: the
+    2026-08-03 onion-skin pass is gone and both T11 operations run the
+    2026-08-05 max-bite ladder instead — at most ``T11_MAX_BITE`` of material
+    per pass, Scott's ratified policy for the 3/8 compression bit; the measured
+    table stays as the references' dialect, with no ladder and no limit), and
+    cuts the T17 WDC stile slot — refusing a sheet where that slot's 45-degree
+    cone would reach a neighbouring part or run off the sheet.
 ``job``
     Writes a whole optimizer run out as one ``.anc`` per sheet, with the
     verifier gating every single write, plus the dry-run (air cut) mode.

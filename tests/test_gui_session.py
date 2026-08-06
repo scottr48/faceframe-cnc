@@ -1652,7 +1652,7 @@ class MillableOpeningTests(unittest.TestCase):
         from faceframe_cnc.post.model import default_config
 
         post = default_config()
-        self.assertEqual(opening_tool_inset(), -post.openings_pass.offset)
+        self.assertEqual(opening_tool_inset(), -post.openings_passes[-1].offset)
         self.assertAlmostEqual(opening_tool_inset(), 0.1975)
         self.assertAlmostEqual(min_millable_opening(), 0.395)
 

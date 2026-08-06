@@ -14,15 +14,29 @@ an operator recognises.  Two units, and the difference between them matters:
     (section, feature, depth pass).  This is the unit the operator steps by
     ("cut 34 of 512") and the unit a cut list enumerates.
 
-An occurrence is not a plan entry.  The plan names a perimeter once and the
-post cuts it TWICE (pass 0, the onion skin at Z0.06, then pass 1 through at
-Z-0.006), so one :class:`~faceframe_cnc.post.model.FeatureRef` yields two
-occurrences; one WDC slot entry likewise yields two, the shallow bite and
-the deep one on the same centreline.  Both are properties of the post table
-(:attr:`~faceframe_cnc.post.model.PostConfig.perimeter_passes`,
+An occurrence is not a plan entry.  The plan names a perimeter once, and an
+opening once, and the post cuts each of them once per configured depth pass, so
+one :class:`~faceframe_cnc.post.model.FeatureRef` can yield more than one
+occurrence; one WDC slot entry always yields two, the shallow bite and the
+deep one on the same centreline.  All three counts are properties of the post
+table (:attr:`~faceframe_cnc.post.model.PostConfig.perimeter_passes`,
+:attr:`~faceframe_cnc.post.model.PostConfig.openings_passes`,
 :attr:`~faceframe_cnc.post.model.WdcSlotSpec.z_cuts`), which is why the
 occurrence carries the pass index the emitter tagged its motions with rather
-than inventing its own numbering.
+than inventing its own numbering — and why nothing here counts passes for
+itself.
+
+How many passes there are depends on which sheet is being watched.  A reference
+program (R710101N and its siblings) was cut with the measured table — one T11
+opening pass at Z0.15, then perimeter pass 0 the Z0.06 onion skin and pass 1
+through at Z-0.006 — and simulates as one opening occurrence and two perimeter
+occurrences per part.  A GENERATED sheet is cut with the 2026-08-05 max-bite
+ladders instead (Scott: at most 0.4 of material per T11 pass, to reduce the load
+on the 3/8 comp), so it simulates as TWO opening occurrences per opening (Z0.45
+then Z0.15) and two perimeter occurrences per part (Z0.372 then through at
+Z-0.006) — the onion skin having gone the same day, its holding job handed to the
+tabs.  The labels say which rung and what it leaves
+(:func:`pass_phase`), so the two two-pass dialects never read alike.
 
 Contiguity is the whole grouping rule
 -------------------------------------
@@ -38,7 +52,13 @@ begins.  Nothing is regrouped by geometry.  Two consequences worth stating:
     nothing;
 *   a plan that listed the identical feature reference twice in a row would
     produce ONE occurrence.  No reference file and no planner order does
-    that, and a genuine repeat is a plan bug, not a display case.
+    that, and a genuine repeat is a plan bug, not a display case;
+*   one profile's whole RELEASE is one occurrence, however many tabs it has
+    (2026-08-05 amendment §3c).  Its several plunge-and-cut blocks are one
+    contiguous run of one feature at one depth, so the general rule already says
+    so — and it is the grouping the freed-at-release semantics needs, because an
+    occurrence takes effect when its LAST step has executed and the piece really
+    does drop when the last of its tabs goes, not when the first one does.
 
 Geometry, never time
 --------------------
@@ -61,6 +81,7 @@ from ..post.model import (
     SECTION_OPENINGS,
     SECTION_PANEL,
     SECTION_PERIMETER,
+    SECTION_RELEASE,
     SECTION_WDC_SLOT,
     CutPlan,
     FeatureRef,
@@ -117,29 +138,73 @@ def _name_of(names: tuple[str, ...], index: int) -> str:
     return f"index {index}"
 
 
-def pass_phase(z_cut: float, config: PostConfig) -> str:
+def pass_phase(z_cut: float, config: PostConfig, section: str | None = None) -> str:
     """What a depth pass at ``z_cut`` leaves behind, as words.
 
     Z0 is the top of the spoilboard and the BOTTOM of the stock
     (:mod:`faceframe_cnc.post.model`), so the material a pass leaves under
-    the cut is ``z_cut`` itself.  Three answers, all measured off the table
-    in hand rather than off the pass's position in it:
+    the cut is ``z_cut`` itself.  Four answers, all read off the table in hand
+    rather than off the pass's position in it:
 
-    *   at or below the bottom of the stock: ``"through"`` — the part is cut
-        free (perimeter pass 2 at Z-0.006 scratches 0.006 into the
+    *   at or below the bottom of the stock: ``"through"`` — the outline is cut
+        right through (perimeter pass 2 at Z-0.006 scratches 0.006 into the
         spoilboard);
     *   above the top of the stock: ``"above the stock"`` — the dry-run
         table's air cut (:func:`~faceframe_cnc.post.job.dry_run_config`)
         touches nothing;
-    *   in between: the onion skin, with its thickness, which for perimeter
-        pass 1 at Z0.06 is the 0.06 that holds the part to the sheet.
+    *   in between, on a table whose tool for ``section`` declares a bite limit
+        (:attr:`~faceframe_cnc.post.model.ToolSpec.max_bite`, the 2026-08-05
+        ratified 0.4 for the 3/8 comp): a rung of the max-bite ladder, said as
+        the BITE IT TAKES rather than its depth below the surface —
+        ``"0.378 deep, 0.372 left"``.  The bite is the number the rule is about
+        (it is the load on the bit), so it is the number shown: the second rung
+        of the openings ladder sits 0.6 below the surface and takes 0.3.  That
+        is a depth-of-cut pass, not a holding rib, and calling a 0.372 wall an
+        onion skin would tell the operator the part is about to come loose;
+    *   in between with no bite limit declared: the measured onion skin, with its
+        thickness, which for the reference programs' perimeter pass 1 at Z0.06 is
+        the 0.06 that holds the part to the sheet.
+
+    ``section`` is which post-table section the pass belongs to, i.e. whose tool
+    is being asked about its bite limit.  ``None`` means "no tool to ask", which
+    reads as the measured wording.
     """
     bottom = config.stock_top_z - config.material_thickness
     if z_cut >= config.stock_top_z - EPS:
         return "above the stock"
     if z_cut <= bottom + EPS:
         return "through"
+    tool = None if section is None else config.tools.get(section)
+    if tool is not None and tool.max_bite is not None:
+        bite = _bite_at(z_cut, _ladder_of(section, config), config.stock_top_z)
+        return f"{bite:g} deep, {z_cut - bottom:g} left"
     return f"onion skin {z_cut - bottom:g} thick"
+
+
+def _ladder_of(section: str, config: PostConfig) -> tuple:
+    """The configured depth passes of ``section``, shallowest first."""
+    if section == SECTION_PERIMETER:
+        return config.perimeter_passes
+    if section == SECTION_OPENINGS:
+        return config.openings_passes
+    return ()
+
+
+def _bite_at(z_cut: float, passes, stock_top_z: float) -> float:
+    """How much material the pass at ``z_cut`` takes: its bite, not its depth.
+
+    Walks the ladder from the stock surface down, which is the same walk the
+    verifier's ``max-bite`` rule makes (:func:`~faceframe_cnc.post.verifier`) —
+    written out again here rather than shared, because this is a label and that
+    is an authority.  A ``z_cut`` the ladder does not contain falls back to the
+    depth below the surface, which is the answer for a single-pass table.
+    """
+    floor = stock_top_z
+    for spec in passes:
+        if abs(spec.z_cut - z_cut) <= EPS:
+            return floor - z_cut
+        floor = min(floor, spec.z_cut)
+    return stock_top_z - z_cut
 
 
 def cut_label(
@@ -180,7 +245,20 @@ def cut_label(
             f"pass {_ordinal(position, passes)} — {name}"
         )
     if section == SECTION_OPENINGS:
-        return f"{tool} opening {_ordinal(ref.index, len(part.openings))} — {name}"
+        # One rung of the T11 roughing ladder (2026-08-05 max-bite amendment):
+        # the pass wording appears only when the table configures more than one,
+        # so a reference program's cut list reads exactly as it did.
+        passes = config.openings_passes
+        rung = ""
+        if len(passes) > 1:
+            position = 0 if pass_index is None else pass_index
+            rung = (
+                f" pass {_ordinal(position, len(passes))} "
+                f"({pass_phase(passes[position].z_cut, config, SECTION_OPENINGS)})"
+            )
+        return (
+            f"{tool} opening {_ordinal(ref.index, len(part.openings))}{rung} — {name}"
+        )
     if section == SECTION_DETAIL:
         return (
             f"{tool} opening {_ordinal(ref.index, len(part.openings))} detail "
@@ -189,11 +267,24 @@ def cut_label(
     if section == SECTION_PERIMETER:
         passes = config.perimeter_passes
         position = 0 if pass_index is None else pass_index
-        phase = pass_phase(passes[position].z_cut, config)
+        phase = pass_phase(passes[position].z_cut, config, SECTION_PERIMETER)
         return (
             f"{tool} perimeter pass {_ordinal(position, len(passes))} "
             f"({phase}) — {name}"
         )
+    if section == SECTION_RELEASE:
+        # 2026-08-05 amendment §3c.  What this cut frees is the fact the
+        # operator wants — the frame, or one of its dropouts — and the feed is
+        # in the label because "slow" is the whole character of the pass and it
+        # is the one place the ratified number shows on screen.
+        what = (
+            "part"
+            if ref.kind == "perimeter"
+            else f"opening {_ordinal(ref.index, len(part.openings))}"
+        )
+        feed = config.release.cut_feed if config.release is not None else None
+        rate = "" if feed is None else f", {feed:g} ipm"
+        return f"{tool} release — frees the {what}{rate} — {name}"
     return f"{tool} {ref.kind} {ref.index + 1} — {name}"
 
 
@@ -418,9 +509,23 @@ class SimTimeline:
 
     @property
     def last_perimeter_pass(self) -> int:
-        """Index of the deepest configured perimeter pass — the one that frees
-        the part."""
+        """Index of the deepest configured perimeter pass — the one that cuts a
+        part's outline right through."""
         return len(self.config.perimeter_passes) - 1
+
+    @property
+    def tab_held(self) -> bool:
+        """Does this program hold its pieces with tabs until a release section?
+
+        Read off the PLAN, which is where the amendment's decision lands
+        (:attr:`~faceframe_cnc.post.model.CutPlan.release`): a plan with a
+        release section is a program whose through passes free nothing, and one
+        without is every program written before 2026-08-05 and every reference
+        file.  Not read off the post table, because a table can configure a
+        release pass for a plan that does not use it — what the operator is
+        watching is the program.
+        """
+        return bool(self.plan.release)
 
     # -- lookups -----------------------------------------------------------
 
@@ -458,7 +563,7 @@ class SimTimeline:
         """
         state = MaterialState.empty(self.part_count)
         for cut in self.cuts[: self.completed_cuts(position)]:
-            state = state.apply(cut, self.last_perimeter_pass)
+            state = state.apply(cut, self.last_perimeter_pass, self.tab_held)
         return state
 
 

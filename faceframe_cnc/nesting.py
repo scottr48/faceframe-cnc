@@ -196,6 +196,17 @@ class NestingError(ValueError):
 #: the optimizer (the GUI session) must clamp or refuse below it, because a
 #: tighter gap silently packs sheets the post must then refuse at Generate
 #: time.
+#:
+#: 2026-08-05, both amendments of that day, and the net effect is nil: removing
+#: the perimeter's onion-skin pass took with it the 0.377-wide sweep that
+#: refused a 0.375 gap from any direction (the through pass reaches exactly
+#: 0.375 at depth, and exact contact is not an overlap), and the max-bite ladder
+#: — at most 0.4 of material per T11 pass, Scott's ratified policy — then put a
+#: pass back at the same measured 0.1895 offset, so the 0.377 sweep is there
+#: again.  A 0.375 gap is refused at Generate once more, from any direction.
+#: That is a backstop and not the rule: this constant is what the paths above
+#: must go on refusing below, because a pass ladder is a machining decision and
+#: could change again without the spacing rule changing with it.
 MIN_PART_GAP = 0.455
 
 

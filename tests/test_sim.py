@@ -22,9 +22,14 @@ Covered here:
       controller holds at position k is the state recomputed from uncut stock
       at position k, whatever route it took to get there;
   (d) material state: a cut counts only when its LAST move has run; a part is
-      skinned by perimeter pass 1 and freed by pass 2; on a nested sheet the
-      host is freed only after its passengers, and a nested frame's opening is
-      routed while its own slab is still captive (the R720101N fact);
+      skinned by perimeter pass 1 and freed by the last pass; on a nested sheet
+      the host is freed only after its passengers, and a nested frame's opening
+      is routed while its own slab is still captive (the R720101N fact);
+  (d2) the same, on the table a generated sheet is really cut with since the
+      2026-08-05 amendments: no onion skin, and both T11 operations run as
+      max-bite ladders -- two occurrences per opening and per perimeter, the
+      rungs labelled by the bite they take, and only the last perimeter rung
+      "through" (:class:`GeneratedTableLadderTest`);
   (e) readouts at the cursor: tool, feed, Z and "cut i of N";
   (f) purity: no Qt / PySide6 / time / datetime / random anywhere under
       ``faceframe_cnc/sim/``, and two identically driven controllers agree.
@@ -64,6 +69,7 @@ from faceframe_cnc.post.model import (
     SECTION_OPENINGS,
     SECTION_PANEL,
     SECTION_PERIMETER,
+    SECTION_RELEASE,
     SECTION_WDC_SLOT,
 )
 from faceframe_cnc.sim import (
@@ -147,7 +153,12 @@ def nested_case() -> tuple[SheetProgram, CutPlan]:
 
     A W3012 turned 90 degrees inside a W2742's opening, and a second W3012
     beside it -- planned by :func:`~faceframe_cnc.post.from_layout.plan_sheet`,
-    which is what applies the 2026-08-03 onion-skin order.
+    which is what applies the inners-before-hosts order.
+
+    No post table is handed over, so the plan follows the MEASURED one: two
+    perimeter passes, the references' dialect.  That is deliberate -- see
+    :func:`cases` -- and :class:`GeneratedTableLadderTest` covers the max-bite
+    ladders a generated sheet is really cut with.
     """
     layout = SheetLayout(
         [
@@ -176,7 +187,19 @@ _CASES: dict[str, Case] = {}
 
 
 def cases() -> dict[str, Case]:
-    """Every fixture, built once: reconstructing three files is not free."""
+    """Every fixture, built once: reconstructing three files is not free.
+
+    All five are on the MEASURED post table (two perimeter passes).  For the
+    three reference files that is the only table that can read them; for the two
+    planner-built sheets it is a choice, and the choice is deliberate — the
+    timeline is generic over the pass table, and two passes is the case with
+    more structure to get wrong (an occurrence per pass, skinned before freed,
+    the onion-skin wording).  The table a generated sheet is cut with since the
+    2026-08-05 amendments gets its own class,
+    :class:`GeneratedTableLadderTest`, because several assertions here are
+    specifically about the measured dialect's two passes -- a skin and a through
+    pass -- being different events, which a max-bite ladder's two rungs are not.
+    """
     if not _CASES:
         sources = [(name, reconstruct(path_of(name))) for name in REFERENCES]
         sources.append(("WDC", wdc_case()))
@@ -193,6 +216,59 @@ def cases() -> dict[str, Case]:
     return _CASES
 
 
+_ONE_PASS: dict[str, object] = {}
+
+
+def one_pass_case():
+    """The nested sample sheet planned the way Generate plans it, built once.
+
+    :func:`cases` uses the MEASURED table (two perimeter passes, no release
+    section) because that is the dialect the reference files are in.  This is the
+    other table — one through pass and a T12 tab release, which is what
+    :func:`~faceframe_cnc.post.from_layout.post_config_for` hands every generated
+    sheet since the 2026-08-05 amendment — and the classes that are about the
+    amendment use it.
+    """
+    if not _ONE_PASS:
+        from faceframe_cnc.post import post_config_for
+
+        config = post_config_for(NestingConfig())
+        layout = SheetLayout(
+            [
+                Placement(
+                    "W2742",
+                    0.0,
+                    0.0,
+                    27.0,
+                    42.0,
+                    False,
+                    [Placement("W3012", 5.0, 6.0, 12.0, 30.0, True, [])],
+                ),
+                Placement("W3012", 30.0, 0.0, 12.0, 30.0, True, []),
+            ]
+        )
+        demand = [PartSpec("W2742", 27.0, 42.0, 1), PartSpec("W3012", 30.0, 12.0, 2)]
+        program, plan = plan_sheet(
+            layout,
+            ProgramHeader(name="R990104N", created=CREATED),
+            demand,
+            NestingConfig(),
+            config,
+        )
+        _ONE_PASS["case"] = Case(
+            label="ONE_PASS",
+            program=program,
+            plan=plan,
+            config=config,
+            timeline=SimTimeline.build(program, plan, config),
+        )
+    return _ONE_PASS["case"]
+
+
+def one_pass_timeline():
+    return one_pass_case().timeline
+
+
 def case(label: str) -> Case:
     return cases()[label]
 
@@ -205,6 +281,9 @@ def planned_features(plan: CutPlan) -> dict[str, list]:
         SECTION_OPENINGS: list(plan.openings),
         SECTION_DETAIL: list(plan.detail_order()),
         SECTION_PERIMETER: [ref for refs in plan.perimeter for ref in refs],
+        # The final T12 tab-release section (2026-08-05 amendment, spec §3c):
+        # one entry per PROFILE it frees, however many tabs that profile has.
+        SECTION_RELEASE: list(plan.release),
     }
 
 
@@ -434,11 +513,12 @@ class TimelineTest(unittest.TestCase):
                         )
 
     def test_a_groove_cut_step_is_as_long_as_the_groove(self):
-        """The measured T13 overrun, read back out of the step geometry.
+        """The clamped T13 stile groove, read back out of the step geometry.
 
-        An upright part's stile groove runs the full part length with the
-        0.375 overrun past both ends (:mod:`faceframe_cnc.post.model`), so the
-        one FEED step of that occurrence travels exactly that far -- which is
+        An upright part's stile groove runs the part's full length less one
+        tool radius at each end since the 2026-08-05 amendment (job R0805 --
+        the SWEPT cut is what runs the full length, flush to flush), so the
+        one FEED step of that occurrence travels exactly that far, which is
         the check that these lengths are the commanded path and not a bounding
         box.
         """
@@ -459,9 +539,10 @@ class TimelineTest(unittest.TestCase):
         self.assertEqual(len(feeds), 1, "a groove is one straight cut move")
         index, _ = feeds[0]
         box = parts[target.part_index].box
+        radius = item.config.tool(SECTION_PANEL).radius
         self.assertAlmostEqual(
             item.timeline.xy_lengths[index],
-            box.height + 2 * item.config.panel.overrun,
+            box.height - 2 * radius,
             delta=TOL,
         )
 
@@ -1022,6 +1103,243 @@ class MaterialStateTest(unittest.TestCase):
                     controller.state.freed_parts,
                     frozenset(range(item.timeline.part_count)),
                 )
+
+
+# --------------------------------------------------------------------------
+# (d2) the sheet as the app really simulates it: the max-bite ladder
+# --------------------------------------------------------------------------
+
+
+class GeneratedTableLadderTest(unittest.TestCase):
+    """What the app's own post table simulates as, and how it differs.
+
+    :func:`cases` builds its generated fixtures with the measured table, which
+    is the dialect the three reference programs are in and the one the
+    onion-skin wording above is about.  What Generate and the Simulate button
+    actually hand the timeline is
+    :func:`~faceframe_cnc.post.from_layout.post_config_for`, and since the
+    2026-08-05 amendments that table has NO onion skin (the parts are tab-held
+    from milestone 2b on, so the 0.06 skin has no holding job left) and runs both
+    T11 operations as max-bite ladders instead (Scott: at most 0.4 of material
+    per pass, to reduce the load on the 3/8 comp).  So this class plans the same
+    nested sheet the way the app does and states what changes:
+
+    *   two perimeter occurrences per part again — but at Z0.372 and Z-0.006, not
+        at the measured dialect's Z0.06 and Z-0.006, and two OPENING occurrences
+        per opening where the references have one;
+    *   the labels never say "onion skin": a rung of a ladder is described by the
+        bite it takes and the material it leaves, and only the last rung of a
+        perimeter ladder says "through".  The wording comes from the configured Z
+        and the tool's declared bite limit, nothing else;
+    *   the through pass SCORES the part and does not free it: the piece is
+        held by its tabs until the final T12 release section takes them away
+        (2026-08-05 amendment §3d, :mod:`faceframe_cnc.sim.state`'s own words).
+        "Scored to size but still held" is now every part's state for most of the
+        program instead of no part's.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        item = one_pass_case()
+        cls.config = item.config
+        cls.program = item.program
+        cls.plan = item.plan
+        cls.timeline = item.timeline
+
+    def perimeter_cuts(self):
+        return [c for c in self.timeline.cuts if c.section == SECTION_PERIMETER]
+
+    def opening_cuts(self):
+        return [c for c in self.timeline.cuts if c.section == SECTION_OPENINGS]
+
+    def test_the_table_under_test_really_is_the_generated_one(self):
+        self.assertEqual(
+            [p.z_cut for p in self.config.perimeter_passes], [0.372, -0.006]
+        )
+        self.assertEqual([p.z_cut for p in self.config.openings_passes], [0.45, 0.15])
+        self.assertEqual(len(self.plan.perimeter), 2)
+
+    def test_one_perimeter_occurrence_per_part_per_rung(self):
+        cuts = self.perimeter_cuts()
+        rungs = len(self.config.perimeter_passes)
+        self.assertEqual(len(cuts), self.timeline.part_count * rungs)
+        self.assertEqual({c.pass_index for c in cuts}, set(range(rungs)))
+        self.assertEqual(
+            {c.part_index for c in cuts}, set(range(self.timeline.part_count))
+        )
+
+    def test_one_opening_occurrence_per_opening_per_rung(self):
+        """The openings gained a rung too (flagged for Scott's ratification)."""
+        cuts = self.opening_cuts()
+        rungs = len(self.config.openings_passes)
+        self.assertEqual(len(cuts), len(self.plan.openings) * rungs)
+        self.assertEqual({c.pass_index for c in cuts}, set(range(rungs)))
+
+    def test_only_the_last_rung_says_through_and_none_says_onion_skin(self):
+        last = len(self.config.perimeter_passes) - 1
+        for cut in self.perimeter_cuts():
+            with self.subTest(label=cut.label):
+                self.assertNotIn("onion skin", cut.label)
+                if cut.pass_index == last:
+                    self.assertIn("through", cut.label)
+                else:
+                    # a rung is described by the bite it takes and what it leaves
+                    self.assertIn("0.378 deep, 0.372 left", cut.label)
+
+    def test_an_opening_rung_says_which_rung_it_is(self):
+        for cut in self.opening_cuts():
+            with self.subTest(label=cut.label):
+                self.assertNotIn("onion skin", cut.label)
+                self.assertIn(f"pass {cut.pass_index + 1} of 2", cut.label)
+                self.assertIn("0.3 deep", cut.label)
+
+    def release_cuts(self):
+        return [c for c in self.timeline.cuts if c.section == SECTION_RELEASE]
+
+    def test_the_one_pass_scores_the_part_but_does_not_free_it(self):
+        """The 2026-08-05 amendment, at the resolution the operator watches.
+
+        The through pass cuts the outline right through and the part still does
+        not move: it is held by its tabs.  What frees it is the final T12 release
+        section, and until that has run the part is scored and not freed -- which
+        is the whole reason the amendment exists (two frames broke because a
+        piece was loose while the sheet was still being cut).
+        """
+        self.assertTrue(self.timeline.tab_held, "a generated sheet is tab-held")
+        controller = SimController(self.timeline)
+        for cut in self.perimeter_cuts():
+            controller.seek(cut.end)
+            state = controller.state[cut.part_index]
+            with self.subTest(label=cut.label):
+                self.assertTrue(state.skinned, "cut to size")
+                self.assertFalse(state.freed, "and still held by its tabs")
+
+    def test_the_release_section_is_what_frees_each_part(self):
+        controller = SimController(self.timeline)
+        perimeter_release = [
+            c for c in self.release_cuts() if c.feature.kind == "perimeter"
+        ]
+        self.assertEqual(len(perimeter_release), self.timeline.part_count)
+        for cut in perimeter_release:
+            controller.seek(cut.last_step)
+            self.assertFalse(
+                controller.state[cut.part_index].freed,
+                "not until the LAST tab of this profile has gone",
+            )
+            controller.seek(cut.end)
+            self.assertTrue(controller.state[cut.part_index].freed, cut.label)
+
+    def test_a_dropout_is_released_by_its_own_release_cut(self):
+        controller = SimController(self.timeline)
+        for cut in [c for c in self.release_cuts() if c.feature.kind == "opening"]:
+            detail = next(
+                c
+                for c in self.timeline.cuts
+                if c.section == SECTION_DETAIL
+                and c.part_index == cut.part_index
+                and c.feature.index == cut.feature.index
+            )
+            controller.seek(detail.end)
+            state = controller.state[cut.part_index]
+            with self.subTest(label=cut.label):
+                self.assertIn(cut.feature.index, state.openings_detailed)
+                self.assertNotIn(
+                    cut.feature.index,
+                    state.openings_released,
+                    "the slug is cut through and still hanging on its tabs",
+                )
+            controller.seek(cut.end)
+            self.assertIn(
+                cut.feature.index, controller.state[cut.part_index].openings_released
+            )
+
+    def test_an_inner_is_still_freed_before_its_host(self):
+        """The one ordering rule the single pass still has to honour.
+
+        Freed now means RELEASED, so the relation is read off the release
+        section -- which spec 3c orders inners-before-hosts for exactly this
+        reason.
+        """
+        parents = Case(
+            "ONE_PASS", self.program, self.plan, self.config, self.timeline
+        ).parents()
+        self.assertTrue(any(p is not None for p in parents))
+        freed_at = {
+            c.part_index: c.end
+            for c in self.release_cuts()
+            if c.feature.kind == "perimeter"
+        }
+        for child, host in enumerate(parents):
+            if host is None:
+                continue
+            self.assertLess(freed_at[child], freed_at[host])
+
+    def test_nothing_is_left_captive_at_the_end(self):
+        controller = SimController(self.timeline)
+        controller.to_end()
+        self.assertEqual(
+            controller.state.freed_parts, frozenset(range(self.timeline.part_count))
+        )
+
+
+class ReleaseSectionTest(unittest.TestCase):
+    """The final T12 release, on the timeline (2026-08-05 amendment §3c).
+
+    One occurrence per PROFILE, whatever number of tabs it has, because that is
+    what the general grouping rule says (one contiguous run of one feature at one
+    depth) and it is the grouping the freed-at-release semantics needs: the
+    occurrence completes when the last tab has gone.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.timeline = one_pass_timeline()
+
+    def release(self):
+        return [c for c in self.timeline.cuts if c.section == SECTION_RELEASE]
+
+    def test_the_release_is_the_last_section_of_the_timeline(self):
+        self.assertEqual(self.timeline.sections[-1].section, SECTION_RELEASE)
+        last = self.timeline.cuts[-1]
+        self.assertEqual(last.section, SECTION_RELEASE)
+        self.assertEqual(last.feature.kind, "perimeter", "an outermost part, last")
+
+    def test_one_occurrence_per_profile_however_many_tabs(self):
+        plan = self.timeline.plan
+        self.assertEqual(
+            [c.feature.profile for c in self.release()],
+            [ref.profile for ref in plan.release],
+        )
+        for cut in self.release():
+            zones = plan.tabs[cut.feature.profile]
+            with self.subTest(label=cut.label):
+                self.assertGreater(len(zones), 1, "more than one tab per profile")
+                # 5 moves per tab: preposition, drop to the ramp plane, plunge,
+                # cut, retract -- and the first tab's preposition is two lines
+                # (the spindle start and the G43) on the section's first cut.
+                self.assertGreaterEqual(cut.step_count, 5 * len(zones))
+
+    def test_the_label_says_what_the_cut_frees_and_how_fast(self):
+        for cut in self.release():
+            with self.subTest(label=cut.label):
+                self.assertTrue(cut.label.startswith("T12 release — frees the "))
+                self.assertIn("150 ipm", cut.label)
+                self.assertIn(cut.part_number, cut.label)
+        kinds = [c.feature.kind for c in self.release()]
+        self.assertEqual(kinds, sorted(kinds, key=lambda k: k != "opening"))
+        self.assertTrue(
+            any("frees the opening" in c.label for c in self.release())
+            and any("frees the part" in c.label for c in self.release())
+        )
+
+    def test_every_release_step_is_inside_a_cut_occurrence(self):
+        """The totality guard, on the newest section."""
+        for index, motion in enumerate(self.timeline.steps):
+            if motion.section != SECTION_RELEASE:
+                continue
+            cut = self.timeline.cut_at_step(index)
+            self.assertEqual(cut.section, SECTION_RELEASE)
+            self.assertIs(cut.feature, motion.feature)
 
 
 # --------------------------------------------------------------------------

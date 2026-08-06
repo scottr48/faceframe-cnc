@@ -25,7 +25,7 @@ from faceframe_cnc.gui.session import (
     load_settings,
     save_settings,
 )
-from faceframe_cnc.nesting import NestingConfig, nest
+from faceframe_cnc.nesting import NestingConfig, PartSpec, nest
 from tests.test_nesting import ORDER_7_21_26
 
 try:  # the .xls parser is the only thing in the app that needs pandas
@@ -139,17 +139,21 @@ class SessionGenerateTests(unittest.TestCase):
 
     def test_refusals_come_back_instead_of_raising(self):
         """A sheet the verifier will not pass is reported, not raised, and
-        the job still writes the sheets that are fine.
+        nothing is written for it.
 
-        The 0.375 gap the spec asks for is what produces one: it is 0.05
-        short of the perimeter lead-in's sweep, so on a real order some
-        sheets cut into their neighbours.  It needs the real order — a
-        two-frame sheet has nowhere for the lead-in to reach.
+        The 0.375 gap the spec asks for is what produces one, in two ways: the
+        perimeter lead-in ramp reaches 0.3938 past a part edge where it breaks
+        the surface, and since the 2026-08-05 max-bite amendment the roughing
+        rung's at-depth loop reaches 0.377 as well (it runs at the measured
+        0.1895 offset).  Every sheet of this order is refused at that gap, which
+        is why the "one of each" case has its own test below — this one is about
+        what happens TO a refusal: reported, no file, nothing raised.
 
-        ``Session.optimize`` refuses a 0.375 gap outright now (the
-        2026-08-03 floor), so the layout is packed with the library and
-        installed via ``set_result`` — the verifier stays the last line of
-        defence for layouts that never went through the session's guard.
+        The part gap itself is not the verifier's job to enforce:
+        ``Session.optimize`` refuses anything under
+        :data:`faceframe_cnc.nesting.MIN_PART_GAP` outright (the test below),
+        which is why this layout has to be packed with the library and
+        installed via ``set_result`` to exist at all.
         """
         session = Session(AppSettings())
         session.set_result(
@@ -157,11 +161,48 @@ class SessionGenerateTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as folder:
             job = session.generate_nc(folder, prefix="7201", created=CREATED)
-            self.assertTrue(job.refused, "0.375 cannot be cut")
-            self.assertTrue(job.written, "the rest of the job still goes out")
+            self.assertTrue(job.refused, "0.375 cannot be cut on these sheets")
+            self.assertFalse(job.written, "and at this gap none of them can be")
             for outcome in job.refused:
                 self.assertEqual(outcome.refusal_kind, "verifier")
                 self.assertNotIn(outcome.filename, os.listdir(folder))
+
+    def test_a_partly_refused_job_still_writes_the_sheets_that_are_fine(self):
+        """The other half of the same promise, on a job with exactly one of each.
+
+        One 48x90 frame has a sheet to itself and no neighbour to cut into; the
+        two 30x30s share a sheet at ``UNCUTTABLE_GAP`` and cannot be cut.  The
+        good sheet goes out, the bad one does not, and neither raises.
+
+        The gap is 0.25 rather than the spec's 0.375 so that the refusal needs no
+        argument about which way the neighbour lies: at 0.25 the through pass's own
+        loop is 0.125 INSIDE the neighbour on every side (see
+        ``tests/test_nc_job.py``'s ``UNCUTTABLE_GAP``).
+        """
+        from tests.test_nc_job import UNCUTTABLE_GAP
+
+        session = Session(AppSettings())
+        session.set_result(
+            nest(
+                [
+                    PartSpec("W4890", 48.0, 90.0, 1),
+                    PartSpec("W3030", 30.0, 30.0, 2),
+                ],
+                NestingConfig(part_gap=UNCUTTABLE_GAP),
+            )
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            job = session.generate_nc(
+                folder, prefix="7201", pdf_report=False, created=CREATED
+            )
+            self.assertTrue(job.refused, "the too-tight pair cannot be cut")
+            self.assertTrue(job.written, "the sheet that is fine still goes out")
+            for outcome in job.refused:
+                self.assertEqual(outcome.refusal_kind, "verifier")
+                self.assertNotIn(outcome.filename, os.listdir(folder))
+            for path in job.files:
+                self.assertTrue(os.path.exists(path))
+            self.assertEqual(len(job.files), len(job.written))
 
     def test_optimize_itself_now_refuses_the_gap_that_caused_those_refusals(self):
         """Bug fix 2026-08-03: a stale 0.375 used to sail through optimize
@@ -268,11 +309,12 @@ class SessionGenerateTests(unittest.TestCase):
                 self.assertIn(outcome.filename, cover)
 
     def test_a_too_tight_gap_is_reported_not_written(self):
-        """The spec's 0.375 gap is 0.05 short of what the perimeter lead-in
-        sweeps; the verifier catches it and the file is not written.  The
-        layout is installed directly (``Session.optimize`` refuses 0.375
-        since the 2026-08-03 floor), using the fixture built to guarantee
-        the collision."""
+        """The spec's 0.375 gap is short of what the perimeter lead-in sweeps
+        where it breaks the surface (0.3938); the verifier catches it and the
+        file is not written.  The layout is installed directly
+        (``Session.optimize`` refuses 0.375 since the 2026-08-03 floor), using
+        the fixture built to guarantee the collision — two parts side by side,
+        so the lead-in points into the gap."""
         from tests.test_nc_job import crowded_sheet
 
         result, _config = crowded_sheet()

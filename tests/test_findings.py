@@ -168,7 +168,11 @@ def unchecked_plan(
     WDC cone reaches a neighbour, which is exactly the sheet a finding test
     needs, so the same order is written out here: parts in canonical order for
     the grooves and the slots, deepest nesting first for the openings, and the
-    onion-skin perimeter pair (everything, then inners first).  A plan carries
+    measured table's perimeter pair (everything, then inners first — this module
+    emits against :func:`~faceframe_cnc.post.model.default_config`, so two
+    passes; a generated sheet is cut with the through pass alone since the
+    2026-08-05 amendment, and the mapping under test here is per LINE, which
+    neither number changes).  A plan carries
     no coordinate and no depth — those come from the post table — so what is
     emitted is the real program for this geometry, and the verifier judges it
     with no help and no hindrance from this file.
@@ -614,6 +618,76 @@ class MappingTest(unittest.TestCase):
 # --------------------------------------------------------------------------
 
 
+
+class ReleaseSectionFindingsTest(unittest.TestCase):
+    """A finding on a release cut lands on the release cut (2026-08-05 §3c).
+
+    The newest section is also the one whose lines a 3D view is least likely to
+    have a home for, so this is the mapping stated for it explicitly: every
+    ``hold`` finding the verifier reports about a release cut resolves to a step,
+    to the release occurrence that owns that step, and to the part that
+    occurrence frees.  Nothing lands in the global bucket for want of a step.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from dataclasses import replace
+
+        from faceframe_cnc.post.from_layout import plan_sheet, post_config_for
+        from faceframe_cnc.post.model import SECTION_RELEASE
+        from faceframe_cnc.post.verifier import verify
+        from tests.test_r0805_regression import r0805_layout
+
+        layout, specs, nesting = r0805_layout()
+        cls.section = SECTION_RELEASE
+        cls.post = post_config_for(nesting)
+        program, plan = plan_sheet(
+            layout,
+            ProgramHeader(name="R080501N", created="05 AUG 26 - 07:30"),
+            specs,
+            nesting,
+            cls.post,
+        )
+        cls.plan = plan
+        cls.timeline = SimTimeline.build(program, plan, cls.post)
+        # the release pass run at the DETAIL pass's feeds: legal everywhere else,
+        # and exactly what "very slowly" rules out
+        fast = replace(
+            cls.post,
+            release=replace(cls.post.release, cut_feed=293.0, entry_feed=100.0),
+        )
+        cls.violations = [
+            v for v in verify(cls.timeline.emitted.text, fast) if v.code == "hold"
+        ]
+        cls.findings = FindingSet.build(cls.timeline, cls.violations)
+
+    def test_the_crafted_program_really_is_refused(self):
+        total = sum(len(zones) for zones in self.plan.tabs.values())
+        self.assertEqual(len(self.violations), 2 * total, "each plunge and each cut")
+
+    def test_every_release_finding_lands_on_a_release_cut(self):
+        self.assertEqual(len(self.findings.findings), len(self.violations))
+        self.assertEqual(self.findings.global_findings, ())
+        for finding in self.findings.findings:
+            with self.subTest(line=finding.violation.line):
+                self.assertIsNotNone(finding.step_index)
+                cut = self.timeline.cuts[finding.cut_index]
+                self.assertEqual(cut.section, self.section)
+                self.assertEqual(finding.part_index, cut.part_index)
+                self.assertEqual(finding.display, str(finding.violation))
+
+    def test_the_flagged_cuts_are_exactly_the_release_occurrences(self):
+        release = [c for c in self.timeline.cuts if c.section == self.section]
+        self.assertEqual(
+            sorted(self.findings.flagged_cuts), sorted(c.index for c in release)
+        )
+        for cut in release:
+            with self.subTest(label=cut.label):
+                self.assertEqual(
+                    {f.violation.code for f in self.findings.for_cut(cut.index)},
+                    {"hold"},
+                )
+
 class ConeSheetTest(unittest.TestCase):
     """A WDC frame with a neighbour inside the cone's end reach."""
 
@@ -928,7 +1002,11 @@ class LeadInOverlayTest(unittest.TestCase):
                         config.perimeter_passes[overlay.pass_index]
                         if perimeter
                         else (
-                            config.openings_pass
+                            # One overlay per rung of the T11 opening ladder
+                            # (2026-08-05 max-bite amendment): the pass index is
+                            # None on a single-rung table and numbers the rungs
+                            # otherwise, exactly as the emitter tags the motions.
+                            config.openings_passes[overlay.pass_index or 0]
                             if overlay.section == SECTION_OPENINGS
                             else config.detail_pass
                         )

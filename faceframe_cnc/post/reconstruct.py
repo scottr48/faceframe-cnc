@@ -16,20 +16,55 @@ Recovery rules (all measured, see :mod:`~faceframe_cnc.post.model`):
 
 *   part footprint  = perimeter loop shrunk by that pass's offset;
 *   routed opening  = T11 opening loop grown by 0.1975 (radius + finish
-    stock), cross-checked against the T12 loop grown by 0.1;
+    stock), cross-checked against the T12 loop grown by 0.1.  Since the
+    2026-08-05 max-bite amendment the T11 section can cut one opening on
+    several depth passes (Z0.45 then Z0.15 on a generated sheet), so the loops
+    are sorted into one list per configured rung and the rungs are held to
+    each other before the deepest one is read as the opening;
 *   rotation        = which pair of T13 grooves sits 0.5625 in from the
     edge (the stile pair) — or, for a WDC frame, which pair of T17 slots
     sits 0.6614 in, since a WDC has no T13 stile grooves to vote with;
+*   T13 groove      = matched against BOTH stile-groove shapes, the clamped
+    one this post writes since the 2026-08-05 amendment and the legacy 0.375
+    overrun every reference file contains (:func:`_groove_ref`);
 *   WDC slot        = two passes on one centreline, matched against the
     emitter's own per-pass overrun;
 *   nesting         = a part whose footprint lies inside another part's
     opening is that part's child (spec 4b).
+
+Tabbed programs (2026-08-05 amendment, Scott, job R0805)
+-------------------------------------------------------
+A generated sheet now holds every part and every dropout with tabs and cuts
+them free in a final T12 release section (spec §3b/§3c).  Two things about that
+have to be read back, and one deliberately is not:
+
+*   a loop that rises over a tab has four extra moves per tab, so a profile loop
+    is no longer eight moves — it is ``8 + 4n``.  :func:`_loop_corners` finds the
+    four corners by walking the loop rather than by counting, so it reads either
+    shape;
+*   a program then has TWO T12 sections, the detail pass and the release, which
+    :func:`_split_sections` tells apart by what they contain: the detail section
+    is closed loops, the release section is straight two-point cuts.  The
+    release cuts are attributed to the profiles they release
+    (:func:`_release_refs`), so a reader can see which part each one frees.
+
+What is NOT recovered is WHERE the tabs are.  A plan carries the zones
+(:attr:`~.model.CutPlan.tabs`) and a zone is a position on a profile, so
+recovering them means measuring the lift positions back off the text and
+inverting the placement arithmetic — and a byte-exact round trip of a TABBED
+program was explicitly not asked for at this milestone.  So a reconstructed plan
+is untabbed and regenerating it produces the same program WITHOUT the tabs and
+the release section: faithful about the sheet, honest about the holding.
+:func:`reconstruct_text` records what it saw on
+:attr:`~.model.CutPlan.release` — the profiles the file releases — so a caller
+that needs to know whether the source was tab-held can ask, and the byte-exact
+round trips (the reference programs, which contain no tab) are untouched.
 """
 
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .model import (
     Box,
@@ -43,6 +78,7 @@ from .model import (
     SECTION_OPENINGS,
     SECTION_PANEL,
     SECTION_PERIMETER,
+    SECTION_RELEASE,
     SECTION_WDC_SLOT,
     SheetProgram,
     default_config,
@@ -51,8 +87,10 @@ from .generator import (
     default_entry_side,
     entry_side_for,
     groove_segment,
+    release_path,
     wdc_slot_segment,
 )
+from .tabs import TabZone, travel_offset
 
 __all__ = ["ReconstructionError", "reconstruct", "reconstruct_text"]
 
@@ -161,24 +199,107 @@ def _scan_features(lines: list[str]) -> list[_Feature]:
     return features
 
 
-def _loop_box(feature: _Feature) -> Box:
-    """The rectangle a profile loop cut, from its four corner points.
+def _close_index(feature: _Feature) -> int:
+    """Which move of a loop returns to the lead-in point and closes it.
 
-    The lead-out of a perimeter loop steps off the profile (0.05 sideways),
-    so the run's bounding box is NOT the rectangle — the four corners
-    are points 1..4 of the run, after the ramp-in.
+    Everything before it is on the rectangle; the two moves after it are the
+    one-tool-diameter overshoot past the lead-in point and the lead-out ramp,
+    both of which leave the rectangle (the ramp also steps 0.05 sideways off the
+    profile on a perimeter), so neither may be measured.
     """
-    if len(feature.points) != 8:
-        raise ReconstructionError(
-            f"profile loop has {len(feature.points)} moves, expected 8 "
-            f"(ramp in, 4 corners, close, overshoot, ramp out)"
+    start = (round(feature.points[0][0], 6), round(feature.points[0][1], 6))
+    for index, point in enumerate(feature.points[1:], start=1):
+        if (round(point[0], 6), round(point[1], 6)) == start:
+            if index < 4:
+                raise ReconstructionError(
+                    f"a profile loop returns to its lead-in point after only "
+                    f"{index} move(s) - a closed rectangle takes four"
+                )
+            if len(feature.points) != index + 3:
+                raise ReconstructionError(
+                    f"a profile loop closes on move {index} but the run has "
+                    f"{len(feature.points)} moves, not the {index + 3} this post "
+                    f"writes (the loop, its overshoot and its lead-out ramp)"
+                )
+            return index
+    raise ReconstructionError(
+        f"a profile loop of {len(feature.points)} moves never returns to its "
+        f"lead-in point, so it is not a closed rectangle this post wrote"
+    )
+
+
+def _loop_box(feature: _Feature) -> Box:
+    """The rectangle a profile loop cut.
+
+    The extent of every point from the lead-in up to and including the move that
+    closes the loop.  Not "points 1..4", which is what this measured before the
+    2026-08-05 amendment: a loop that rises over a holding tab has four extra
+    moves per tab (spec §3b), all of them ON the rectangle, so counting moves is
+    no longer the way to find the corners — and taking the extent of the closed
+    part of the loop finds them whether there are tabs or not.
+    """
+    close = _close_index(feature)
+    points = feature.points[: close + 1]
+    xs = sorted({round(p[0], 6) for p in points})
+    ys = sorted({round(p[1], 6) for p in points})
+    if len(xs) < 2 or len(ys) < 2:
+        raise ReconstructionError(f"loop points are not a rectangle: {points}")
+    return Box(xs[0], ys[0], xs[-1], ys[-1])
+
+
+def _loop_zones(feature: _Feature, box: Box, config: PostConfig):
+    """The holding tabs this loop rose over, as :class:`~.tabs.TabZone`.
+
+    The 2026-08-05 amendment read backwards.  A tab lift is four moves — cut on
+    to the foot of the climb, climb to :attr:`~.model.TabSpec.top_z`, traverse
+    the full-height length at that Z, descend back to depth — so in the point
+    list a tab is the one place where TWO consecutive points sit at the tab top.
+    Those two points are the tab's crests, and a zone is where their midpoint
+    falls on the profile:
+
+    *   the side is the side of ``box`` the crests run along;
+    *   ``centre`` is that midpoint's offset from the side's midpoint, which is
+        the same number on every one of a profile's concentric paths — the T11
+        kerf, the T12 kerf and the flush release path alike — and so is what a
+        zone means (:mod:`~.tabs`);
+    *   ``length`` is the distance between the crests, snapped to the post
+        table's own :attr:`~.model.TabSpec.length` when it matches to within a
+        printed ten-thousandth: the crest coordinates reach this module rounded
+        to four decimals, and a zone carrying 0.7501 instead of 0.75 would be a
+        rounding artefact masquerading as a decision.
+    """
+    top = config.tabs.top_z
+    zones: list[TabZone] = []
+    points = feature.points[: _close_index(feature) + 1]
+    for first, second in zip(points, points[1:]):
+        if abs(first[2] - top) > PRINTED_TOL or abs(second[2] - top) > PRINTED_TOL:
+            continue
+        side = _side_of(box, first[:2], second[:2])
+        low = travel_offset(box, side, first[:2])
+        high = travel_offset(box, side, second[:2])
+        length = abs(high - low)
+        if abs(length - config.tabs.length) <= PRINTED_TOL:
+            length = config.tabs.length
+        zones.append(
+            TabZone(side=side, centre=(low + high) / 2.0, length=length)
         )
-    corners = feature.points[1:5]
-    xs = sorted({round(p[0], 6) for p in corners})
-    ys = sorted({round(p[1], 6) for p in corners})
-    if len(xs) != 2 or len(ys) != 2:
-        raise ReconstructionError(f"loop corners are not a rectangle: {corners}")
-    return Box(xs[0], ys[0], xs[1], ys[1])
+    return tuple(zones)
+
+
+def _side_of(box: Box, start, end) -> str:
+    """Which side of ``box`` the segment ``start`` -> ``end`` runs along."""
+    if abs(start[1] - end[1]) <= abs(start[0] - end[0]):
+        across = (start[1] + end[1]) / 2.0
+        candidates = (("bottom", box.y0), ("top", box.y1))
+    else:
+        across = (start[0] + end[0]) / 2.0
+        candidates = (("left", box.x0), ("right", box.x1))
+    side, line = min(candidates, key=lambda item: abs(across - item[1]))
+    if abs(across - line) > PRINTED_TOL:
+        raise ReconstructionError(
+            f"the segment {start} -> {end} does not run along any side of {box}"
+        )
+    return side
 
 
 def _entry_side(feature: _Feature, box: Box) -> str:
@@ -203,13 +324,20 @@ def _entry_side(feature: _Feature, box: Box) -> str:
     )
 
 
-def _match_pass(z_cut: float, config: PostConfig):
-    for index, spec in enumerate(config.perimeter_passes):
+def _match_pass(z_cut: float, passes, what: str):
+    """Which configured depth pass a loop at ``z_cut`` is.
+
+    One function for both ladders (the perimeter's, and — since the 2026-08-05
+    max-bite amendment — the T11 openings'), because reading a program back means
+    the same thing in both cases: the Z word says which rung, and a Z that is not
+    a configured rung is not something to guess at.
+    """
+    for index, spec in enumerate(passes):
         if abs(spec.z_cut - z_cut) < 1e-9:
             return index, spec
     raise ReconstructionError(
-        f"perimeter loop cuts at Z{z_cut}, which is not one of the configured "
-        f"passes {[p.z_cut for p in config.perimeter_passes]} - refusing to guess"
+        f"{what} loop cuts at Z{z_cut}, which is not one of the configured "
+        f"passes {[p.z_cut for p in passes]} - refusing to guess"
     )
 
 
@@ -248,11 +376,30 @@ def reconstruct_text(text: str, config: PostConfig | None = None):
         elif tool_number == 17:
             name = SECTION_WDC_SLOT
         elif tool_number == 12:
-            name = SECTION_DETAIL
+            # T12 appears TWICE since the 2026-08-05 amendment: the detail pass
+            # and the release section, at the same depth with the same tool.  What
+            # tells them apart is what they contain — the detail pass is closed
+            # loops, a release cut is the straight plunge-and-move grammar (spec
+            # §3c) — which is the same structural distinction the verifier makes.
+            name = (
+                SECTION_RELEASE
+                if features and all(item.is_groove for item in features)
+                else SECTION_DETAIL
+            )
         elif tool_number == 11:
+            # T11 cuts two operations, and since the 2026-08-05 max-bite
+            # amendment each of them can be a LADDER of depth passes, so the
+            # question is which operation's ladder this section's first loop
+            # belongs to.  The two ladders never share a Z (openings run
+            # 0.45/0.15, perimeters 0.372/-0.006, and the measured table's single
+            # 0.15 against 0.06/-0.006), which is what makes the first loop
+            # enough to name the section.
             name = (
                 SECTION_OPENINGS
-                if abs(features[0].z_cut - cfg.openings_pass.z_cut) < 1e-9
+                if any(
+                    abs(features[0].z_cut - spec.z_cut) < 1e-9
+                    for spec in cfg.openings_passes
+                )
                 else SECTION_PERIMETER
             )
         else:
@@ -269,11 +416,19 @@ def reconstruct_text(text: str, config: PostConfig | None = None):
         raise ReconstructionError("no perimeter section: cannot recover footprints")
 
     # --- parts, from the perimeter section --------------------------------
-    passes: list[list[tuple[Box, str]]] = [[] for _ in cfg.perimeter_passes]
+    passes: list[list[tuple[Box, str, tuple[TabZone, ...]]]] = [
+        [] for _ in cfg.perimeter_passes
+    ]
     for feature in sections[SECTION_PERIMETER]:
-        index, spec = _match_pass(feature.z_cut, cfg)
+        index, spec = _match_pass(feature.z_cut, cfg.perimeter_passes, "perimeter")
         box = _loop_box(feature)
-        passes[index].append((box.grow(-spec.offset).rounded(), _entry_side(feature, box)))
+        passes[index].append(
+            (
+                box.grow(-spec.offset).rounded(),
+                _entry_side(feature, box),
+                _loop_zones(feature, box, cfg),
+            )
+        )
 
     if not passes[0]:
         raise ReconstructionError("perimeter section cut nothing at the first depth")
@@ -284,23 +439,55 @@ def reconstruct_text(text: str, config: PostConfig | None = None):
                 f"pass 1 cuts {len(passes[0])}"
             )
 
-    boxes = [box for box, _ in passes[0]]
+    boxes = [box for box, _, _ in passes[0]]
     parts = [PartProgram(part_number=f"PART{i + 1}", box=box) for i, box in enumerate(boxes)]
 
     # --- openings ---------------------------------------------------------
-    opening_boxes: list[Box] = []
-    opening_sides: list[str] = []
+    # One list per configured T11 depth pass, exactly as the perimeter above:
+    # since the 2026-08-05 max-bite amendment a generated sheet cuts every
+    # opening twice (Z0.45 then Z0.15) and the measured table cuts it once, so
+    # the rungs are collected by their Z word and then held to each other.  The
+    # DEEPEST rung is the one the opening list is read off, because it is the pass
+    # the plan and the measured offset were always about.
+    if not cfg.openings_passes:
+        raise ReconstructionError(
+            "this post table configures no T11 opening pass, so nothing here can "
+            "say what an opening loop in the file was cutting"
+        )
+    opening_passes: list[list[tuple[Box, str, tuple[TabZone, ...]]]] = [
+        [] for _ in cfg.openings_passes
+    ]
     for feature in sections.get(SECTION_OPENINGS, []):
+        index, spec = _match_pass(feature.z_cut, cfg.openings_passes, "opening")
         box = _loop_box(feature)
-        opening_boxes.append(box.grow(-cfg.openings_pass.offset).rounded())
-        opening_sides.append(_entry_side(feature, box))
+        opening_passes[index].append(
+            (
+                box.grow(-spec.offset).rounded(),
+                _entry_side(feature, box),
+                _loop_zones(feature, box, cfg),
+            )
+        )
+    for index, entries in enumerate(opening_passes[:-1]):
+        if [box for box, _, _ in entries] != [
+            box for box, _, _ in opening_passes[-1]
+        ]:
+            raise ReconstructionError(
+                f"T11 opening pass {index + 1} does not rough the same openings, in "
+                f"the same order, as the deepest pass "
+                f"(Z{cfg.openings_passes[-1].z_cut})"
+            )
+    opening_boxes = [box for box, _, _ in opening_passes[-1]]
+    opening_sides = [side for _, side, _ in opening_passes[-1]]
+    opening_zones = [zones for _, _, zones in opening_passes[-1]]
 
     detail_boxes: list[Box] = []
     detail_sides: list[str] = []
+    detail_zones: list[tuple[TabZone, ...]] = []
     for feature in sections.get(SECTION_DETAIL, []):
         box = _loop_box(feature)
         detail_boxes.append(box.grow(-cfg.detail_pass.offset).rounded())
         detail_sides.append(_entry_side(feature, box))
+        detail_zones.append(_loop_zones(feature, box, cfg))
     if detail_boxes and detail_boxes != opening_boxes:
         raise ReconstructionError(
             "the T12 detail section does not finish the same openings, in the "
@@ -346,8 +533,14 @@ def reconstruct_text(text: str, config: PostConfig | None = None):
 
     slot_refs = _slot_refs(parts, index_of, slots, cfg)
 
+    #: The tabs the file's own lifts state, per profile.  Openings vote first
+    #: and the detail pass fills in anything the T11 section did not (which is
+    #: nothing on a program this post wrote — spec §3b puts the two kerfs' lifts
+    #: at the same positions on purpose).
+    zones: dict[tuple[int, str, int], tuple[TabZone, ...]] = {}
+
     opening_refs: list[FeatureRef] = []
-    for box, side in zip(opening_boxes, opening_sides):
+    for position, (box, side) in enumerate(zip(opening_boxes, opening_sides)):
         owner = _innermost(parts, box)
         assert owner is not None
         ref_index = owner.openings.index(box)
@@ -359,15 +552,18 @@ def reconstruct_text(text: str, config: PostConfig | None = None):
                 entry=None
                 if side
                 == _effective_entry_side(
-                    box.grow(cfg.openings_pass.offset),
+                    box.grow(cfg.openings_passes[-1].offset),
                     "opening",
                     cfg.tools[SECTION_OPENINGS],
-                    cfg.openings_pass,
+                    cfg.openings_passes[-1],
                     cfg,
                 )
                 else side,
             )
         )
+        for source in (opening_zones, detail_zones):
+            if position < len(source) and source[position]:
+                zones.setdefault(opening_refs[-1].profile, source[position])
 
     detail_refs: list[FeatureRef] | None = None
     if detail_sides and detail_sides != opening_sides:
@@ -380,7 +576,7 @@ def reconstruct_text(text: str, config: PostConfig | None = None):
     for pass_index, entries in enumerate(passes):
         spec = cfg.perimeter_passes[pass_index]
         pass_refs: list[FeatureRef] = []
-        for box, side in entries:
+        for box, side, pass_zones in entries:
             owner = next((p for p in parts if p.box == box), None)
             if owner is None:
                 raise ReconstructionError(
@@ -402,7 +598,17 @@ def reconstruct_text(text: str, config: PostConfig | None = None):
                     else side,
                 )
             )
+            if pass_zones:
+                zones.setdefault(pass_refs[-1].profile, pass_zones)
         perimeter_refs.append(pass_refs)
+
+    release_refs = _release_refs(
+        parts,
+        index_of,
+        _straight_runs(sections.get(SECTION_RELEASE, []), "T12 release cut"),
+        zones,
+        cfg,
+    )
 
     plan = CutPlan(
         panel=panel_refs,
@@ -411,8 +617,77 @@ def reconstruct_text(text: str, config: PostConfig | None = None):
         perimeter=perimeter_refs,
         detail=detail_refs,
         sections=tuple(order) if order else DEFAULT_SECTIONS,
+        tabs=zones or None,
+        release=release_refs,
     )
     return program, plan
+
+
+def _release_refs(parts, index_of, runs, zones, cfg: PostConfig) -> list[FeatureRef]:
+    """One :class:`FeatureRef` per PROFILE the release section frees, in order.
+
+    Each straight T12 cut is attributed to the profile whose flush release path
+    (:func:`~.generator.release_path`) it runs on — the same numeric test the
+    verifier's hold invariant makes, and the reason a release cut can be traced
+    back to the part it frees at all.  The plan then names each profile once, in
+    the order the file first releases it, because one entry stands for all of
+    that profile's tabs: the emitter cuts one release move per zone.
+
+    Refuses a release cut that matches no tabbed profile rather than guessing:
+    a cut nothing on the sheet was standing in the way of is not something this
+    post wrote, and reading it as if it were would hide it.
+    """
+    if not runs:
+        return []
+    if cfg.release is None:
+        raise ReconstructionError(
+            "this program has a T12 release section but the post table configures "
+            "no release pass, so nothing here says what depth or feeds it should "
+            "have had - read it with post_config_for()'s table"
+        )
+    candidates: list[tuple[FeatureRef, Box]] = []
+    for part in parts:
+        index = index_of[id(part)]
+        for opening_index, opening in enumerate(part.openings):
+            candidates.append(
+                (
+                    FeatureRef(index, "opening", opening_index),
+                    release_path(opening, "opening", cfg.tool(SECTION_RELEASE).radius),
+                )
+            )
+        candidates.append(
+            (
+                FeatureRef(index, "perimeter"),
+                release_path(part.box, "perimeter", cfg.tool(SECTION_RELEASE).radius),
+            )
+        )
+
+    refs: list[FeatureRef] = []
+    for start, end in runs:
+        for ref, path in candidates:
+            if ref.profile not in zones:
+                continue
+            try:
+                side = _side_of(path, start, end)
+            except ReconstructionError:
+                continue
+            low = min(travel_offset(path, side, start), travel_offset(path, side, end))
+            high = max(travel_offset(path, side, start), travel_offset(path, side, end))
+            if any(
+                zone.side == side and low <= zone.centre <= high
+                for zone in zones[ref.profile]
+            ):
+                if ref not in refs:
+                    refs.append(ref)
+                break
+        else:
+            raise ReconstructionError(
+                f"the T12 release cut {start} -> {end} is not flush with any tabbed "
+                f"profile's finished edge over one of the tabs that profile's own "
+                f"loops left standing - this post only writes a release cut on the "
+                f"flush path of a tab it made"
+            )
+    return refs
 
 
 def _effective_entry_side(cut: Box, kind: str, tool, spec, cfg: PostConfig) -> str:
@@ -574,17 +849,48 @@ def _matches(want, got) -> bool:
 
 
 def _groove_ref(parts, index_of, start, end, cfg: PostConfig) -> FeatureRef:
-    """Identify which of a part's four grooves this segment is."""
+    """Identify which of a part's four grooves this segment is.
+
+    TWO shapes are accepted for a stile groove, and both map to the same
+    :class:`FeatureRef` (2026-08-05 amendment, job R0805):
+
+    *   the CLAMPED one this post writes now — endpoints one tool radius
+        inside the part ends, so the cut stops flush with the part;
+    *   the LEGACY one, ``panel.overrun`` (0.375) PAST both part ends, which
+        is what every reference ``.anc`` in the repo contains and what the
+        shop's own CAM wrote for years.
+
+    Reading a file is not the same act as writing one: a program the shop
+    already cut has to be readable whatever the post emits today, or the
+    reference files stop being usable evidence.  Which shape a file used is
+    not recorded on the ref, because a ref carries no geometry at all — so
+    regenerating a legacy file produces the clamped groove, which is exactly
+    the intended behaviour change and exactly what the byte-for-byte
+    round-trip goldens have to be re-blessed for (spec §5).
+    """
+    radius = cfg.tools[SECTION_PANEL].radius
+    # The legacy shape is the clamp run backwards: an effective reach of MINUS
+    # the measured overrun puts the endpoint 0.375 OUTSIDE the part instead of
+    # a tool radius inside it.  Expressed through the same function on purpose,
+    # so the two shapes can never disagree about the insets, the long axis or
+    # the rotation convention — only about where the groove stops.
+    legacy = replace(cfg.panel, end_inset=-(radius + cfg.panel.overrun))
     for part in parts:
         for index in range(4):
-            want_start, want_end = groove_segment(part, index, cfg.panel)
-            if _same(want_start, start) and _same(want_end, end):
-                return FeatureRef(index_of[id(part)], "groove", index, reverse=False)
-            if _same(want_start, end) and _same(want_end, start):
-                return FeatureRef(index_of[id(part)], "groove", index, reverse=True)
+            for panel in (cfg.panel, legacy):
+                want_start, want_end = groove_segment(part, index, panel, radius)
+                if _same(want_start, start) and _same(want_end, end):
+                    return FeatureRef(
+                        index_of[id(part)], "groove", index, reverse=False
+                    )
+                if _same(want_start, end) and _same(want_end, start):
+                    return FeatureRef(
+                        index_of[id(part)], "groove", index, reverse=True
+                    )
     raise ReconstructionError(
         f"T13 groove {start} -> {end} does not match any part's measured groove "
-        f"pattern (0.5625 stile / 0.9375 rail insets, 0.375 overrun)"
+        f"pattern (0.5625 stile / 0.9375 rail insets; a stile groove ends either "
+        f"flush with the part edge or {cfg.panel.overrun:g} past it)"
     )
 
 
